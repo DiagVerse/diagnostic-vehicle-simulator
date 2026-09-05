@@ -44,8 +44,20 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
     tracing::info!(%addr, plugins = %plugins_dir.display(), "starting dvsim engine");
 
     let host = PluginHost::load_from_dir(&plugins_dir);
+
+    // Resolve the UDS protocol handler once at startup; the diagnostics endpoints report it as
+    // unavailable (rather than failing) if the plugin was not present.
+    let protocol = host.FindProtocol("uds");
+    if protocol.is_none() {
+        tracing::warn!(
+            "no 'uds' protocol plugin loaded; /ecu/* endpoints will report it unavailable"
+        );
+    }
+
     let state = Arc::new(AppState {
         plugins: host.infos().to_vec(),
+        protocol,
+        ecu: std::sync::Mutex::new(ecu::VirtualEcu::New(ecu::sample::BuildEngineEcu())),
     });
 
     api::serve(addr, state)

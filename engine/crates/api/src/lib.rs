@@ -2,17 +2,33 @@
 //! an external client). It is deliberately thin: it serializes application-layer data and
 //! exposes it over HTTP. It contains no business logic.
 
-use std::{net::SocketAddr, sync::Arc};
+pub mod diagnostics;
 
-use application::PluginInfo;
-use axum::{extract::State, routing::get, Json, Router};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+
+use application::{PluginInfo, ProtocolPlugin};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
+use ecu::VirtualEcu;
 use serde::Serialize;
 use tower_http::cors::CorsLayer;
 
-/// Shared, read-only state handed to every request.
+/// Shared state handed to every request.
 pub struct AppState {
     /// Metadata for all plugins loaded at startup.
     pub plugins: Vec<PluginInfo>,
+    /// The resolved UDS protocol handler, if the plugin was loaded. `None` means the
+    /// diagnostics endpoints report the protocol as unavailable rather than failing hard.
+    pub protocol: Option<ProtocolPlugin>,
+    /// The single demo ECU the diagnostics endpoints drive. Guarded by a mutex because it
+    /// holds live, mutable diagnostic state; the lock is only held for synchronous work.
+    pub ecu: Mutex<VirtualEcu>,
 }
 
 /// Response body for `GET /health`.
@@ -29,6 +45,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/plugins", get(plugins))
+        .route("/ecu/state", get(diagnostics::GetEcuState))
+        .route("/ecu/request", post(diagnostics::PostEcuRequest))
+        .route("/ecu/reset", post(diagnostics::PostEcuReset))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
