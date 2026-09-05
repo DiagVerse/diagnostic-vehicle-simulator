@@ -24,6 +24,7 @@ fn EmptyState() -> Arc<AppState> {
         simulation: Arc::new(Mutex::new(simulation::SimulationService::New())),
         busy_ecus: Mutex::new(BTreeSet::new()),
         hardware: Mutex::new(api::hardware::HardwareState::default()),
+        traffic: api::traffic::TrafficChannel::New(),
     })
 }
 
@@ -165,5 +166,34 @@ async fn the_architecture_routes_match_their_path_parameters() {
         status,
         StatusCode::NOT_FOUND,
         "DELETE /simulation/networks/:networkId is not reachable"
+    );
+}
+
+#[tokio::test]
+async fn the_event_stream_is_reachable_and_announces_itself_as_sse() {
+    // A route that exists but answers as JSON would leave EventSource silently never firing,
+    // which looks from the browser exactly like an engine that produces no traffic.
+    let request = Request::builder()
+        .method("GET")
+        .uri("/events")
+        .body(Body::empty())
+        .expect("a valid request");
+
+    let response = build_router(EmptyState())
+        .oneshot(request)
+        .await
+        .expect("the router should answer");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let strContentType = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        strContentType.starts_with("text/event-stream"),
+        "the feed must be served as SSE, got '{strContentType}'"
     );
 }

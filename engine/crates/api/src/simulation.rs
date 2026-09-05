@@ -32,6 +32,7 @@ use ecu::VirtualEcu;
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::{FormatHex, ParseHex, SessionName};
+use crate::traffic::{ExchangeResponse, NowMs, TrafficEvent};
 use crate::AppState;
 
 /// Longest CAN log accepted in one upload (characters). A log is pasted or uploaded by a
@@ -389,6 +390,10 @@ pub async fn GetSimulationState(State(state): State<Arc<AppState>>) -> Json<Simu
 pub async fn PostSimulationStart(State(state): State<Arc<AppState>>) -> Json<SimulationStateDto> {
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation.Start();
+    state.traffic.Publish(TrafficEvent::Lifecycle {
+        at_ms: NowMs(),
+        what: "simulation started".to_string(),
+    });
     Json(BuildStateDto(&simulation, state.protocol.is_some()))
 }
 
@@ -396,6 +401,10 @@ pub async fn PostSimulationStart(State(state): State<Arc<AppState>>) -> Json<Sim
 pub async fn PostSimulationStop(State(state): State<Arc<AppState>>) -> Json<SimulationStateDto> {
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation.Stop();
+    state.traffic.Publish(TrafficEvent::Lifecycle {
+        at_ms: NowMs(),
+        what: "simulation stopped".to_string(),
+    });
     Json(BuildStateDto(&simulation, state.protocol.is_some()))
 }
 
@@ -449,6 +458,15 @@ pub async fn PostSimulationRequest(
 
     let vecResponses = match outcome {
         RoutingOutcome::Stopped => {
+            PublishExchange(
+                &state,
+                u32RequestCanId,
+                &vecRequest,
+                "stopped",
+                false,
+                &[],
+                Some("the simulation is stopped; every ECU is off the bus".to_string()),
+            );
             return Ok(Json(SimulationRequestResultDto {
                 can_id_hex: FormatCanId(u32RequestCanId),
                 request_hex: FormatHex(&vecRequest),
@@ -460,6 +478,15 @@ pub async fn PostSimulationRequest(
             }));
         }
         RoutingOutcome::NoTarget => {
+            PublishExchange(
+                &state,
+                u32RequestCanId,
+                &vecRequest,
+                "unrouted",
+                false,
+                &[],
+                Some("no ECU listens on that identifier".to_string()),
+            );
             return Ok(Json(SimulationRequestResultDto {
                 can_id_hex: FormatCanId(u32RequestCanId),
                 request_hex: FormatHex(&vecRequest),
@@ -476,6 +503,15 @@ pub async fn PostSimulationRequest(
         } => {
             // Silence on the wire, like `unrouted` — but the operator asking through the UI
             // just flicked a switch, and needs to be told that is what they are looking at.
+            PublishExchange(
+                &state,
+                u32RequestCanId,
+                &vecRequest,
+                "silenced",
+                false,
+                &[],
+                Some(strReason.clone()),
+            );
             return Ok(Json(SimulationRequestResultDto {
                 can_id_hex: FormatCanId(u32RequestCanId),
                 request_hex: FormatHex(&vecRequest),
@@ -497,14 +533,25 @@ pub async fn PostSimulationRequest(
     let vecResponseDtos = EmitPlans(&vecResponses).await;
     drop(busyGuard);
 
+    let strAddressing = if bIsFunctional {
+        "functional".to_string()
+    } else {
+        "physical".to_string()
+    };
+    PublishExchange(
+        &state,
+        u32RequestCanId,
+        &vecRequest,
+        &strAddressing,
+        true,
+        &vecResponseDtos,
+        None,
+    );
+
     Ok(Json(SimulationRequestResultDto {
         can_id_hex: FormatCanId(u32RequestCanId),
         request_hex: FormatHex(&vecRequest),
-        addressing: if bIsFunctional {
-            "functional".to_string()
-        } else {
-            "physical".to_string()
-        },
+        addressing: strAddressing,
         routed: true,
         responses: vecResponseDtos,
         silenced_ecu_name: None,
@@ -1882,4 +1929,39 @@ pub async fn PutEcuEnabled(
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// Put one routed exchange on the live feed.
+///
+/// Every outcome is published, not only the ones that produced bytes: a monitor that shows
+/// answers but not silences would make "nothing listens on that id" and "the request never
+/// arrived" look identical, which is exactly the confusion the reason string exists to end.
+fn PublishExchange(
+    state: &Arc<AppState>,
+    u32RequestCanId: u32,
+    vecRequest: &[u8],
+    strAddressing: &str,
+    bRouted: bool,
+    vecResponses: &[SimulationResponseDto],
+    optStrReason: Option<String>,
+) {
+    let vecEventResponses = vecResponses
+        .iter()
+        .map(|response| ExchangeResponse {
+            ecu_name: response.ecu_name.clone(),
+            response_can_id_hex: response.response_can_id_hex.clone(),
+            response_hex: response.response_hex.clone(),
+            suppressed: response.suppressed,
+        })
+        .collect();
+
+    state.traffic.Publish(TrafficEvent::Exchange {
+        at_ms: NowMs(),
+        can_id_hex: FormatCanId(u32RequestCanId),
+        request_hex: FormatHex(vecRequest),
+        addressing: strAddressing.to_string(),
+        routed: bRouted,
+        responses: vecEventResponses,
+        reason: optStrReason,
+    });
 }

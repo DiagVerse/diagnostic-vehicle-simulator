@@ -13,12 +13,14 @@
 
 pub mod bus;
 pub mod mock;
+pub mod observer;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::observer::{FrameDirection, FrameObserver};
 use application::ProtocolHandler;
 use can::CanFrame;
 use isotp::params::{c_timeoutFlowControl, IsoTpParameters};
@@ -66,6 +68,8 @@ struct Endpoint {
 /// Drives the simulation from a CAN bus.
 pub struct CanBridge {
     m_boxBus: Box<dyn CanBusPort>,
+    /// Who is watching the wire, if anyone. The bridge works identically without one.
+    m_optObserver: Option<Arc<dyn FrameObserver>>,
     m_arcSimulation: Arc<Mutex<SimulationService>>,
     m_params: IsoTpParameters,
     /// Endpoints keyed by the identifier frames arrive on — physical and broadcast alike.
@@ -90,6 +94,7 @@ impl CanBridge {
     ) -> Self {
         let mut bridge = CanBridge {
             m_boxBus: boxBus,
+            m_optObserver: None,
             m_arcSimulation: arcSimulation,
             m_params: params,
             m_mapEndpoints: BTreeMap::new(),
@@ -99,6 +104,22 @@ impl CanBridge {
         };
         bridge.RebuildEndpoints();
         bridge
+    }
+
+    /// Attach something that wants to see every frame crossing this bridge.
+    ///
+    /// Optional by construction: a bridge with no observer behaves exactly as before, so
+    /// nothing about the wire depends on whether anyone happens to be watching it.
+    pub fn WithObserver(mut self, arcObserver: Arc<dyn FrameObserver>) -> Self {
+        self.m_optObserver = Some(arcObserver);
+        self
+    }
+
+    /// Tell the observer about one frame, if there is one.
+    fn AnnounceFrame(&self, direction: FrameDirection, frame: &CanFrame) {
+        if let Some(arcObserver) = &self.m_optObserver {
+            arcObserver.OnFrame(direction, frame);
+        }
     }
 
     /// The counters this bridge updates, for a status display.
@@ -179,6 +200,9 @@ impl CanBridge {
                 self.m_arcStats
                     .m_atomicFramesReceived
                     .fetch_add(vecFrames.len() as u64, Ordering::Relaxed);
+                for frame in &vecFrames {
+                    self.AnnounceFrame(FrameDirection::Received, frame);
+                }
                 self.m_queueInbound.extend(vecFrames);
             }
             Err(error) => tracing::warn!(%error, "could not read from the bus"),
@@ -267,6 +291,12 @@ impl CanBridge {
             simulation.ProcessByCanId(u32RequestCanId, vecPdu, protocol)
             // The guard is dropped here, before anything sleeps. The compiler enforces it.
         };
+
+        // Announced before the silent outcomes return, so a monitor sees the request that got
+        // nothing back and the reason — which is the case a person is usually chasing.
+        if let Some(arcObserver) = &self.m_optObserver {
+            arcObserver.OnExchange(u32RequestCanId, vecPdu, &outcome);
+        }
 
         let vecResponses = match outcome {
             RoutingOutcome::Handled(vecResponses) => vecResponses,
@@ -378,6 +408,9 @@ impl CanBridge {
         self.m_arcStats
             .m_atomicFramesSent
             .fetch_add(1, Ordering::Relaxed);
+        // Announced before the send is attempted, so a frame the link then refuses still shows
+        // up in the monitor alongside the warning explaining why it never left.
+        self.AnnounceFrame(FrameDirection::Sent, &frame);
         if let Err(error) = self.m_boxBus.SendFrame(&frame) {
             tracing::warn!(%error, canId = format!("{u32CanId:03X}"), "could not transmit a frame");
         }

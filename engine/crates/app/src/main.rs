@@ -70,6 +70,7 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
         simulation: Arc::new(std::sync::Mutex::new(simulation::SimulationService::New())),
         busy_ecus: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         hardware: std::sync::Mutex::new(api::hardware::HardwareState::default()),
+        traffic: api::traffic::TrafficChannel::New(),
     });
 
     api::serve(addr, state)
