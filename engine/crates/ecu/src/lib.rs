@@ -207,7 +207,7 @@ impl VirtualEcu {
     /// the same split ADR 0004 made for functional NRC suppression. Layout and scaling come
     /// from ISO 14229-1 clause 9.2.3.1, Tables 28 and 29: P2Server_max in two bytes at 1 ms
     /// resolution, P2*Server_max in two bytes at 10 ms resolution.
-    fn ApplySessionTimingRecord(&self, vecResponse: &mut Vec<u8>) {
+    fn ApplySessionTimingRecord(&self, vecResponse: &mut [u8]) {
         if vecResponse.first() != Some(&c_bySessionControlPositiveResponse) {
             return;
         }

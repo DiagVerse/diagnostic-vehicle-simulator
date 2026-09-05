@@ -292,11 +292,25 @@ fn CheckPendingGaps(
 mod tests {
     use super::*;
 
-    /// The response to `22 F1 90` used throughout: `62 F1 90` plus a 16-byte VIN.
+    /// The response to `22 F1 90` used throughout: `62 F1 90` plus a VIN.
+    ///
+    /// A VIN is 17 characters (ISO 3779), so this PDU is 20 bytes — long enough to need
+    /// ISO-TP segmentation, which is what a realistic ReadDataByIdentifier(0xF190) looks like.
     fn ReadVinResponse() -> Vec<u8> {
         let mut vecResponse = vec![0x62, 0xF1, 0x90];
-        vecResponse.extend_from_slice(b"VIN0123456789XYZ");
+        vecResponse.extend_from_slice(c_strSampleVin.as_bytes());
         vecResponse
+    }
+
+    /// A syntactically valid 17-character VIN (ISO 3779).
+    const c_strSampleVin: &str = "1HGCM82633A004352";
+
+    #[test]
+    fn the_sample_vin_is_seventeen_characters() {
+        // ISO 3779 fixes the VIN at 17 characters; a fixture that is not stops the DID being
+        // representative of what an ECU really returns.
+        assert_eq!(c_strSampleVin.len(), 17);
+        assert_eq!(ReadVinResponse().len(), 20);
     }
 
     /// Build a plan the way `VirtualEcu` does, for a supported service.
