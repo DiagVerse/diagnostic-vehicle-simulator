@@ -619,6 +619,7 @@ dependencies = [
  "isotp",
  "plugin-contract",
  "thiserror",
+ "tracing",
  "uds-plugin",
 ]
 

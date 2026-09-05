@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use ::simulation::{RoutingOutcome, SimulationService};
+use ::simulation::{RoutedResponse, RoutingOutcome, SimulationService};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -101,6 +101,8 @@ pub struct SimulationEcuDto {
     pub logical_address: u16,
     pub request_can_id_hex: String,
     pub response_can_id_hex: String,
+    /// The broadcast identifier this ECU also listens on, if any.
+    pub functional_can_id_hex: Option<String>,
     pub addressing_mode: String,
     pub address_confidence: String,
     pub session: u8,
@@ -122,22 +124,37 @@ pub struct SimulationStateDto {
     pub ecus: Vec<SimulationEcuDto>,
 }
 
+/// One ECU's answer to a routed request.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulationResponseDto {
+    pub ecu_name: String,
+    pub response_can_id_hex: String,
+    pub response_hex: String,
+    /// True when the ECU handled the request but deliberately sent nothing (the
+    /// suppressPosRspMsgIndicationBit). The state change, if any, still happened.
+    pub suppressed: bool,
+    pub session: u8,
+    pub session_name: String,
+    pub security_unlocked: bool,
+}
+
 /// The outcome of one routed request.
+///
+/// `responses` holds one entry per ECU that answered. A physically addressed request produces
+/// at most one; a functionally addressed one produces an entry per listening ECU, in the order
+/// CAN arbitration would put them on the bus. It can legitimately be empty even when
+/// `routed` is true — every listener was required to stay silent.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulationRequestResultDto {
     pub can_id_hex: String,
     pub request_hex: String,
+    /// How the identifier was interpreted: `"physical"`, `"functional"`, or `"unrouted"`.
+    pub addressing: String,
     /// False when no ECU listens on that identifier — nothing was sent, as on a real bus.
     pub routed: bool,
-    pub ecu_name: Option<String>,
-    pub response_can_id_hex: Option<String>,
-    pub response_hex: String,
-    /// True when the ECU handled the request but deliberately sent no response.
-    pub suppressed: bool,
-    pub session: Option<u8>,
-    pub session_name: Option<String>,
-    pub security_unlocked: Option<bool>,
+    pub responses: Vec<SimulationResponseDto>,
 }
 
 /// POST /simulation/load — reconstruct a vehicle from CAN-log text and start its ECUs.
@@ -207,49 +224,44 @@ pub async fn PostSimulationRequest(
         ));
     }
 
+    let bIsFunctional = simulation.IsFunctionalCanId(u32RequestCanId);
     let outcome = simulation.ProcessByCanId(u32RequestCanId, &vecRequest, protocol);
 
     let result = match outcome {
         RoutingOutcome::NoTarget => SimulationRequestResultDto {
             can_id_hex: FormatCanId(u32RequestCanId),
             request_hex: FormatHex(&vecRequest),
+            addressing: "unrouted".to_string(),
             routed: false,
-            ecu_name: None,
-            response_can_id_hex: None,
-            response_hex: String::new(),
-            suppressed: false,
-            session: None,
-            session_name: None,
-            security_unlocked: None,
+            responses: Vec::new(),
         },
-        RoutingOutcome::Handled(vecResponses) => {
-            // Physical addressing: exactly one ECU owns a request identifier.
-            let response = vecResponses
-                .into_iter()
-                .next()
-                .expect("a handled request always carries at least one answer");
-
-            // The ECU that answered is the one addressed, so its post-request state is what
-            // the caller wants to see next to the response.
-            let optEcu = simulation.FindEcuByRequestCanId(u32RequestCanId);
-            let bySession = optEcu.map(|runningEcu| runningEcu.CurrentSession());
-
-            SimulationRequestResultDto {
-                can_id_hex: FormatCanId(u32RequestCanId),
-                request_hex: FormatHex(&vecRequest),
-                routed: true,
-                ecu_name: Some(response.m_strEcuName.clone()),
-                response_can_id_hex: Some(FormatCanId(response.m_u32ResponseCanId)),
-                response_hex: FormatHex(&response.m_vecResponse),
-                suppressed: response.IsSuppressed(),
-                session: bySession,
-                session_name: bySession.map(SessionName),
-                security_unlocked: optEcu.map(|runningEcu| runningEcu.IsSecurityUnlocked()),
-            }
-        }
+        RoutingOutcome::Handled(vecResponses) => SimulationRequestResultDto {
+            can_id_hex: FormatCanId(u32RequestCanId),
+            request_hex: FormatHex(&vecRequest),
+            addressing: if bIsFunctional {
+                "functional".to_string()
+            } else {
+                "physical".to_string()
+            },
+            routed: true,
+            responses: vecResponses.iter().map(BuildResponseDto).collect(),
+        },
     };
 
     Ok(Json(result))
+}
+
+/// Describe one ECU's answer.
+fn BuildResponseDto(response: &RoutedResponse) -> SimulationResponseDto {
+    SimulationResponseDto {
+        ecu_name: response.m_strEcuName.clone(),
+        response_can_id_hex: FormatCanId(response.m_u32ResponseCanId),
+        response_hex: FormatHex(&response.m_vecResponse),
+        suppressed: response.IsSuppressed(),
+        session: response.m_bySession,
+        session_name: SessionName(response.m_bySession),
+        security_unlocked: response.m_bIsSecurityUnlocked,
+    }
 }
 
 /// Describe the running simulation for the UI.
@@ -284,6 +296,7 @@ fn BuildEcuDto(runningEcu: &VirtualEcu) -> SimulationEcuDto {
         logical_address: config.m_u16LogicalAddress,
         request_can_id_hex: FormatCanId(address.m_u32RequestCanId),
         response_can_id_hex: FormatCanId(address.m_u32ResponseCanId),
+        functional_can_id_hex: address.m_optU32FunctionalCanId.map(FormatCanId),
         addressing_mode: AddressingModeName(address.m_addressingMode),
         address_confidence: ConfidenceName(address.m_confidence),
         session: runningEcu.CurrentSession(),

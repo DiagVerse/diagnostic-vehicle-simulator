@@ -17,8 +17,27 @@
 use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
-use core_domain::model::{Ecu, Vehicle};
+use core_domain::model::{CanAddress, Ecu, Vehicle};
 use ecu::VirtualEcu;
+
+/// First byte of a UDS negative response (ISO 14229-1).
+const c_byNegativeResponseSid: u8 = 0x7F;
+
+/// Negative response codes a server must suppress when the request was functionally addressed
+/// (ISO 14229-1 clause 7.5.3.3 Table 5 and clause 7.5.4.3 Table 7). Every other NRC is sent
+/// normally.
+const c_arrFunctionallySuppressedNrcs: [u8; 5] = [
+    0x11, // serviceNotSupported
+    0x12, // sub-functionNotSupported
+    0x31, // requestOutOfRange
+    0x7E, // sub-functionNotSupportedInActiveSession
+    0x7F, // serviceNotSupportedInActiveSession
+];
+
+/// Longest functional request the simulator accepts. A broadcast has no single peer to send
+/// flow control, so ISO 15765-2 permits a SingleFrame only — seven payload bytes with normal
+/// addressing.
+const c_uMaxFunctionalRequestBytes: usize = 7;
 
 /// Errors from loading or driving a simulation.
 #[derive(Debug, thiserror::Error)]
@@ -31,12 +50,9 @@ pub enum SimulationError {
     #[error("no diagnostic ECU found in the log (no correlated UDS request/response pairs)")]
     NoEcusFound,
 
-    /// The model contains an ECU without CAN addressing, so it cannot be routed to.
-    #[error("ECU '{strEcuName}' has no CAN address and cannot be simulated on CAN")]
-    MissingCanAddress {
-        /// Name of the offending ECU.
-        strEcuName: String,
-    },
+    /// Not one ECU in the model carries CAN addressing, so nothing can be routed to.
+    #[error("no ECU in the model has a CAN address; none can be simulated on CAN")]
+    NoRoutableEcus,
 
     /// Two ECUs claim the same request identifier, so routing would be ambiguous.
     #[error(
@@ -50,6 +66,32 @@ pub enum SimulationError {
         /// ECU that claimed it second.
         strSecondEcu: String,
     },
+
+    /// Two ECUs answer on the same identifier, so their responses would be indistinguishable
+    /// on the wire.
+    #[error(
+        "response CAN id 0x{u32ResponseCanId:03X} is claimed by both '{strFirstEcu}' and '{strSecondEcu}'"
+    )]
+    DuplicateResponseCanId {
+        /// The contested response identifier.
+        u32ResponseCanId: u32,
+        /// ECU that claimed the identifier first.
+        strFirstEcu: String,
+        /// ECU that claimed it second.
+        strSecondEcu: String,
+    },
+
+    /// One identifier is both a broadcast address and an ECU's own request address, which
+    /// would make routing ambiguous.
+    #[error(
+        "CAN id 0x{u32CanId:03X} is both '{strEcuName}'s own request identifier and a functional (broadcast) identifier"
+    )]
+    FunctionalIdCollidesWithPhysical {
+        /// The contested identifier.
+        u32CanId: u32,
+        /// The ECU whose physical request identifier it is.
+        strEcuName: String,
+    },
 }
 
 /// One ECU's answer to a routed request.
@@ -62,6 +104,11 @@ pub struct RoutedResponse {
     /// The UDS response bytes. Empty when the ECU deliberately suppressed its response
     /// (suppressPosRspMsgIndicationBit) — the caller must then transmit nothing.
     pub m_vecResponse: Vec<u8>,
+    /// The ECU's session after the request. A suppressed response still changes state, so this
+    /// is reported even when nothing was sent.
+    pub m_bySession: u8,
+    /// Whether the ECU has a security level unlocked after the request.
+    pub m_bIsSecurityUnlocked: bool,
 }
 
 impl RoutedResponse {
@@ -89,6 +136,9 @@ pub struct SimulationService {
     /// Live ECUs keyed by the CAN identifier a tester addresses them on. A `BTreeMap` keeps
     /// listing order stable and makes routing an O(log n) lookup.
     m_mapEcusByRequestId: BTreeMap<u32, VirtualEcu>,
+    /// For each functional (broadcast) identifier, the physical request identifiers of the
+    /// ECUs that listen on it, in ascending response-identifier order.
+    m_mapFunctionalTargets: BTreeMap<u32, Vec<u32>>,
 }
 
 impl Default for SimulationService {
@@ -103,6 +153,7 @@ impl SimulationService {
         SimulationService {
             m_optVehicle: None,
             m_mapEcusByRequestId: BTreeMap::new(),
+            m_mapFunctionalTargets: BTreeMap::new(),
         }
     }
 
@@ -119,6 +170,7 @@ impl SimulationService {
     /// Start every ECU of an already-built vehicle model.
     pub fn LoadVehicle(&mut self, vehicle: Vehicle) -> Result<&Vehicle, SimulationError> {
         let mapEcus = BuildEcuMap(&vehicle)?;
+        let mapFunctionalTargets = BuildFunctionalTargetMap(&mapEcus)?;
 
         tracing::info!(
             vehicle = %vehicle.m_strName,
@@ -134,6 +186,7 @@ impl SimulationService {
         }
 
         self.m_mapEcusByRequestId = mapEcus;
+        self.m_mapFunctionalTargets = mapFunctionalTargets;
         self.m_optVehicle = Some(vehicle);
         Ok(self
             .m_optVehicle
@@ -145,6 +198,7 @@ impl SimulationService {
     pub fn Clear(&mut self) {
         self.m_optVehicle = None;
         self.m_mapEcusByRequestId.clear();
+        self.m_mapFunctionalTargets.clear();
         tracing::info!("simulation cleared");
     }
 
@@ -165,6 +219,12 @@ impl SimulationService {
             .map(|(u32RequestCanId, runningEcu)| (*u32RequestCanId, runningEcu))
     }
 
+    /// True when the identifier is a functional (broadcast) address some running ECU listens
+    /// on, rather than one ECU's own request address.
+    pub fn IsFunctionalCanId(&self, u32CanId: u32) -> bool {
+        self.m_mapFunctionalTargets.contains_key(&u32CanId)
+    }
+
     /// Look up one running ECU by the identifier it is addressed on.
     pub fn FindEcuByRequestCanId(&self, u32RequestCanId: u32) -> Option<&VirtualEcu> {
         self.m_mapEcusByRequestId.get(&u32RequestCanId)
@@ -182,12 +242,43 @@ impl SimulationService {
         );
     }
 
-    /// Route one inbound UDS request, addressed to `u32RequestCanId`, to the ECU that owns
-    /// that identifier and return its answer.
+    /// Route one inbound UDS request, addressed to `u32RequestCanId`, and return the answers.
     ///
-    /// Physical addressing only: exactly one ECU owns a given request identifier. An
-    /// identifier no ECU owns yields [`RoutingOutcome::NoTarget`] and no response at all.
+    /// Three cases, kept as separate branches because they behave differently on the wire:
+    ///   1. **Physical** — exactly one ECU owns the identifier; it answers on its own response
+    ///      identifier.
+    ///   2. **Functional (broadcast)** — every ECU listening on the identifier processes the
+    ///      request on its own state and answers on its own response identifier. Answers come
+    ///      back in ascending response-identifier order, which is the order CAN arbitration
+    ///      would produce.
+    ///   3. **Neither** — no ECU has the identifier in its acceptance filter, so no ECU even
+    ///      receives the request. Nothing is transmitted; a negative response would imply a
+    ///      server that decided to reject, and there is none.
     pub fn ProcessByCanId(
+        &mut self,
+        u32RequestCanId: u32,
+        vecRequest: &[u8],
+        protocol: &dyn ProtocolHandler,
+    ) -> RoutingOutcome {
+        if self.m_mapEcusByRequestId.contains_key(&u32RequestCanId) {
+            return self.ProcessPhysical(u32RequestCanId, vecRequest, protocol);
+        }
+
+        if self.m_mapFunctionalTargets.contains_key(&u32RequestCanId) {
+            return self.ProcessFunctional(u32RequestCanId, vecRequest, protocol);
+        }
+
+        // A tester scanning for ECUs addresses identifiers nothing answers on; that is normal
+        // traffic, not a fault, so it is logged at debug level.
+        tracing::debug!(
+            requestCanId = format!("{u32RequestCanId:03X}"),
+            "no ECU listens on this CAN id; staying silent"
+        );
+        RoutingOutcome::NoTarget
+    }
+
+    /// Case 1: the identifier belongs to exactly one ECU.
+    fn ProcessPhysical(
         &mut self,
         u32RequestCanId: u32,
         vecRequest: &[u8],
@@ -195,17 +286,69 @@ impl SimulationService {
     ) -> RoutingOutcome {
         let runningEcu = match self.m_mapEcusByRequestId.get_mut(&u32RequestCanId) {
             Some(runningEcu) => runningEcu,
-            None => {
-                tracing::warn!(
-                    requestCanId = format!("{u32RequestCanId:03X}"),
-                    "no ECU listens on this CAN id; staying silent"
-                );
-                return RoutingOutcome::NoTarget;
-            }
+            None => return RoutingOutcome::NoTarget,
         };
 
         let response = ProcessOnEcu(runningEcu, u32RequestCanId, vecRequest, protocol);
         RoutingOutcome::Handled(vec![response])
+    }
+
+    /// Case 2: a broadcast identifier every listening ECU processes on its own state.
+    fn ProcessFunctional(
+        &mut self,
+        u32FunctionalCanId: u32,
+        vecRequest: &[u8],
+        protocol: &dyn ProtocolHandler,
+    ) -> RoutingOutcome {
+        // A functional request cannot be segmented: there is no single peer to send flow
+        // control, so ISO 15765-2 allows a SingleFrame only.
+        if vecRequest.len() > c_uMaxFunctionalRequestBytes {
+            tracing::warn!(
+                requestCanId = format!("{u32FunctionalCanId:03X}"),
+                requestBytes = vecRequest.len(),
+                maxBytes = c_uMaxFunctionalRequestBytes,
+                "functional request is too long to be sent in a single frame; ignoring it"
+            );
+            return RoutingOutcome::NoTarget;
+        }
+
+        let vecTargetRequestIds = match self.m_mapFunctionalTargets.get(&u32FunctionalCanId) {
+            Some(vecTargets) => vecTargets.clone(),
+            None => return RoutingOutcome::NoTarget,
+        };
+
+        let mut vecResponses = Vec::new();
+        for u32TargetRequestId in vecTargetRequestIds {
+            let runningEcu = match self.m_mapEcusByRequestId.get_mut(&u32TargetRequestId) {
+                Some(runningEcu) => runningEcu,
+                None => continue,
+            };
+
+            let response = ProcessOnEcu(runningEcu, u32FunctionalCanId, vecRequest, protocol);
+
+            // A functionally addressed server must stay silent for some negative responses
+            // rather than flood the tester with "I do not support that" (ISO 14229-1
+            // clause 7.5.3.3 Table 5 and clause 7.5.4.3 Table 7). The state change, if any,
+            // has already been applied.
+            if IsNegativeResponseSuppressedFunctionally(&response.m_vecResponse) {
+                tracing::debug!(
+                    ecu = %response.m_strEcuName,
+                    nrc = format!("{:02X}", NegativeResponseCodeOf(&response.m_vecResponse).unwrap_or(0)),
+                    "negative response suppressed because the request was functionally addressed"
+                );
+                continue;
+            }
+
+            vecResponses.push(response);
+        }
+
+        // Ascending response identifier: CAN arbitration is won by the lower identifier, so
+        // this is the order the answers would appear on a real bus.
+        vecResponses.sort_by_key(|response| response.m_u32ResponseCanId);
+
+        // An empty vector is not "no target": the identifier was known and the ECUs did
+        // process the request — they were simply all required to stay quiet.
+        RoutingOutcome::Handled(vecResponses)
     }
 }
 
@@ -216,12 +359,12 @@ fn ProcessOnEcu(
     vecRequest: &[u8],
     protocol: &dyn ProtocolHandler,
 ) -> RoutedResponse {
-    // Every routed ECU has a CAN address — `BuildEcuMap` rejects the model otherwise — so
-    // reading it back here cannot fail.
+    // Only ECUs that carry a CAN address are ever started, so reading it back here cannot
+    // fail: `BuildEcuMap` skips the rest.
     let u32ResponseCanId = runningEcu
         .Config()
         .m_optCanAddress
-        .expect("a routed ECU always has a CAN address; BuildEcuMap enforces it")
+        .expect("a started ECU always has a CAN address; BuildEcuMap only starts those")
         .m_u32ResponseCanId;
     let strEcuName = runningEcu.Config().m_strName.clone();
 
@@ -247,10 +390,16 @@ fn ProcessOnEcu(
         m_strEcuName: strEcuName,
         m_u32ResponseCanId: u32ResponseCanId,
         m_vecResponse: vecResponse,
+        m_bySession: runningEcu.CurrentSession(),
+        m_bIsSecurityUnlocked: runningEcu.IsSecurityUnlocked(),
     }
 }
 
-/// Build the request-identifier → running-ECU map, rejecting models that cannot be routed.
+/// Build the request-identifier -> running-ECU map, rejecting models that cannot be routed.
+///
+/// An ECU without CAN addressing is skipped rather than failing the whole load: a model can
+/// legitimately hold ECUs from a source that carries no CAN addressing, and a partial vehicle
+/// is more useful than none (README §7). Only a model with nothing routable at all is refused.
 fn BuildEcuMap(vehicle: &Vehicle) -> Result<BTreeMap<u32, VirtualEcu>, SimulationError> {
     if vehicle.m_vecEcus.is_empty() {
         return Err(SimulationError::NoEcusFound);
@@ -258,28 +407,127 @@ fn BuildEcuMap(vehicle: &Vehicle) -> Result<BTreeMap<u32, VirtualEcu>, Simulatio
 
     let mut mapEcus: BTreeMap<u32, VirtualEcu> = BTreeMap::new();
     for config in &vehicle.m_vecEcus {
-        let u32RequestCanId = RequestCanIdOf(config)?;
+        let address = match config.m_optCanAddress {
+            Some(address) => address,
+            None => {
+                tracing::warn!(
+                    ecu = %config.m_strName,
+                    "ECU has no CAN address and cannot be reached on CAN; it is loaded but not started"
+                );
+                continue;
+            }
+        };
 
-        if let Some(existing) = mapEcus.get(&u32RequestCanId) {
-            return Err(SimulationError::DuplicateRequestCanId {
-                u32RequestCanId,
-                strFirstEcu: existing.Config().m_strName.clone(),
-                strSecondEcu: config.m_strName.clone(),
-            });
-        }
+        RejectDuplicateIdentifiers(&mapEcus, config, &address)?;
+        mapEcus.insert(address.m_u32RequestCanId, VirtualEcu::New(config.clone()));
+    }
 
-        mapEcus.insert(u32RequestCanId, VirtualEcu::New(config.clone()));
+    if mapEcus.is_empty() {
+        return Err(SimulationError::NoRoutableEcus);
     }
 
     Ok(mapEcus)
 }
 
-/// The CAN identifier an ECU is addressed on, or an error if the model does not record one.
-fn RequestCanIdOf(config: &Ecu) -> Result<u32, SimulationError> {
-    match config.m_optCanAddress {
-        Some(address) => Ok(address.m_u32RequestCanId),
-        None => Err(SimulationError::MissingCanAddress {
-            strEcuName: config.m_strName.clone(),
-        }),
+/// Refuse an ECU whose identifiers collide with one already started: two ECUs on one request
+/// identifier make routing ambiguous, and two on one response identifier make their answers
+/// indistinguishable on the wire.
+fn RejectDuplicateIdentifiers(
+    mapEcus: &BTreeMap<u32, VirtualEcu>,
+    config: &Ecu,
+    address: &CanAddress,
+) -> Result<(), SimulationError> {
+    if let Some(existing) = mapEcus.get(&address.m_u32RequestCanId) {
+        return Err(SimulationError::DuplicateRequestCanId {
+            u32RequestCanId: address.m_u32RequestCanId,
+            strFirstEcu: existing.Config().m_strName.clone(),
+            strSecondEcu: config.m_strName.clone(),
+        });
+    }
+
+    for existing in mapEcus.values() {
+        let optExistingAddress = existing.Config().m_optCanAddress;
+        let bSharesResponseId = matches!(
+            optExistingAddress,
+            Some(existingAddress)
+                if existingAddress.m_u32ResponseCanId == address.m_u32ResponseCanId
+        );
+        if bSharesResponseId {
+            return Err(SimulationError::DuplicateResponseCanId {
+                u32ResponseCanId: address.m_u32ResponseCanId,
+                strFirstEcu: existing.Config().m_strName.clone(),
+                strSecondEcu: config.m_strName.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the broadcast-identifier -> listening-ECU map from the started ECUs.
+///
+/// The targets are ordered by response identifier so a broadcast produces answers in the order
+/// CAN arbitration would.
+fn BuildFunctionalTargetMap(
+    mapEcus: &BTreeMap<u32, VirtualEcu>,
+) -> Result<BTreeMap<u32, Vec<u32>>, SimulationError> {
+    let mut mapTargets: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+
+    for (u32RequestCanId, runningEcu) in mapEcus {
+        let address = match runningEcu.Config().m_optCanAddress {
+            Some(address) => address,
+            None => continue,
+        };
+        let u32FunctionalCanId = match address.m_optU32FunctionalCanId {
+            Some(u32FunctionalCanId) => u32FunctionalCanId,
+            None => continue,
+        };
+
+        // A broadcast identifier that is also some ECU's own request identifier would make
+        // routing ambiguous — the physical branch would always win and shadow the broadcast.
+        if let Some(shadowed) = mapEcus.get(&u32FunctionalCanId) {
+            return Err(SimulationError::FunctionalIdCollidesWithPhysical {
+                u32CanId: u32FunctionalCanId,
+                strEcuName: shadowed.Config().m_strName.clone(),
+            });
+        }
+
+        mapTargets
+            .entry(u32FunctionalCanId)
+            .or_default()
+            .push((address.m_u32ResponseCanId, *u32RequestCanId));
+    }
+
+    let mut mapOrdered: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (u32FunctionalCanId, mut vecTargets) in mapTargets {
+        vecTargets.sort_by_key(|(u32ResponseCanId, _)| *u32ResponseCanId);
+        let vecRequestIds = vecTargets
+            .into_iter()
+            .map(|(_, u32RequestCanId)| u32RequestCanId)
+            .collect();
+        mapOrdered.insert(u32FunctionalCanId, vecRequestIds);
+    }
+
+    Ok(mapOrdered)
+}
+
+/// The NRC of a negative response, or `None` if the bytes are not one.
+fn NegativeResponseCodeOf(vecResponse: &[u8]) -> Option<u8> {
+    if vecResponse.len() < 3 || vecResponse[0] != c_byNegativeResponseSid {
+        return None;
+    }
+    Some(vecResponse[2])
+}
+
+/// True when a negative response must not be sent because the request was functionally
+/// addressed (ISO 14229-1 clause 7.5.3.3 Table 5, clause 7.5.4.3 Table 7).
+///
+/// The rule keeps a broadcast from drawing a chorus of "I do not support that" from every ECU
+/// on the bus. It applies to negative responses only; the suppressPosRspMsgIndicationBit is a
+/// separate mechanism and does not affect them.
+fn IsNegativeResponseSuppressedFunctionally(vecResponse: &[u8]) -> bool {
+    match NegativeResponseCodeOf(vecResponse) {
+        Some(byNrc) => c_arrFunctionallySuppressedNrcs.contains(&byNrc),
+        None => false,
     }
 }

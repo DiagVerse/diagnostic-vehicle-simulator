@@ -67,7 +67,16 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
         // A PDU is first tested as an answer to something outstanding; only if it answers
         // nothing is it considered as a new request.
         if let Some(uIndex) = FindPendingRequestFor(&vecPending, pdu) {
-            let pending = vecPending.remove(uIndex);
+            // A functional request is answered by every ECU that listens on the broadcast
+            // identifier, so it stays outstanding for the ECUs still to answer; a physical
+            // request has exactly one answer and is retired once it arrives.
+            let bIsFunctional = IsFunctionalRequestCanId(vecPending[uIndex].m_u32RequestCanId);
+            let pending = if bIsFunctional {
+                ClonePendingRequest(&vecPending[uIndex])
+            } else {
+                vecPending.remove(uIndex)
+            };
+
             let ecu = EcuFor(&mut mapEcus, pdu.m_u32CanId);
             RecordCanAddress(ecu, pending.m_u32RequestCanId, pdu.m_u32CanId);
             ApplyPair(ecu, &pending.m_vecBytes, &pdu.m_vecBytes);
@@ -261,51 +270,73 @@ fn IsFunctionalRequestCanId(u32CanId: u32) -> bool {
     NormalFixedTaTypeOf(u32CanId) == Some(c_byNormalFixedFunctionalTaType)
 }
 
-/// Record the CAN identifier pair an ECU is reached on.
+/// Copy an outstanding request so it can be matched again by another responder.
+fn ClonePendingRequest(pending: &PendingRequest) -> PendingRequest {
+    PendingRequest {
+        m_u32RequestCanId: pending.m_u32RequestCanId,
+        m_byServiceId: pending.m_byServiceId,
+        m_vecBytes: pending.m_vecBytes.clone(),
+    }
+}
+
+/// Record the CAN identifiers an ECU is reached on, from one correlated exchange.
 ///
-/// When the request was physically addressed, both identifiers were seen on the bus and the
-/// pair is `Observed`. When it was functionally addressed (0x7DF), the ECU's own request
-/// identifier was never on the bus, so it is derived from the response identifier by
-/// convention and recorded as `Inferred`. An already-`Observed` pair is never downgraded by a
-/// later inference.
+/// A physically addressed exchange puts both identifiers on the bus, so the pair is
+/// `Observed`. A functionally addressed one only reveals the broadcast identifier the ECU
+/// listens on; the ECU's own request identifier has to be derived from its response identifier
+/// by an addressing convention, which is `Inferred` — and only possible at all for the
+/// legislated 11-bit range or 29-bit normal fixed addressing.
 fn RecordCanAddress(ecu: &mut Ecu, u32RequestCanId: u32, u32ResponseCanId: u32) {
-    let bIsFunctional = IsFunctionalRequestCanId(u32RequestCanId);
-
-    let (u32PhysicalRequestId, confidence) = if bIsFunctional {
-        match DeriveRequestCanId(u32ResponseCanId) {
-            Some(u32Derived) => (u32Derived, Confidence::Inferred),
-            // Nothing to derive from: keep whatever we already have rather than recording the
-            // shared broadcast identifier as if it belonged to this ECU.
-            None => return,
-        }
-    } else {
-        (u32RequestCanId, Confidence::Observed)
-    };
-
-    let bWouldDowngrade = matches!(
-        ecu.m_optCanAddress,
-        Some(existing) if existing.m_confidence == Confidence::Observed
-    ) && confidence == Confidence::Inferred;
-    if bWouldDowngrade {
+    if IsFunctionalRequestCanId(u32RequestCanId) {
+        RecordFunctionalListen(ecu, u32RequestCanId, u32ResponseCanId);
         return;
     }
 
-    let mode = AddressingModeOf(u32PhysicalRequestId, u32ResponseCanId);
-
-    // A functional identifier actually seen addressing this ECU beats the standard's default,
-    // because it was observed rather than assumed.
-    let optU32FunctionalCanId = if bIsFunctional {
-        Some(u32RequestCanId)
-    } else {
-        ExistingFunctionalCanId(ecu).or_else(|| DefaultFunctionalCanId(u32PhysicalRequestId, mode))
-    };
+    let mode = AddressingModeOf(u32RequestCanId, u32ResponseCanId);
+    let optU32FunctionalCanId =
+        ExistingFunctionalCanId(ecu).or_else(|| DefaultFunctionalCanId(u32RequestCanId, mode));
 
     ecu.m_optCanAddress = Some(CanAddress {
-        m_u32RequestCanId: u32PhysicalRequestId,
+        m_u32RequestCanId: u32RequestCanId,
         m_u32ResponseCanId: u32ResponseCanId,
         m_optU32FunctionalCanId: optU32FunctionalCanId,
         m_addressingMode: mode,
-        m_confidence: confidence,
+        m_confidence: Confidence::Observed,
+    });
+}
+
+/// Record that an ECU answered a broadcast request.
+///
+/// If the ECU's physical addressing is already known, only the broadcast identifier is added —
+/// an observed physical pair is never downgraded by an inference. If this broadcast is the
+/// first sighting of the ECU, its own request identifier is derived where a convention allows
+/// and marked `Inferred`; where none does (an OEM identifier pair), the ECU is left without a
+/// CAN address rather than having the shared broadcast identifier recorded as its own, which
+/// would collide with every other listener.
+fn RecordFunctionalListen(ecu: &mut Ecu, u32FunctionalCanId: u32, u32ResponseCanId: u32) {
+    if let Some(address) = ecu.m_optCanAddress.as_mut() {
+        address.m_optU32FunctionalCanId = Some(u32FunctionalCanId);
+        return;
+    }
+
+    let u32RequestCanId = match DeriveRequestCanId(u32ResponseCanId) {
+        Some(u32Derived) => u32Derived,
+        None => {
+            tracing::debug!(
+                responseCanId = format!("{u32ResponseCanId:03X}"),
+                "ECU answered a broadcast on an identifier no convention pairs; \
+                 leaving it unaddressed until a physical exchange is seen"
+            );
+            return;
+        }
+    };
+
+    ecu.m_optCanAddress = Some(CanAddress {
+        m_u32RequestCanId: u32RequestCanId,
+        m_u32ResponseCanId: u32ResponseCanId,
+        m_optU32FunctionalCanId: Some(u32FunctionalCanId),
+        m_addressingMode: AddressingModeOf(u32RequestCanId, u32ResponseCanId),
+        m_confidence: Confidence::Inferred,
     });
 }
 
@@ -708,6 +739,74 @@ mod tests {
         assert_eq!(
             address.m_addressingMode,
             CanAddressingMode::NormalFixed29Bit
+        );
+    }
+
+    #[test]
+    fn one_broadcast_request_discovers_every_ecu_that_answers_it() {
+        // A tester discovers the bus by broadcasting: one request, several answers. All of
+        // them must be recorded, not just the first.
+        let frames = vec![
+            f(0x7DF, 0.001, vec![0x02, 0x3E, 0x00]),
+            f(0x7E8, 0.002, vec![0x02, 0x7E, 0x00]),
+            f(0x7E9, 0.003, vec![0x02, 0x7E, 0x00]),
+            f(0x7EA, 0.004, vec![0x02, 0x7E, 0x00]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        assert_eq!(vehicle.m_vecEcus.len(), 3);
+
+        for ecu in &vehicle.m_vecEcus {
+            let address = ecu.m_optCanAddress.expect("CAN address recorded");
+            assert_eq!(
+                address.m_optU32FunctionalCanId,
+                Some(c_u32Functional11BitCanId)
+            );
+            assert_eq!(address.m_confidence, Confidence::Inferred);
+        }
+    }
+
+    #[test]
+    fn an_oem_ecu_seen_only_on_a_broadcast_is_left_unaddressed() {
+        // 0x765 is an OEM response identifier; no convention says which identifier a tester
+        // reaches it on, and recording the shared 0x7DF as its own would collide with every
+        // other listener.
+        let frames = vec![
+            f(0x7DF, 0.001, vec![0x02, 0x3E, 0x00]),
+            f(0x765, 0.002, vec![0x02, 0x7E, 0x00]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        assert_eq!(vehicle.m_vecEcus.len(), 1);
+
+        let ecu = &vehicle.m_vecEcus[0];
+        assert!(ecu.m_vecSupportedServices.contains(&0x3E));
+        assert!(
+            ecu.m_optCanAddress.is_none(),
+            "no identifier pair can be derived, so none is invented"
+        );
+    }
+
+    #[test]
+    fn a_later_broadcast_adds_the_functional_id_to_an_observed_pair() {
+        let frames = vec![
+            f(0x745, 0.001, vec![0x02, 0x10, 0x03]),
+            f(0x765, 0.002, vec![0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4]),
+            f(0x7DF, 0.003, vec![0x02, 0x3E, 0x00]),
+            f(0x765, 0.004, vec![0x02, 0x7E, 0x00]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        let address = vehicle.m_vecEcus[0]
+            .m_optCanAddress
+            .expect("CAN address recorded");
+
+        assert_eq!(address.m_u32RequestCanId, 0x745);
+        assert_eq!(address.m_confidence, Confidence::Observed);
+        // The broadcast identifier was observed even though no standard mandates it here.
+        assert_eq!(
+            address.m_optU32FunctionalCanId,
+            Some(c_u32Functional11BitCanId)
         );
     }
 
