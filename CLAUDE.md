@@ -92,6 +92,10 @@ The project naming convention below (Hungarian-style prefixes like `m_iRetryCoun
 
 Add that to every engine crate's `lib.rs`/`main.rs` that uses the prefix convention. Do **not** remove `-D warnings` from CI — keep every other lint enforced. JavaScript/TypeScript has no equivalent conflict. Type/struct/enum/trait names remain `PascalCase` (already idiomatic Rust), so no allow is needed for them.
 
+**Two settled decisions:**
+- **Scope — going forward only.** The convention applies to all code written from **Phase 1 onward**. The small Phase 0 scaffold (`core-domain`, `plugin-contract`, `application`, `api`, `app`, `sample-plugin`) was written before the convention and is intentionally left in idiomatic snake_case — do **not** mass-rename it. When materially editing a Phase 0 file later, migrate the touched code to the convention; don't churn untouched code.
+- **Serialized boundary structs use serde rename.** Structs that cross to JS/JSON use Hungarian field names in Rust plus `#[serde(rename_all = "camelCase")]` (or explicit `#[serde(rename = "...")]`) so the wire/JS side sees clean camelCase (`serviceId`, `transactionId`). Internal (non-serialized) types just use the Hungarian names directly.
+
 ## 1. Golden Rules
 
 1. Readability over cleverness.
