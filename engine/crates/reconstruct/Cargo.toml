@@ -11,3 +11,12 @@ can.workspace = true
 isotp.workspace = true
 core-domain.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Round-trip test: rebuild a VirtualEcu from the reconstructed model and replay the log's
+# requests through the real UDS logic, asserting the responses match what was observed.
+ecu.workspace = true
+uds-plugin.workspace = true
+application.workspace = true
+plugin-contract.workspace = true
+abi_stable.workspace = true

@@ -15,6 +15,7 @@ application.workspace = true
 api.workspace = true
 core-domain.workspace = true
 ecu.workspace = true
+reconstruct.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

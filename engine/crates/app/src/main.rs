@@ -5,12 +5,14 @@
 //! once; everything else depends inward.
 //!
 //! Usage:
-//!   dvsim serve [--addr 127.0.0.1:8080] [--plugins <dir>]
-//!   dvsim demo  [--plugins <dir>]
+//!   dvsim serve       [--addr 127.0.0.1:8080] [--plugins <dir>]
+//!   dvsim demo        [--plugins <dir>]
+//!   dvsim reconstruct <canlog-file>
 //!
 //! With no arguments it defaults to `serve` on 127.0.0.1:8080 reading `plugins.d/`.
 
 mod demo;
+mod reconstruct_cmd;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -26,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         Cli::Serve { addr, plugins } => serve(addr, plugins).await,
         Cli::Demo { plugins } => demo::Run(&plugins),
+        Cli::Reconstruct { path } => reconstruct_cmd::Run(&path),
         Cli::Help => {
             print_help();
             Ok(())
@@ -70,6 +73,7 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
 enum Cli {
     Serve { addr: SocketAddr, plugins: PathBuf },
     Demo { plugins: PathBuf },
+    Reconstruct { path: PathBuf },
     Help,
 }
 
@@ -77,7 +81,8 @@ impl Cli {
     fn parse(args: impl Iterator<Item = String>) -> Self {
         let mut addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid default addr");
         let mut plugins = default_plugin_dir();
-        let mut subcommand: Option<String> = None;
+        // Positional arguments in order: [0] = subcommand, [1] = subcommand argument.
+        let mut positional: Vec<String> = Vec::new();
 
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -95,14 +100,19 @@ impl Cli {
                         plugins = PathBuf::from(v);
                     }
                 }
-                other if subcommand.is_none() => subcommand = Some(other.to_string()),
-                _ => {}
+                other => positional.push(other.to_string()),
             }
         }
 
-        match subcommand.as_deref() {
+        match positional.first().map(String::as_str) {
             None | Some("serve") => Cli::Serve { addr, plugins },
             Some("demo") => Cli::Demo { plugins },
+            Some("reconstruct") => match positional.get(1) {
+                Some(path) => Cli::Reconstruct {
+                    path: PathBuf::from(path),
+                },
+                None => Cli::Help,
+            },
             _ => Cli::Help,
         }
     }
@@ -112,8 +122,9 @@ fn print_help() {
     println!(
         "dvsim — Diagnostic Vehicle Simulator engine\n\n\
          USAGE:\n\
-         \x20   dvsim serve [--addr <ip:port>] [--plugins <dir>]\n\
-         \x20   dvsim demo  [--plugins <dir>]\n\n\
+         \x20   dvsim serve       [--addr <ip:port>] [--plugins <dir>]\n\
+         \x20   dvsim demo        [--plugins <dir>]\n\
+         \x20   dvsim reconstruct <canlog-file>\n\n\
          OPTIONS:\n\
          \x20   --addr <ip:port>   Address to listen on (default 127.0.0.1:8080)\n\
          \x20   --plugins <dir>    Plugin drop-in directory (default plugins.d)\n\
