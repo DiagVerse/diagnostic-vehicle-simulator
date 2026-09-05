@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-Implementation has started. **Phase 0 (bootstrap) is complete**: the repo is under git, with a Rust engine workspace, a Vite/React/TypeScript UI, a working runtime plugin system, and CI. The build plan lives in `/Users/sri/.claude/plans/go-through-the-readme-md-transient-dongarra.md`.
+Implementation has started. **Phase 0 (bootstrap) and Phase 1 (core diagnostic engine) are complete.** The repo is under git (remote `DiagVerse/diagnostic-vehicle-simulator`), with a Rust engine workspace, a Vite/React/TypeScript UI, a working runtime plugin system, and CI. The build plan lives in `/Users/sri/.claude/plans/go-through-the-readme-md-transient-dongarra.md`.
+
+Phase 1 delivered: the Unified Vehicle Model (`core-domain`), a UDS (ISO 14229) protocol as a dynamically-loaded plugin (`plugins/protocols/l7-application/uds`), a stateful virtual ECU runtime (`crates/ecu`), and the `ProtocolHandler` port bridging the two (`application`). `dvsim demo` runs a full diagnostic session through the dynamically-loaded UDS plugin. Next: Phase 2 (CAN + ISO-TP + CAN-log reconstruction).
 
 - `README.md` is the authoritative source for *intended* behavior, scope, and long-term architecture. Its `Project Structure` tree (§20) is a historical proposal — the **actual** layout is the hexagonal/OSI structure described below, not that tree.
 - The engine lives in `engine/` (Cargo workspace); the UI in `ui/`; runtime plugins are dropped into `plugins.d/`. Architecture decisions are recorded in `docs/architecture/`.
