@@ -3,6 +3,7 @@
 //! exposes it over HTTP. It contains no business logic.
 
 pub mod diagnostics;
+pub mod hardware;
 pub mod simulation;
 
 use std::{
@@ -34,11 +35,15 @@ pub struct AppState {
     pub ecu: Mutex<VirtualEcu>,
     /// The loaded vehicle simulation the `/simulation/*` endpoints drive. Guarded by a mutex
     /// for the same reason as `ecu`: it holds live ECU state and is mutated by requests.
-    pub simulation: Mutex<SimulationService>,
+    /// Shared rather than owned: the hardware bridge runs in its own task and drives the same
+    /// simulation the HTTP endpoints do, so an ECU behaves identically either way.
+    pub simulation: Arc<Mutex<SimulationService>>,
     /// Request CAN identifiers whose ECU is part-way through a ResponsePending sequence. Such
     /// an ECU has told the tester it cannot receive another request (ISO 14229-1 Annex A.1),
     /// so a second one is refused instead of mutating its state mid-answer.
     pub busy_ecus: Mutex<BTreeSet<u32>>,
+    /// The CAN bridge, when one is running.
+    pub hardware: Mutex<hardware::HardwareState>,
 }
 
 /// Response body for `GET /health`.
@@ -67,6 +72,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/simulation/reset", post(simulation::PostSimulationReset))
         .route("/simulation/start", post(simulation::PostSimulationStart))
         .route("/simulation/stop", post(simulation::PostSimulationStop))
+        .route("/hw/ports", get(hardware::GetSerialPorts))
+        .route("/hw/status", get(hardware::GetHardwareStatus))
+        .route("/hw/start", post(hardware::PostHardwareStart))
+        .route("/hw/stop", post(hardware::PostHardwareStop))
         .route("/simulation/topology", get(simulation::GetTopology))
         .route("/simulation/vehicle", post(simulation::PostCreateVehicle))
         .route("/simulation/ecus", post(simulation::PostAddEcu))

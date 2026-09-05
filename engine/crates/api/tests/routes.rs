@@ -21,8 +21,9 @@ fn EmptyState() -> Arc<AppState> {
         plugins: Vec::new(),
         protocol: None,
         ecu: Mutex::new(ecu::VirtualEcu::New(ecu::sample::BuildEngineEcu())),
-        simulation: Mutex::new(simulation::SimulationService::New()),
+        simulation: Arc::new(Mutex::new(simulation::SimulationService::New())),
         busy_ecus: Mutex::new(BTreeSet::new()),
+        hardware: Mutex::new(api::hardware::HardwareState::default()),
     })
 }
 
@@ -49,6 +50,10 @@ async fn every_simulation_route_is_reachable() {
         ("GET", "/health", ""),
         ("GET", "/plugins", ""),
         ("GET", "/simulation/state", ""),
+        ("GET", "/hw/ports", ""),
+        ("GET", "/hw/status", ""),
+        ("POST", "/hw/stop", "{}"),
+        ("GET", "/simulation/topology", ""),
         ("POST", "/simulation/reset", "{}"),
         (
             "POST",

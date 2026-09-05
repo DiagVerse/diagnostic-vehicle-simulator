@@ -1,0 +1,24 @@
+[package]
+name = "serial-can"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Serial transports for a CAN bridge: a real COM port, a virtual one, and an in-memory loopback for tests."
+
+[features]
+# On by default so a normal build can open a real port. CI and any host without the serial
+# stack can still build the crate — and everything above it — with `--no-default-features`.
+default = ["serial"]
+serial = ["dep:serialport"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+# `default-features = false` drops the libudev dependency, which is a system package the
+# enumeration path is not worth requiring. Ports are still opened by name on every platform.
+serialport = { version = "4", default-features = false, optional = true }
+
+# Only to put a virtual port into non-blocking mode; std offers no portable way to do it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

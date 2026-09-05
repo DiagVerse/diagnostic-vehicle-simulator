@@ -14,6 +14,9 @@ members = [
     "crates/isotp",
     "crates/reconstruct",
     "crates/simulation",
+    "crates/serial-can",
+    "crates/slcan",
+    "crates/bridge",
     "plugins/sample",
     "plugins/protocols/l7-application/uds",
 ]
@@ -52,6 +55,9 @@ can = { path = "crates/can" }
 isotp = { path = "crates/isotp" }
 reconstruct = { path = "crates/reconstruct" }
 simulation = { path = "crates/simulation" }
+serial-can = { path = "crates/serial-can" }
+slcan = { path = "crates/slcan" }
+bridge = { path = "crates/bridge" }
 uds-plugin = { path = "plugins/protocols/l7-application/uds" }
 
 [profile.release]

@@ -1,10 +1,10 @@
 [package]
-name = "isotp"
+name = "slcan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "ISO-TP (ISO 15765-2) reassembly of CAN frames into UDS PDUs (OSI L4 transport)."
+description = "SLCAN/LAWICEL ASCII codec: CAN frames to and from the line protocol USB-CAN adapters speak."
 
 [dependencies]
 can.workspace = true

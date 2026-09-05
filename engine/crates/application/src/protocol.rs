@@ -15,7 +15,10 @@ use crate::plugin_host::PluginHost;
 /// A native handle to something that can process a diagnostic request. Implemented by
 /// [`ProtocolPlugin`] (a dynamically-loaded plugin), but the ECU only depends on this trait,
 /// so an in-process or test handler works identically.
-pub trait ProtocolHandler {
+///
+/// `Send + Sync` because the CAN bridge runs in its own task and holds one across await
+/// points. A plugin handle is a name and a function pointer, so this costs nothing.
+pub trait ProtocolHandler: Send + Sync {
     /// Handle one request against an ECU state snapshot, returning the response + changes.
     fn Handle(&self, vecRequest: RVec<u8>, snapshot: REcuSnapshot) -> RProtocolOutcome;
 
@@ -26,6 +29,10 @@ pub trait ProtocolHandler {
 /// A protocol handler backed by a loaded plugin's stable-ABI `handle_request` function. The
 /// underlying module lives for the process lifetime (abi_stable leaks it), so the stored
 /// function pointer stays valid.
+///
+/// Cloneable, and cheaply: it is a name and a function pointer. That lets a long-running task —
+/// the CAN bridge — own its own handle rather than borrow one from shared state.
+#[derive(Clone)]
 pub struct ProtocolPlugin {
     m_strName: String,
     m_fnHandle: extern "C" fn(RVec<u8>, REcuSnapshot) -> RProtocolOutcome,
