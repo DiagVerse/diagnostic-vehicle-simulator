@@ -61,6 +61,7 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
         plugins: host.infos().to_vec(),
         protocol,
         ecu: std::sync::Mutex::new(ecu::VirtualEcu::New(ecu::sample::BuildEngineEcu())),
+        simulation: std::sync::Mutex::new(simulation::SimulationService::New()),
     });
 
     api::serve(addr, state)

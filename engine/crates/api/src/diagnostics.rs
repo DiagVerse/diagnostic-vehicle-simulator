@@ -134,7 +134,7 @@ fn ErrorResult(strRequestHex: &str, strError: String) -> RequestResultDto {
 }
 
 /// Human-readable name for a UDS session sub-function byte.
-fn SessionName(bySession: u8) -> String {
+pub(crate) fn SessionName(bySession: u8) -> String {
     match bySession {
         0x01 => "Default".to_string(),
         0x02 => "Programming".to_string(),
@@ -145,7 +145,7 @@ fn SessionName(bySession: u8) -> String {
 }
 
 /// Format bytes as space-separated uppercase hex.
-fn FormatHex(vecBytes: &[u8]) -> String {
+pub(crate) fn FormatHex(vecBytes: &[u8]) -> String {
     vecBytes
         .iter()
         .map(|byByte| format!("{byByte:02X}"))
@@ -154,7 +154,7 @@ fn FormatHex(vecBytes: &[u8]) -> String {
 }
 
 /// Parse a hex string (spaces optional, e.g. "22 F1 90" or "22F190") into bytes.
-fn ParseHex(strInput: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn ParseHex(strInput: &str) -> Result<Vec<u8>, String> {
     let strClean: String = strInput.chars().filter(|c| !c.is_whitespace()).collect();
 
     if strClean.is_empty() {
