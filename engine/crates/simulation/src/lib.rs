@@ -153,6 +153,12 @@ impl RoutedResponse {
 /// The result of routing one inbound request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoutingOutcome {
+    /// The simulation is stopped, so every ECU is off the bus.
+    ///
+    /// Distinct from `NoTarget`: the wire looks the same — silence either way — but the reason
+    /// is entirely different, and an operator who has forgotten they pressed stop needs to be
+    /// told which one they are looking at.
+    Stopped,
     /// No loaded ECU listens on that request identifier. A real ECU is silent on an
     /// identifier it does not own — it does **not** answer with a negative response — so the
     /// simulator stays silent too.
@@ -171,6 +177,10 @@ pub struct SimulationService {
     /// For each functional (broadcast) identifier, the physical request identifiers of the
     /// ECUs that listen on it, in ascending response-identifier order.
     m_mapFunctionalTargets: BTreeMap<u32, Vec<u32>>,
+    /// Whether the ECUs are on the bus. Stopping is the simulator's equivalent of pulling
+    /// power: nothing answers, but the model and every ECU's diagnostic state are kept, so
+    /// starting again resumes exactly where it left off. Clearing state is what a reset is for.
+    m_bIsRunning: bool,
 }
 
 impl Default for SimulationService {
@@ -186,7 +196,32 @@ impl SimulationService {
             m_optVehicle: None,
             m_mapEcusByRequestId: BTreeMap::new(),
             m_mapFunctionalTargets: BTreeMap::new(),
+            m_bIsRunning: true,
         }
+    }
+
+    /// Put the ECUs on the bus.
+    pub fn Start(&mut self) {
+        if !self.m_bIsRunning {
+            tracing::info!(ecus = self.m_mapEcusByRequestId.len(), "simulation started");
+        }
+        self.m_bIsRunning = true;
+    }
+
+    /// Take the ECUs off the bus, keeping the model and their diagnostic state.
+    pub fn Stop(&mut self) {
+        if self.m_bIsRunning {
+            tracing::info!(
+                ecus = self.m_mapEcusByRequestId.len(),
+                "simulation stopped; ECUs keep their state and will resume where they left off"
+            );
+        }
+        self.m_bIsRunning = false;
+    }
+
+    /// Whether the ECUs are currently answering.
+    pub fn IsRunning(&self) -> bool {
+        self.m_bIsRunning
     }
 
     /// Reconstruct a vehicle from CAN-log text and start every ECU in it.
@@ -467,6 +502,14 @@ impl SimulationService {
         vecRequest: &[u8],
         protocol: &dyn ProtocolHandler,
     ) -> RoutingOutcome {
+        if !self.m_bIsRunning {
+            tracing::debug!(
+                requestCanId = format!("{u32RequestCanId:03X}"),
+                "simulation is stopped; nothing answers"
+            );
+            return RoutingOutcome::Stopped;
+        }
+
         if self.m_mapEcusByRequestId.contains_key(&u32RequestCanId) {
             return self.ProcessPhysical(u32RequestCanId, vecRequest, protocol);
         }

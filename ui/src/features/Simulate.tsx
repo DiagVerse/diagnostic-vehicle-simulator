@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
+import { NEGATIVE_RESPONSES, UDS_CATALOGUE } from './udsCatalogue'
 import {
   api,
   type EcuTiming,
@@ -97,6 +98,18 @@ export function Simulate() {
     }
   }
 
+  async function toggleRunning() {
+    setBusy(true)
+    try {
+      setState(await (state?.running ? api.simulationStop() : api.simulationStart()))
+      setError(null)
+    } catch (e) {
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function reset() {
     setBusy(true)
     try {
@@ -115,6 +128,13 @@ export function Simulate() {
       {error && (
         <div className="rounded-lg border border-red-900/60 bg-red-950/40 px-4 py-3 text-sm text-red-300">
           {error}
+        </div>
+      )}
+
+      {state?.loaded && !state.running && (
+        <div className="rounded-lg border border-amber-900/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-300">
+          Simulation stopped — the ECUs are off the bus and answer nothing. Their sessions,
+          security state and overrides are kept, so starting again resumes where it left off.
         </div>
       )}
 
@@ -140,6 +160,7 @@ export function Simulate() {
           <EcuList
             state={state}
             onReset={reset}
+            onToggleRunning={toggleRunning}
             onChanged={setState}
             onError={setError}
             busy={busy}
@@ -441,12 +462,14 @@ function EmptyState() {
 function EcuList({
   state,
   onReset,
+  onToggleRunning,
   onChanged,
   onError,
   busy,
 }: {
   state: SimulationState
   onReset: () => void
+  onToggleRunning: () => void
   onChanged: (state: SimulationState) => void
   onError: (message: string | null) => void
   busy: boolean
@@ -472,13 +495,30 @@ function EcuList({
         />
       ))}
 
-      <button
-        onClick={onReset}
-        disabled={busy}
-        className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
-      >
-        Reset all ECUs
-      </button>
+      <div className="flex gap-2">
+        <button
+          onClick={onToggleRunning}
+          disabled={busy}
+          title={
+            state.running
+              ? 'Take the ECUs off the bus, keeping their state'
+              : 'Put the ECUs back on the bus'
+          }
+          className={`flex-1 rounded-md px-3 py-2 text-sm font-medium text-white transition disabled:opacity-40 ${
+            state.running ? 'bg-rose-800 hover:bg-rose-700' : 'bg-emerald-700 hover:bg-emerald-600'
+          }`}
+        >
+          {state.running ? 'Stop simulation' : 'Start simulation'}
+        </button>
+        <button
+          onClick={onReset}
+          disabled={busy}
+          title="Return every ECU to the default session with security locked; keeps the model, the timing and the overrides"
+          className="rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+        >
+          Reset state
+        </button>
+      </div>
     </aside>
   )
 }
@@ -716,32 +756,13 @@ function RequestPanel({
 // Response overrides
 // ---------------------------------------------------------------------------------------
 
-/** The requests worth offering first — the ones a tester actually sends. */
-const REQUEST_CATALOGUE: { label: string; requestHex: string; responseHex: string }[] = [
-  { label: '0x22 ReadDataByIdentifier', requestHex: '22 F1 90', responseHex: '62 F1 90 00' },
-  { label: '0x2E WriteDataByIdentifier', requestHex: '2E F1 90 00', responseHex: '6E F1 90' },
-  { label: '0x14 ClearDiagnosticInformation', requestHex: '14 FF FF FF', responseHex: '54' },
-  { label: '0x19 ReadDTCInformation', requestHex: '19 02 FF', responseHex: '59 02 FF' },
-  { label: '0x2F InputOutputControl', requestHex: '2F F1 90 03 01', responseHex: '6F F1 90 03' },
-  { label: '0x31 RoutineControl', requestHex: '31 01 F0 00', responseHex: '71 01 F0 00' },
-  { label: '0x34 RequestDownload', requestHex: '34 00 44 00 00 00 00 00 00 01 00', responseHex: '74 20 04 00' },
-  { label: '0x36 TransferData', requestHex: '36 01', responseHex: '76 01' },
-  { label: '0x37 RequestTransferExit', requestHex: '37', responseHex: '77' },
-  { label: '0x28 CommunicationControl', requestHex: '28 01 01', responseHex: '68 01' },
-  { label: '0x85 ControlDTCSetting', requestHex: '85 02', responseHex: 'C5 02' },
-  { label: '0x87 LinkControl', requestHex: '87 01 01', responseHex: 'C7 01' },
-  { label: '0x23 ReadMemoryByAddress', requestHex: '23 14 20 00 00 04', responseHex: '63 00 00 00 00' },
-]
-
-/** Services the engine's UDS plugin answers without help. */
-const IMPLEMENTED_SERVICES = ['10', '11', '19', '22', '27', '31', '3E']
-
 /**
  * Edit what one ECU answers to a particular request.
  *
- * This is the only way to get a positive response out of the services the engine's UDS plugin
- * does not implement, and the only way to make an ECU refuse or ignore a request it would
- * otherwise answer.
+ * The picker is service → sub-function, because `19 02` and `19 04` are different requests with
+ * different parameter shapes; offering one row per service is what made this feel limited.
+ * Both byte fields stay editable before the override is added, so anything the catalogue does
+ * not cover can simply be typed.
  */
 function OverridePanel({
   ecu,
@@ -754,6 +775,10 @@ function OverridePanel({
 }) {
   const [overrides, setOverrides] = useState<ResponseOverride[] | null>(null)
   const [working, setWorking] = useState(false)
+  const [serviceSid, setServiceSid] = useState(UDS_CATALOGUE[0].sid)
+  const [variantIndex, setVariantIndex] = useState(0)
+  const [requestHex, setRequestHex] = useState(UDS_CATALOGUE[0].variants[0].requestHex)
+  const [responseHex, setResponseHex] = useState(UDS_CATALOGUE[0].variants[0].responseHex)
 
   const requestCanIdHex = ecu?.requestCanIdHex
 
@@ -782,6 +807,25 @@ function OverridePanel({
   }
 
   const vecOverrides = overrides ?? []
+  const service = UDS_CATALOGUE.find((entry) => entry.sid === serviceSid) ?? UDS_CATALOGUE[0]
+  const variant = service.variants[variantIndex] ?? service.variants[0]
+
+  function selectService(sid: string) {
+    const next = UDS_CATALOGUE.find((entry) => entry.sid === sid)
+    if (!next) return
+    setServiceSid(sid)
+    setVariantIndex(0)
+    setRequestHex(next.variants[0].requestHex)
+    setResponseHex(next.variants[0].responseHex)
+  }
+
+  function selectVariant(index: number) {
+    const next = service.variants[index]
+    if (!next) return
+    setVariantIndex(index)
+    setRequestHex(next.requestHex)
+    setResponseHex(next.responseHex)
+  }
 
   async function save(vecNext: ResponseOverride[]) {
     if (!ecu) return
@@ -797,20 +841,30 @@ function OverridePanel({
     }
   }
 
-  function addFromCatalogue(requestHex: string, responseHex: string) {
+  function addCurrent(action: 'substitute' | 'suppress') {
     save([
       ...vecOverrides,
       {
         requestHex,
         matchTrailingBytes: false,
-        action: 'substitute',
-        responseHex,
-        echoSpans: [],
+        action,
+        responseHex: action === 'substitute' ? responseHex : null,
+        // Echo spans come from the catalogue entry, but only while its request template is
+        // untouched: an edited template moves the bytes the span points at.
+        echoSpans:
+          action === 'substitute' && requestHex === variant.requestHex
+            ? (variant.echoSpans ?? [])
+            : [],
         enabled: true,
         respondEvenIfSuppressed: false,
-        note: '',
+        note: `${service.name} — ${variant.label}`,
       },
     ])
+  }
+
+  function refuseWith(nrc: string) {
+    const bySid = requestHex.trim().slice(0, 2).toUpperCase()
+    setResponseHex(`7F ${bySid} ${nrc}`)
   }
 
   return (
@@ -822,25 +876,90 @@ function OverridePanel({
         <span className="text-xs text-slate-500">{vecOverrides.length} override(s)</span>
       </div>
 
-      <p className="mt-2 text-xs text-slate-600">
-        The engine&rsquo;s UDS plugin answers {IMPLEMENTED_SERVICES.map((s) => '0x' + s).join(', ')}.
-        Every other service returns <span className="font-mono">7F .. 11</span> until you define
-        a response here.
-      </p>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <label className="block">
+          <span className="text-xs text-slate-400">Service</span>
+          <select
+            value={serviceSid}
+            onChange={(e) => selectService(e.target.value)}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-200 outline-none focus:border-slate-500"
+          >
+            {UDS_CATALOGUE.map((entry) => (
+              <option key={entry.sid} value={entry.sid}>
+                0x{entry.sid} {entry.name}
+                {entry.implemented ? '' : ' — override only'}
+              </option>
+            ))}
+          </select>
+        </label>
 
-      <div className="mt-3">
+        <label className="block">
+          <span className="text-xs text-slate-400">Sub-function / variant</span>
+          <select
+            value={variantIndex}
+            onChange={(e) => selectVariant(Number(e.target.value))}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-200 outline-none focus:border-slate-500"
+          >
+            {service.variants.map((entry, iIndex) => (
+              <option key={entry.label} value={iIndex}>
+                {entry.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {!service.implemented && (
+        <p className="mt-2 rounded border border-amber-900/50 bg-amber-950/20 px-2 py-1.5 text-[11px] text-amber-400/90">
+          The engine&rsquo;s UDS plugin does not implement 0x{service.sid}. Without an override
+          here it answers <span className="font-mono">7F {service.sid} 11</span>.
+        </p>
+      )}
+
+      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        <label className="block">
+          <span className="text-xs text-slate-400">Request (** = any byte)</span>
+          <input
+            value={requestHex}
+            onChange={(e) => setRequestHex(e.target.value)}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 font-mono text-xs text-slate-200 outline-none focus:border-slate-500"
+          />
+        </label>
+        <label className="block">
+          <span className="text-xs text-slate-400">Response</span>
+          <input
+            value={responseHex}
+            onChange={(e) => setResponseHex(e.target.value)}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 font-mono text-xs text-emerald-300 outline-none focus:border-slate-500"
+          />
+        </label>
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => addCurrent('substitute')}
+          disabled={busy || working}
+          className="rounded-md bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Apply response
+        </button>
+        <button
+          onClick={() => addCurrent('suppress')}
+          disabled={busy || working}
+          title="Handle the request but transmit nothing"
+          className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+        >
+          Answer with silence
+        </button>
         <select
           value=""
+          onChange={(e) => e.target.value && refuseWith(e.target.value)}
           disabled={busy || working}
-          onChange={(e) => {
-            const entry = REQUEST_CATALOGUE.find((c) => c.requestHex === e.target.value)
-            if (entry) addFromCatalogue(entry.requestHex, entry.responseHex)
-          }}
-          className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+          className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-300 outline-none focus:border-slate-500"
         >
-          <option value="">Add a response for…</option>
-          {REQUEST_CATALOGUE.map((entry) => (
-            <option key={entry.requestHex} value={entry.requestHex}>
+          <option value="">Refuse with…</option>
+          {NEGATIVE_RESPONSES.map((entry) => (
+            <option key={entry.nrc} value={entry.nrc}>
               {entry.label}
             </option>
           ))}
@@ -932,7 +1051,7 @@ function OverrideRow({
 
       <div className="mt-1.5 flex items-center gap-2">
         {!rule.enabled && <Badge tone="slate">disabled</Badge>}
-        {rule.maskHex && rule.maskHex.includes('00') && <Badge tone="amber">wildcard</Badge>}
+        {rule.requestHex.includes('**') && <Badge tone="amber">wildcard</Badge>}
         {bIsDirty && (
           <button
             onClick={() => onChange(draft)}
@@ -1182,7 +1301,12 @@ function ExchangeEntryView({ result }: { result: SimulationRequestResult }) {
         {result.addressing === 'functional' && <Badge tone="amber">broadcast</Badge>}
       </div>
 
-      {!result.routed ? (
+      {result.addressing === 'stopped' ? (
+        <div className="mt-1 text-amber-500/80">
+          <span className="text-slate-600">←</span> the simulation is stopped — the ECUs are off
+          the bus
+        </div>
+      ) : !result.routed ? (
         <div className="mt-1 text-slate-500">
           <span className="text-slate-600">←</span> no ECU listens on {result.canIdHex} — silence
         </div>

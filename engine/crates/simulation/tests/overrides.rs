@@ -79,7 +79,7 @@ fn Send(simulation: &mut SimulationService, vecRequest: &[u8]) -> RoutedResponse
         RoutingOutcome::Handled(vecResponses) => {
             vecResponses.into_iter().next().expect("one answer")
         }
-        RoutingOutcome::NoTarget => panic!("0x7E0 should be routable"),
+        outcome => panic!("0x7E0 should be routable, got {outcome:?}"),
     }
 }
 
@@ -329,5 +329,61 @@ fn a_disabled_override_is_ignored() {
     assert_eq!(
         &Send(&mut simulation, &[0x22, 0xF1, 0x90]).m_vecResponse[3..],
         b"SIMULATORVIN00001"
+    );
+}
+
+#[test]
+fn a_stopped_simulation_answers_nothing_but_forgets_nothing() {
+    let mut simulation = LoadWith(Vec::new());
+
+    // Change some state, then take the ECUs off the bus.
+    Send(&mut simulation, &[0x10, 0x03]);
+    simulation.Stop();
+
+    assert!(!simulation.IsRunning());
+    assert_eq!(
+        simulation.ProcessByCanId(0x7E0, &[0x22, 0xF1, 0x90], &UdsHandler),
+        RoutingOutcome::Stopped
+    );
+
+    // Stopping is pulling power, not clearing memory: the vehicle and the session survive.
+    assert!(simulation.IsLoaded());
+    assert_eq!(
+        simulation
+            .FindEcuByRequestCanId(0x7E0)
+            .unwrap()
+            .CurrentSession(),
+        0x03
+    );
+
+    simulation.Start();
+    assert_eq!(
+        &Send(&mut simulation, &[0x22, 0xF1, 0x90]).m_vecResponse[3..],
+        b"SIMULATORVIN00001"
+    );
+    assert_eq!(
+        simulation
+            .FindEcuByRequestCanId(0x7E0)
+            .unwrap()
+            .CurrentSession(),
+        0x03,
+        "the ECU resumes where it left off"
+    );
+}
+
+#[test]
+fn stopping_is_distinguishable_from_having_no_ecu_there() {
+    // Both are silence on the wire, but an operator who forgot they pressed stop needs to be
+    // told which one they are looking at.
+    let mut simulation = LoadWith(Vec::new());
+    assert_eq!(
+        simulation.ProcessByCanId(0x7E5, &[0x3E, 0x00], &UdsHandler),
+        RoutingOutcome::NoTarget
+    );
+
+    simulation.Stop();
+    assert_eq!(
+        simulation.ProcessByCanId(0x7E5, &[0x3E, 0x00], &UdsHandler),
+        RoutingOutcome::Stopped
     );
 }

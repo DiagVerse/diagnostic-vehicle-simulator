@@ -57,8 +57,8 @@ fn SendExpectingHandled(
 ) -> Vec<simulation::RoutedResponse> {
     match simulation.ProcessByCanId(u32RequestCanId, vecRequest, &UdsHandler) {
         RoutingOutcome::Handled(vecResponses) => vecResponses,
-        RoutingOutcome::NoTarget => {
-            panic!("CAN id 0x{u32RequestCanId:03X} should be a known identifier")
+        outcome => {
+            panic!("CAN id 0x{u32RequestCanId:03X} should be a known identifier, got {outcome:?}")
         }
     }
 }
@@ -76,9 +76,7 @@ fn SendExpectingOneAnswer(
             let response = &vecResponses[0];
             (response.m_u32ResponseCanId, response.m_vecResponse.clone())
         }
-        RoutingOutcome::NoTarget => {
-            panic!("expected an ECU on CAN id 0x{u32RequestCanId:03X}, but none was routed to")
-        }
+        outcome => panic!("expected an ECU on CAN id 0x{u32RequestCanId:03X}, got {outcome:?}"),
     }
 }
 
@@ -197,7 +195,7 @@ fn a_suppressed_positive_response_is_routed_but_carries_no_bytes() {
             assert_eq!(vecResponses.len(), 1);
             assert!(vecResponses[0].IsSuppressed());
         }
-        RoutingOutcome::NoTarget => panic!("the ECU on 0x7E0 should have handled the request"),
+        outcome => panic!("the ECU on 0x7E0 should have handled the request, got {outcome:?}"),
     }
 }
 

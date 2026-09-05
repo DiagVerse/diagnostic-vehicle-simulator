@@ -62,7 +62,7 @@ fn SendExpectingOneAnswer(
             assert_eq!(vecResponses.len(), 1, "exactly one ECU should answer");
             vecResponses.into_iter().next().expect("one answer")
         }
-        RoutingOutcome::NoTarget => panic!("CAN id 0x{u32RequestCanId:03X} should be routable"),
+        outcome => panic!("CAN id 0x{u32RequestCanId:03X} should be routable, got {outcome:?}"),
     }
 }
 

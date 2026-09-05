@@ -66,7 +66,7 @@ fn a_hand_built_vehicle_answers_exactly_like_a_reconstructed_one() {
             assert_eq!(vecResponses[0].m_u32ResponseCanId, 0x7E8);
             assert_eq!(&vecResponses[0].m_vecResponse[3..], b"1HGCM82633A004352");
         }
-        RoutingOutcome::NoTarget => panic!("the ECU just added should be routable"),
+        outcome => panic!("the ECU just added should be routable, got {outcome:?}"),
     }
 }
 
@@ -121,7 +121,7 @@ fn a_removed_ecu_stops_answering_and_leaves_the_model() {
     // The broadcast now reaches only what is left.
     match simulation.ProcessByCanId(0x7DF, &[0x3E, 0x00], &UdsHandler) {
         RoutingOutcome::Handled(vecResponses) => assert_eq!(vecResponses.len(), 1),
-        RoutingOutcome::NoTarget => panic!("0x7DF should still reach the remaining ECU"),
+        outcome => panic!("0x7DF should still reach the remaining ECU, got {outcome:?}"),
     }
 }
 
