@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use ::simulation::execute::{EmittedFrame, ExecutePlans};
 use ::simulation::{RoutedResponse, RoutingOutcome, SimulationService};
 use axum::{
     extract::{Path, State},
@@ -27,10 +28,8 @@ use core_domain::model::{
     SessionType,
 };
 use core_domain::Confidence;
-use ecu::schedule::ScheduledResponse;
 use ecu::VirtualEcu;
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::diagnostics::{FormatHex, ParseHex, SessionName};
 use crate::AppState;
@@ -461,44 +460,33 @@ async fn EmitPlans(vecResponses: &[RoutedResponse]) -> Vec<SimulationResponseDto
     let mut vecDtos: Vec<SimulationResponseDto> =
         vecResponses.iter().map(BuildResponseDto).collect();
 
-    let mut vecTimeline: Vec<(usize, &ScheduledResponse)> = Vec::new();
-    for (uResponseIndex, response) in vecResponses.iter().enumerate() {
-        for step in &response.m_plan.m_vecSteps {
-            vecTimeline.push((uResponseIndex, step));
-        }
-    }
-    vecTimeline.sort_by_key(|(_, step)| step.m_u32AtMs);
-
-    // An absolute deadline per step, so the small per-iteration overhead cannot accumulate
-    // across a long sequence.
-    let baseline = Instant::now();
-    for (uResponseIndex, step) in vecTimeline {
-        sleep_until(baseline + Duration::from_millis(step.m_u32AtMs as u64)).await;
-
-        let u64ActualMs = baseline.elapsed().as_millis() as u64;
-        let strKind = if step.m_bIsResponsePending {
+    let mut fnOnFrame = |frame: EmittedFrame<'_>| {
+        let strKind = if frame.m_step.m_bIsResponsePending {
             "responsePending"
         } else {
             "final"
         };
 
         tracing::info!(
-            ecu = %vecResponses[uResponseIndex].m_strEcuName,
-            responseCanId = %vecDtos[uResponseIndex].response_can_id_hex,
-            atMs = step.m_u32AtMs,
-            actualMs = u64ActualMs,
+            ecu = %vecResponses[frame.m_uResponseIndex].m_strEcuName,
+            responseCanId = %vecDtos[frame.m_uResponseIndex].response_can_id_hex,
+            atMs = frame.m_step.m_u32AtMs,
+            actualMs = frame.m_u64ActualMs,
             kind = strKind,
             "response frame emitted"
         );
 
-        vecDtos[uResponseIndex].frames.push(SimulationFrameDto {
-            at_ms: step.m_u32AtMs,
-            actual_ms: u64ActualMs,
-            hex: FormatHex(&step.m_vecBytes),
-            kind: strKind.to_string(),
-        });
-    }
+        vecDtos[frame.m_uResponseIndex]
+            .frames
+            .push(SimulationFrameDto {
+                at_ms: frame.m_step.m_u32AtMs,
+                actual_ms: frame.m_u64ActualMs,
+                hex: FormatHex(&frame.m_step.m_vecBytes),
+                kind: strKind.to_string(),
+            });
+    };
 
+    ExecutePlans(vecResponses, &mut fnOnFrame).await;
     vecDtos
 }
 
@@ -1316,7 +1304,8 @@ mod tests {
 #[cfg(test)]
 mod emitter_tests {
     use super::*;
-    use ecu::schedule::ResponsePlan;
+    use ecu::schedule::{ResponsePlan, ScheduledResponse};
+    use tokio::time::Instant;
 
     /// One ECU answering after a ResponsePending: `7F 22 78` at 50 ms, the real answer at
     /// 200 ms.

@@ -13,6 +13,8 @@ ecu.workspace = true
 reconstruct.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Only the plan executor needs a clock; everything else in this crate is pure.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # The round-trip tests drive the real UDS logic (linked as an rlib) rather than a stub, so

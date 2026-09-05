@@ -876,6 +876,7 @@ dependencies = [
  "plugin-contract",
  "reconstruct",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "uds-plugin",
 ]
