@@ -71,13 +71,16 @@ version = "0.1.0"
 dependencies = [
  "application",
  "axum",
+ "bridge",
  "core-domain",
  "ecu",
  "http-body-util",
+ "isotp",
  "serde",
  "serde_json",
  "serial-can",
  "simulation",
+ "slcan",
  "tokio",
  "tower",
  "tower-http",
@@ -845,6 +848,7 @@ dependencies = [
 name = "serial-can"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serialport",
  "thiserror 1.0.69",
  "tracing",

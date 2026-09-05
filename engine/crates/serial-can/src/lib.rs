@@ -13,6 +13,7 @@
 pub mod loopback;
 #[cfg(feature = "serial")]
 pub mod port;
+pub mod virtualport;
 
 use std::time::Duration;
 
@@ -88,19 +89,32 @@ pub fn ListPorts() -> Vec<SerialPortInfo> {
     }
 }
 
-/// Open a serial port by name at the given baud rate.
+/// Open a port by name at the given baud rate.
+///
+/// A real serial port is tried first. If the operating system says the device is not one — a
+/// pseudo-terminal, or a `com0com`-style pair, where there is no UART to configure and the
+/// line settings are meaningless — it is opened as a virtual port instead. Which of the two
+/// happened is logged, because it changes what the link can be expected to do.
 pub fn OpenPort(
     strPortName: &str,
     u32BaudRate: u32,
 ) -> Result<Box<dyn SerialTransport>, SerialError> {
     #[cfg(feature = "serial")]
     {
-        let transport = port::SerialPortTransport::Open(strPortName, u32BaudRate)?;
-        Ok(Box::new(transport))
+        match port::SerialPortTransport::Open(strPortName, u32BaudRate) {
+            Ok(transport) => return Ok(Box::new(transport)),
+            Err(error) => tracing::debug!(
+                port = %strPortName,
+                %error,
+                "not a real serial port; opening it as a virtual one instead"
+            ),
+        }
     }
     #[cfg(not(feature = "serial"))]
     {
-        let _ = (strPortName, u32BaudRate);
-        Err(SerialError::NotSupported)
+        let _ = u32BaudRate;
     }
+
+    let transport = virtualport::VirtualPortTransport::Open(strPortName)?;
+    Ok(Box::new(transport))
 }

@@ -57,7 +57,7 @@ struct ApiErrorDto {
 
 impl ApiError {
     /// The caller sent something the engine cannot act on.
-    fn BadRequest(strMessage: String) -> Self {
+    pub(crate) fn BadRequest(strMessage: String) -> Self {
         ApiError {
             m_status: StatusCode::BAD_REQUEST,
             m_strMessage: strMessage,
@@ -66,7 +66,7 @@ impl ApiError {
 
     /// The engine is not in a state where the request makes sense (nothing loaded, no plugin,
     /// an ECU already busy).
-    fn Conflict(strMessage: String) -> Self {
+    pub(crate) fn Conflict(strMessage: String) -> Self {
         ApiError {
             m_status: StatusCode::CONFLICT,
             m_strMessage: strMessage,
@@ -74,7 +74,7 @@ impl ApiError {
     }
 
     /// The caller addressed something that does not exist.
-    fn NotFound(strMessage: String) -> Self {
+    pub(crate) fn NotFound(strMessage: String) -> Self {
         ApiError {
             m_status: StatusCode::NOT_FOUND,
             m_strMessage: strMessage,

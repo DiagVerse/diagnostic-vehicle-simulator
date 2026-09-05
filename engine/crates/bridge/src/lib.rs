@@ -15,6 +15,7 @@ pub mod bus;
 pub mod mock;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -32,6 +33,28 @@ use crate::bus::CanBusPort;
 /// How long to wait between polls of a quiet bus. Short enough to stay responsive, long enough
 /// not to spin a core.
 const c_pollInterval: Duration = Duration::from_millis(2);
+
+/// How much has crossed the link, for a status display.
+///
+/// Atomics rather than a lock: these are written on every frame and read occasionally by an
+/// HTTP handler, and a counter is not worth contending over.
+#[derive(Debug, Default)]
+pub struct BridgeStats {
+    m_atomicFramesReceived: AtomicU64,
+    m_atomicFramesSent: AtomicU64,
+}
+
+impl BridgeStats {
+    /// Frames taken off the bus.
+    pub fn FramesReceived(&self) -> u64 {
+        self.m_atomicFramesReceived.load(Ordering::Relaxed)
+    }
+
+    /// Frames put on it.
+    pub fn FramesSent(&self) -> u64 {
+        self.m_atomicFramesSent.load(Ordering::Relaxed)
+    }
+}
 
 /// One ECU's view of the link: what it is reassembling, and on which identifier it answers.
 struct Endpoint {
@@ -54,6 +77,7 @@ pub struct CanBridge {
     /// the main loop and the flow-control wait draw from, the second would be thrown away and
     /// every segmented response would time out.
     m_queueInbound: VecDeque<CanFrame>,
+    m_arcStats: Arc<BridgeStats>,
     m_startedAt: Instant,
 }
 
@@ -70,10 +94,16 @@ impl CanBridge {
             m_params: params,
             m_mapEndpoints: BTreeMap::new(),
             m_queueInbound: VecDeque::new(),
+            m_arcStats: Arc::new(BridgeStats::default()),
             m_startedAt: Instant::now(),
         };
         bridge.RebuildEndpoints();
         bridge
+    }
+
+    /// The counters this bridge updates, for a status display.
+    pub fn Stats(&self) -> Arc<BridgeStats> {
+        Arc::clone(&self.m_arcStats)
     }
 
     /// Rebuild the per-identifier endpoints from the loaded vehicle. Call after the vehicle
@@ -145,7 +175,12 @@ impl CanBridge {
             .m_boxBus
             .ReceiveFrames(self.m_startedAt.elapsed().as_secs_f64())
         {
-            Ok(vecFrames) => self.m_queueInbound.extend(vecFrames),
+            Ok(vecFrames) => {
+                self.m_arcStats
+                    .m_atomicFramesReceived
+                    .fetch_add(vecFrames.len() as u64, Ordering::Relaxed);
+                self.m_queueInbound.extend(vecFrames);
+            }
             Err(error) => tracing::warn!(%error, "could not read from the bus"),
         }
     }
@@ -337,6 +372,9 @@ impl CanBridge {
     /// Put one frame on the bus, logging rather than failing if the link is gone.
     fn SendRaw(&mut self, u32CanId: u32, vecData: Vec<u8>, f64TimestampSec: f64) {
         let frame = CanFrame::NewClassic(f64TimestampSec, u32CanId, vecData);
+        self.m_arcStats
+            .m_atomicFramesSent
+            .fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.m_boxBus.SendFrame(&frame) {
             tracing::warn!(%error, canId = format!("{u32CanId:03X}"), "could not transmit a frame");
         }
