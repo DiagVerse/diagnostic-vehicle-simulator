@@ -47,7 +47,21 @@ export interface TrafficLagged {
   missed: number
 }
 
-export type TrafficEvent = TrafficFrame | TrafficExchange | TrafficLifecycle | TrafficLagged
+/** The history the engine replayed when this monitor attached. */
+export interface TrafficReplayed {
+  kind: 'replayed'
+  atMs: number
+  count: number
+  /** How many older events the engine had already dropped before we attached. */
+  droppedBefore: number
+}
+
+export type TrafficEvent =
+  | TrafficFrame
+  | TrafficExchange
+  | TrafficLifecycle
+  | TrafficLagged
+  | TrafficReplayed
 
 /** One event with an id, so React can key a list that only ever grows at the front. */
 export interface TrafficEntry {
@@ -70,10 +84,15 @@ const FLUSH_INTERVAL_MS = 250
 /**
  * Subscribe to the engine's live traffic feed.
  *
- * `maxEntries` is a hard ceiling on what is kept in memory: the oldest are dropped once it is
- * reached. A monitor left open on a busy bus must not grow without bound, so the buffer is a
- * ring and the honest consequence — that you are looking at a window, not a complete record —
- * is surfaced by the caller rather than hidden.
+ * Entries are held **oldest first**, with the newest at the end. That is how a log reads, and
+ * it is also what makes scrolling survivable: appending to the end leaves everything already on
+ * screen at the same offset, whereas prepending shifts the whole list under the reader's cursor
+ * every time a frame arrives.
+ *
+ * `maxEntries` is a hard ceiling: the oldest are dropped once it is reached. A monitor left
+ * open on a busy bus must not grow without bound, so the buffer is a ring and the honest
+ * consequence — that you are looking at a window, not a complete record — is surfaced rather
+ * than hidden.
  */
 export function useTrafficFeed(maxEntries: number) {
   const [entries, setEntries] = useState<TrafficEntry[]>([])
@@ -81,6 +100,8 @@ export function useTrafficFeed(maxEntries: number) {
   const [isPaused, setPaused] = useState(false)
   /** Total events seen since this monitor attached, including ones dropped from the buffer. */
   const [totalSeen, setTotalSeen] = useState(0)
+  /** What the engine said it replayed, so the monitor can be honest about where history starts. */
+  const [replay, setReplay] = useState<TrafficReplayed | null>(null)
 
   const pendingRef = useRef<TrafficEntry[]>([])
   const nextIdRef = useRef(1)
@@ -106,6 +127,9 @@ export function useTrafficFeed(maxEntries: number) {
       }
       try {
         const event = JSON.parse(message.data) as TrafficEvent
+        if (event.kind === 'replayed') {
+          setReplay(event)
+        }
         pendingRef.current.push({ id: nextIdRef.current++, event })
       } catch {
         // A malformed line is not worth tearing the monitor down for; skip it and keep going.
@@ -119,8 +143,11 @@ export function useTrafficFeed(maxEntries: number) {
       }
       pendingRef.current = []
       setTotalSeen((seen) => seen + pending.length)
-      // Newest first, and never longer than the ceiling.
-      setEntries((previous) => [...pending.reverse(), ...previous].slice(0, maxEntries))
+      // Appended at the end, and never longer than the ceiling: once full, the oldest go.
+      setEntries((previous) => {
+        const vecNext = [...previous, ...pending]
+        return vecNext.length > maxEntries ? vecNext.slice(vecNext.length - maxEntries) : vecNext
+      })
     }, FLUSH_INTERVAL_MS)
 
     return () => {
@@ -135,7 +162,7 @@ export function useTrafficFeed(maxEntries: number) {
     setTotalSeen(0)
   }, [])
 
-  return { entries, status, isPaused, setPaused, totalSeen, clear }
+  return { entries, status, isPaused, setPaused, totalSeen, replay, clear }
 }
 
 /** Wall-clock time of an event, as a monitor should show it. */
@@ -166,6 +193,10 @@ export function FormatEventLine(event: TrafficEvent): string {
       return `${strAt}  ==  ${event.what}`
     case 'lagged':
       return `${strAt}  !!  fell behind: ${event.missed} event(s) missed`
+    case 'replayed':
+      return event.droppedBefore > 0
+        ? `${strAt}  ==  ${event.count} earlier event(s) replayed; ${event.droppedBefore} older one(s) had already been dropped by the engine`
+        : `${strAt}  ==  ${event.count} earlier event(s) replayed — the session from its start`
   }
 }
 
@@ -185,8 +216,7 @@ export function SaveTrafficLog(entries: TrafficEntry[], totalSeen: number): void
       ? `# the buffer is a window: ${totalSeen - entries.length} older event(s) were dropped`
       : `# nothing was dropped`,
     '',
-    // Stored newest-first for display; a log file reads oldest-first.
-    ...[...entries].reverse().map((entry) => FormatEventLine(entry.event)),
+    ...entries.map((entry) => FormatEventLine(entry.event)),
   ]
 
   const blob = new Blob([vecLines.join('\n')], { type: 'text/plain' })
