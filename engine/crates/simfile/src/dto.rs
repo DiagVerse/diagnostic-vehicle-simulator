@@ -72,6 +72,15 @@ pub struct EcuDto {
     /// Sessions it can enter: `"default"`, `"programming"`, `"extended"`, `"safety"`.
     #[serde(default)]
     pub sessions: Vec<String>,
+    /// Which services are reachable in which session, keyed by session name.
+    ///
+    /// Left out, every supported service works in every session. A session listed here is
+    /// restricted to what it lists, and anything else is refused with NRC 0x7F — which is how
+    /// a real ECU keeps flashing and actuation out of the default session. A session *not*
+    /// mentioned stays unrestricted, so locking down `extended` does not silently lock
+    /// `default` too.
+    #[serde(default)]
+    pub session_services: BTreeMap<String, Vec<String>>,
     /// Service identifiers it supports, in hex. Left out, it gets the ones the engine's UDS
     /// plugin implements.
     #[serde(default)]

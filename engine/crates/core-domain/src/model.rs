@@ -899,6 +899,16 @@ pub struct Ecu {
     pub m_vecSecurityLevels: Vec<SecurityLevel>,
     /// Timing parameters.
     pub m_timing: EcuTiming,
+    /// Which services are reachable in which session, keyed by the session's sub-function byte.
+    ///
+    /// Empty — the default — means every supported service works in every supported session,
+    /// which is what the engine did before this existed. A session that *is* listed restricts
+    /// what it allows: a request for a service outside its list is refused with NRC 0x7F
+    /// serviceNotSupportedInActiveSession, which is how a real ECU keeps flashing and
+    /// actuation out of the default session.
+    #[serde(default)]
+    pub m_mapSessionServices: BTreeMap<u8, Vec<u8>>,
+
     /// Which network this ECU sits on, by id. `None` means nobody has said — not "the default
     /// bus". An ECU reconstructed from a log is always `None`, because a capture cannot
     /// observe bus membership.
@@ -925,6 +935,7 @@ impl Ecu {
             m_vecDtcs: Vec::new(),
             m_vecSecurityLevels: Vec::new(),
             m_timing: EcuTiming::default(),
+            m_mapSessionServices: BTreeMap::new(),
             m_optStrNetworkId: None,
             m_vecResponseOverrides: Vec::new(),
         }
@@ -943,6 +954,19 @@ impl Ecu {
     /// True if the ECU advertises support for the given request service id.
     pub fn IsServiceSupported(&self, byServiceId: u8) -> bool {
         self.m_vecSupportedServices.contains(&byServiceId)
+    }
+
+    /// True if the service can be reached from the session the ECU is currently in.
+    ///
+    /// An ECU that says nothing about sessions allows everything it supports, everywhere. One
+    /// that restricts a session allows only what that session lists — and a session it does
+    /// not mention at all is unrestricted, so adding a rule for `extended` does not silently
+    /// lock down `default` too.
+    pub fn IsServiceAllowedInSession(&self, byServiceId: u8, bySession: u8) -> bool {
+        match self.m_mapSessionServices.get(&bySession) {
+            Some(vecAllowed) => vecAllowed.contains(&byServiceId),
+            None => true,
+        }
     }
 
     /// True if the ECU can enter the given session.

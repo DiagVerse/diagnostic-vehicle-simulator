@@ -186,3 +186,61 @@ fn an_ecu_that_requests_and_responds_on_one_identifier_is_refused() {
     let strError = LoadFromText(&strFile).unwrap_err().to_string();
     assert!(strError.contains("same CAN id"), "{strError}");
 }
+
+const c_strChassis: &str = include_str!("../../../../samples/chassis-control.simfile.json");
+
+#[test]
+fn the_chassis_sample_restricts_what_each_session_allows() {
+    let vehicle = LoadFromText(c_strChassis).expect("the chassis sample should load");
+
+    let idm = vehicle
+        .m_vecEcus
+        .iter()
+        .find(|ecu| ecu.m_strName == "IDM")
+        .expect("the IDM");
+
+    // SecurityAccess is reachable in extended but not in default — which is how a real ECU
+    // keeps unlocking out of the session a tester lands in.
+    assert!(!idm.IsServiceAllowedInSession(0x27, 0x01), "default");
+    assert!(idm.IsServiceAllowedInSession(0x27, 0x03), "extended");
+    // ReadDataByIdentifier works everywhere.
+    assert!(idm.IsServiceAllowedInSession(0x22, 0x01));
+
+    // The CDM restricts only its default session, so extended stays unrestricted rather than
+    // being locked down by implication.
+    let cdm = vehicle
+        .m_vecEcus
+        .iter()
+        .find(|ecu| ecu.m_strName == "CDM")
+        .expect("the CDM");
+    assert!(!cdm.IsServiceAllowedInSession(0x27, 0x01), "default");
+    assert!(
+        cdm.IsServiceAllowedInSession(0x27, 0x03),
+        "extended is not mentioned"
+    );
+}
+
+#[test]
+fn an_ecu_that_says_nothing_about_sessions_allows_everything_everywhere() {
+    let strFile = FileWith(
+        r#"{"name":"E","requestCanId":"7E0","responseCanId":"7E8","services":["10","22"]}"#,
+    );
+    let vehicle = LoadFromText(&strFile).expect("a file with no session rules");
+    assert!(vehicle.m_vecEcus[0].IsServiceAllowedInSession(0x22, 0x01));
+    assert!(vehicle.m_vecEcus[0].IsServiceAllowedInSession(0x22, 0x03));
+}
+
+#[test]
+fn restricting_a_session_the_ecu_cannot_enter_is_refused() {
+    // Describing behaviour nothing can ever reach is a mistake worth catching at load.
+    let strFile = FileWith(
+        r#"{"name":"E","requestCanId":"7E0","responseCanId":"7E8",
+            "sessions":["default"],
+            "sessionServices":{"programming":["10"]}}"#,
+    );
+    let strError = LoadFromText(&strFile).unwrap_err().to_string();
+    assert!(
+        strError.contains("not in this ECU's sessions"),
+        "{strError}"
+    );
+}

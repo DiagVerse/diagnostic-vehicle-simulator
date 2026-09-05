@@ -1,0 +1,111 @@
+{
+  "simfileVersion": 1,
+  "vehicle": "Chassis control bench",
+
+  "networks": [
+    {
+      "id": "chassis",
+      "name": "Chassis CAN",
+      "kind": "CAN",
+      "bitrateBps": 500000
+    }
+  ],
+
+  "ecus": [
+    {
+      "name": "IDM",
+      "network": "chassis",
+      "requestCanId": "700",
+      "responseCanId": "70C",
+      "logicalAddress": 16,
+
+      "sessions": ["default", "extended", "programming"],
+      "services": ["10", "11", "19", "22", "27", "31", "3E"],
+
+      "sessionServices": {
+        "default": ["10", "11", "19", "22", "3E"],
+        "extended": ["10", "11", "19", "22", "27", "31", "3E"],
+        "programming": ["10", "11", "22", "27", "31", "3E"]
+      },
+
+      "dids": {
+        "F190": { "text": "SIMULATORVIN00001" },
+        "F18C": { "text": "IDM-0000-0001" },
+        "F191": { "text": "HW-IDM-01" },
+        "F194": { "text": "SW-IDM-1.04" },
+        "F186": "01",
+        "F110": "00 00 00 00"
+      },
+
+      "dtcs": [
+        { "code": "C0035-00", "status": "activeConfirmedWithLamp" },
+        { "code": "C0040-00", "status": "pendingOnly" },
+        { "code": "U0121-87", "status": "historyConfirmed" }
+      ],
+
+      "security": [
+        { "requestSeed": "01", "seed": "5B 8F 11 22", "key": "A6 18 DD B8" }
+      ],
+
+      "timing": {
+        "p2Ms": 50,
+        "p2StarMs": 5000,
+        "p4Ms": 30000
+      },
+
+      "responses": [
+        {
+          "request": "2E F1 10 **",
+          "response": "6E F1 10",
+          "note": "accepts a write to the configuration identifier; 0x2E is not implemented by the engine's UDS plugin, so an override is the only way it can answer positively"
+        },
+        {
+          "request": "31 01 F0 10 **",
+          "response": "71 01 F0 10 00",
+          "note": "start of a chassis calibration routine, reporting 'in progress'"
+        },
+        {
+          "request": "22 F1 20",
+          "note": "no response at all: this ECU is deliberately silent for one identifier, which no negative response can express"
+        }
+      ]
+    },
+
+    {
+      "name": "CDM",
+      "network": "chassis",
+      "requestCanId": "701",
+      "responseCanId": "70D",
+      "logicalAddress": 17,
+
+      "sessions": ["default", "extended"],
+      "services": ["10", "11", "19", "22", "27", "3E"],
+
+      "sessionServices": {
+        "default": ["10", "19", "22", "3E"]
+      },
+
+      "dids": {
+        "F190": { "text": "SIMULATORVIN00001" },
+        "F18C": { "text": "CDM-0000-0001" },
+        "F194": { "text": "SW-CDM-2.01" }
+      },
+
+      "dtcs": [
+        { "code": "P2522-1F", "status": "activeConfirmed" },
+        { "code": "P0805-11", "status": "pendingOnly" }
+      ],
+
+      "security": [
+        { "requestSeed": "01", "seed": "DE AD BE EF", "key": "CA FE F0 0D" }
+      ],
+
+      "timing": {
+        "p2Ms": 50,
+        "p2StarMs": 5000,
+        "p4Ms": 30000,
+        "responseDelayMs": 900
+      }
+    }
+  ]
+}
