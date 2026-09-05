@@ -173,6 +173,9 @@ pub struct SimulationEcuDto {
 #[serde(rename_all = "camelCase")]
 pub struct SimulationStateDto {
     pub loaded: bool,
+    /// False when the simulation is stopped: the vehicle is still loaded and every ECU keeps
+    /// its state, but nothing answers.
+    pub running: bool,
     pub vehicle_name: Option<String>,
     pub protocol_loaded: bool,
     pub ecus: Vec<SimulationEcuDto>,
@@ -222,12 +225,13 @@ pub struct SimulationResponseDto {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseOverrideDto {
-    /// The request bytes to match, e.g. "22 F1 90".
+    /// The request bytes to match, e.g. `"22 F1 90"`. A byte written `**` is a wildcard, so
+    /// `"22 ** **"` matches a read of any identifier.
+    ///
+    /// Wildcards live in this string rather than in a parallel mask field on purpose: two
+    /// fields that must stay the same length are two fields that can disagree, and editing the
+    /// pattern while a stale mask travelled alongside it was a real bug.
     pub request_hex: String,
-    /// One mask byte per pattern byte; "FF" means the byte must match, "00" means any value.
-    /// Omitted means "match every byte exactly".
-    #[serde(default)]
-    pub mask_hex: Option<String>,
     /// Treat the pattern as a prefix, for requests with a variable tail.
     #[serde(default)]
     pub match_trailing_bytes: bool,
@@ -343,6 +347,20 @@ pub async fn GetSimulationState(State(state): State<Arc<AppState>>) -> Json<Simu
     Json(BuildStateDto(&simulation, state.protocol.is_some()))
 }
 
+/// POST /simulation/start — put the ECUs back on the bus.
+pub async fn PostSimulationStart(State(state): State<Arc<AppState>>) -> Json<SimulationStateDto> {
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation.Start();
+    Json(BuildStateDto(&simulation, state.protocol.is_some()))
+}
+
+/// POST /simulation/stop — take them off it, keeping the model and their state.
+pub async fn PostSimulationStop(State(state): State<Arc<AppState>>) -> Json<SimulationStateDto> {
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation.Stop();
+    Json(BuildStateDto(&simulation, state.protocol.is_some()))
+}
+
 /// POST /simulation/reset — return every running ECU to the default session, keeping the
 /// loaded model.
 pub async fn PostSimulationReset(State(state): State<Arc<AppState>>) -> Json<SimulationStateDto> {
@@ -392,6 +410,15 @@ pub async fn PostSimulationRequest(
     };
 
     let vecResponses = match outcome {
+        RoutingOutcome::Stopped => {
+            return Ok(Json(SimulationRequestResultDto {
+                can_id_hex: FormatCanId(u32RequestCanId),
+                request_hex: FormatHex(&vecRequest),
+                addressing: "stopped".to_string(),
+                routed: false,
+                responses: Vec::new(),
+            }));
+        }
         RoutingOutcome::NoTarget => {
             return Ok(Json(SimulationRequestResultDto {
                 can_id_hex: FormatCanId(u32RequestCanId),
@@ -831,8 +858,10 @@ fn BuildOverrideDto(overrideRule: &ResponseOverride) -> ResponseOverrideDto {
     };
 
     ResponseOverrideDto {
-        request_hex: FormatHex(&overrideRule.m_vecRequestPattern),
-        mask_hex: Some(FormatHex(&overrideRule.m_vecRequestMask)),
+        request_hex: FormatHexPattern(
+            &overrideRule.m_vecRequestPattern,
+            &overrideRule.m_vecRequestMask,
+        ),
         match_trailing_bytes: overrideRule.m_bMatchTrailingBytes,
         action: strAction,
         response_hex: optResponseHex,
@@ -846,12 +875,7 @@ fn BuildOverrideDto(overrideRule: &ResponseOverride) -> ResponseOverrideDto {
 /// Read one override from a request body. Shape errors are reported here; whether the override
 /// could be a real exchange is decided by the domain type's own validation.
 fn BuildOverride(dto: &ResponseOverrideDto) -> Result<ResponseOverride, String> {
-    let vecPattern = ParseHex(&dto.request_hex)?;
-
-    let vecMask = match &dto.mask_hex {
-        Some(strMask) => ParseHex(strMask)?,
-        None => vec![0xFF; vecPattern.len()],
-    };
+    let (vecPattern, vecMask) = ParseHexPattern(&dto.request_hex)?;
 
     let action = match dto.action.as_str() {
         "suppress" => OverrideAction::Suppress,
@@ -1046,6 +1070,7 @@ fn BuildStateDto(simulation: &SimulationService, bProtocolLoaded: bool) -> Simul
 
     SimulationStateDto {
         loaded: simulation.IsLoaded(),
+        running: simulation.IsRunning(),
         vehicle_name: simulation
             .Vehicle()
             .map(|vehicle| vehicle.m_strName.clone()),
@@ -1137,6 +1162,67 @@ fn FormatCanId(u32CanId: u32) -> String {
     }
 }
 
+/// Parse a request pattern: hex bytes where `**` (also `??`, `..` or `xx`) means "any value".
+///
+/// Returns the pattern bytes alongside the mask they imply, so a caller never has to keep two
+/// lists in step.
+fn ParseHexPattern(strInput: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut vecPattern = Vec::new();
+    let mut vecMask = Vec::new();
+
+    for strToken in SplitPatternTokens(strInput) {
+        if IsWildcardToken(&strToken) {
+            vecPattern.push(0x00);
+            vecMask.push(0x00);
+            continue;
+        }
+
+        let byValue = u8::from_str_radix(&strToken, 16)
+            .map_err(|_| format!("'{strToken}' is not a hex byte or a wildcard (**)"))?;
+        vecPattern.push(byValue);
+        vecMask.push(0xFF);
+    }
+
+    if vecPattern.is_empty() {
+        return Err("the request pattern is empty".to_string());
+    }
+    Ok((vecPattern, vecMask))
+}
+
+/// Split a pattern into two-character tokens, accepting both `22 F1 90` and `22F190`.
+fn SplitPatternTokens(strInput: &str) -> Vec<String> {
+    let strClean: String = strInput.chars().filter(|c| !c.is_whitespace()).collect();
+    strClean
+        .chars()
+        .collect::<Vec<char>>()
+        .chunks(2)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+/// True for the spellings of "any value" a person might reasonably type.
+fn IsWildcardToken(strToken: &str) -> bool {
+    matches!(strToken, "**" | "??" | ".." | "xx" | "XX")
+}
+
+/// Render a pattern and its mask back as one string, with wildcards where the mask allows any
+/// value.
+fn FormatHexPattern(vecPattern: &[u8], vecMask: &[u8]) -> String {
+    vecPattern
+        .iter()
+        .enumerate()
+        .map(|(uIndex, byValue)| {
+            let bIsWildcard = vecMask.get(uIndex).copied().unwrap_or(0xFF) == 0x00;
+            if bIsWildcard {
+                "**".to_string()
+            } else {
+                format!("{byValue:02X}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Parse a CAN identifier written as hex, with or without a `0x` prefix.
 fn ParseCanId(strInput: &str) -> Result<u32, String> {
     let strTrimmed = strInput.trim();
@@ -1178,6 +1264,46 @@ mod tests {
         assert!(ParseCanId("").is_err());
         assert!(ParseCanId("zz").is_err());
         assert!(ParseCanId("FFFFFFFF").is_err());
+    }
+
+    #[test]
+    fn a_pattern_carries_its_own_wildcards() {
+        // Wildcards live in the pattern string precisely so a caller never has to keep a
+        // parallel mask the same length as it — editing one and forgetting the other was a
+        // real bug, and changing a sub-function changes the byte count whenever the new
+        // sub-function takes different parameters.
+        assert_eq!(
+            ParseHexPattern("22 ** **"),
+            Ok((vec![0x22, 0x00, 0x00], vec![0xFF, 0x00, 0x00]))
+        );
+        assert_eq!(
+            ParseHexPattern("19 02 FF"),
+            Ok((vec![0x19, 0x02, 0xFF], vec![0xFF, 0xFF, 0xFF]))
+        );
+        // Changing the sub-function to one with a different parameter shape just works.
+        assert_eq!(
+            ParseHexPattern("19 04 12 34 56 01"),
+            Ok((vec![0x19, 0x04, 0x12, 0x34, 0x56, 0x01], vec![0xFF; 6]))
+        );
+    }
+
+    #[test]
+    fn a_pattern_round_trips_through_its_string_form() {
+        for strPattern in ["19 02 FF", "22 ** **", "2E FD 01 55", "36 **"] {
+            let (vecPattern, vecMask) = ParseHexPattern(strPattern).expect("a valid pattern");
+            assert_eq!(FormatHexPattern(&vecPattern, &vecMask), strPattern);
+        }
+    }
+
+    #[test]
+    fn a_pattern_accepts_unspaced_hex_and_rejects_nonsense() {
+        assert_eq!(
+            ParseHexPattern("19 0A"),
+            ParseHexPattern("190A"),
+            "spacing is presentation, not meaning"
+        );
+        assert!(ParseHexPattern("").is_err());
+        assert!(ParseHexPattern("ZZ 01").is_err());
     }
 
     #[test]

@@ -91,6 +91,8 @@ export interface SimulationEcu {
 /** What the engine currently has loaded. */
 export interface SimulationState {
   loaded: boolean
+  /** False when the simulation is stopped: still loaded, still stateful, but off the bus. */
+  running: boolean
   vehicleName: string | null
   protocolLoaded: boolean
   ecus: SimulationEcu[]
@@ -150,9 +152,8 @@ export interface EchoSpan {
  * services, and an override is the only way to get a positive response out of the rest.
  */
 export interface ResponseOverride {
+  /** Bytes to match; a byte written `**` is a wildcard, e.g. `22 ** **`. */
   requestHex: string
-  /** One mask byte per pattern byte: FF must match, 00 is a wildcard. */
-  maskHex?: string | null
   matchTrailingBytes: boolean
   /** 'substitute' or 'suppress'. */
   action: string
@@ -283,6 +284,8 @@ export const api = {
     putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/name`, { name }),
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
+  simulationStart: () => postJson<SimulationState>('/simulation/start', {}),
+  simulationStop: () => postJson<SimulationState>('/simulation/stop', {}),
   simulationRequest: (canIdHex: string, requestHex: string) =>
     postJson<SimulationRequestResult>('/simulation/request', { canIdHex, requestHex }),
   simulationTopology: () => getJson<Topology>('/simulation/topology'),
