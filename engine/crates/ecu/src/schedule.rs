@@ -324,6 +324,19 @@ mod tests {
     }
 
     #[test]
+    fn a_read_request_is_never_mistaken_for_a_sub_function_request() {
+        // Regression: byte 1 of `22 F1 90` is the DID's high byte, not a sub-function, so its
+        // top bit must never be treated as the suppressPosRspMsgIndicationBit. Clearing it
+        // would turn a VIN read into a read of DID 0x7190.
+        let timing = EcuTiming {
+            m_u32ResponseDelayMs: 200,
+            ..EcuTiming::default()
+        };
+        let plan = PlanFor(&timing, 0x22, &ReadVinResponse());
+        assert_eq!(plan.FinalResponse(), ReadVinResponse().as_slice());
+    }
+
+    #[test]
     fn an_answer_inside_p2_is_a_single_immediate_step() {
         let timing = EcuTiming::default();
         let plan = PlanFor(&timing, 0x22, &ReadVinResponse());

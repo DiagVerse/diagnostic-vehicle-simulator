@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
-use core_domain::model::{CanAddress, Ecu, Vehicle};
+use core_domain::model::{CanAddress, Ecu, EcuTiming, Vehicle};
+use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
 
 /// First byte of a UDS negative response (ISO 14229-1).
@@ -81,6 +82,13 @@ pub enum SimulationError {
         strSecondEcu: String,
     },
 
+    /// No running ECU is addressed by the given identifier.
+    #[error("no ECU is addressed on CAN id 0x{u32RequestCanId:03X}")]
+    EcuNotFound {
+        /// The identifier that matched nothing.
+        u32RequestCanId: u32,
+    },
+
     /// One identifier is both a broadcast address and an ECU's own request address, which
     /// would make routing ambiguous.
     #[error(
@@ -109,12 +117,21 @@ pub struct RoutedResponse {
     pub m_bySession: u8,
     /// Whether the ECU has a security level unlocked after the request.
     pub m_bIsSecurityUnlocked: bool,
+    /// The full timed answer: any ResponsePending messages, the final response, and when each
+    /// goes on the wire. The caller executes it; nothing here sleeps.
+    pub m_plan: ResponsePlan,
 }
 
 impl RoutedResponse {
-    /// True when the ECU processed the request but deliberately sent nothing back.
+    /// True when the ECU processed the request but nothing goes on the wire — either the
+    /// positive response was suppressed, or fault injection withheld it. `m_plan` says which.
     pub fn IsSuppressed(&self) -> bool {
         self.m_vecResponse.is_empty()
+    }
+
+    /// True when this answer began with one or more ResponsePending messages.
+    pub fn HasResponsePending(&self) -> bool {
+        self.m_plan.m_u8ResponsePendingCount > 0
     }
 }
 
@@ -230,8 +247,42 @@ impl SimulationService {
         self.m_mapEcusByRequestId.get(&u32RequestCanId)
     }
 
+    /// Replace one ECU's timing parameters.
+    ///
+    /// Written to both the running ECU and the loaded model, so the model JSON and what is
+    /// actually simulated cannot drift apart. The caller validates the parameters first.
+    ///
+    /// The change applies to the **next** request: an answer already scheduled keeps the
+    /// values it was built with, and the tester only learns new P2/P2* values at the next
+    /// DiagnosticSessionControl response, which is the sole place ISO 14229-1 carries them.
+    pub fn SetEcuTiming(
+        &mut self,
+        u32RequestCanId: u32,
+        timing: EcuTiming,
+    ) -> Result<(), SimulationError> {
+        let runningEcu = self
+            .m_mapEcusByRequestId
+            .get_mut(&u32RequestCanId)
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+        runningEcu.SetTiming(timing);
+
+        UpdateVehicleTiming(self.m_optVehicle.as_mut(), u32RequestCanId, timing);
+        Ok(())
+    }
+
+    /// One ECU's current timing parameters.
+    pub fn EcuTimingOf(&self, u32RequestCanId: u32) -> Result<EcuTiming, SimulationError> {
+        self.m_mapEcusByRequestId
+            .get(&u32RequestCanId)
+            .map(|runningEcu| runningEcu.Timing())
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })
+    }
+
     /// Restart every running ECU: back to the default session with security locked. The
     /// loaded model is kept.
+    /// A reset returns *diagnostic state* to default, not *configuration*: rebuilding from
+    /// the ECU's own config carries operator-set timing across unchanged, which is what an
+    /// operator who set up a fault and then reset the session expects.
     pub fn ResetAllEcus(&mut self) {
         for runningEcu in self.m_mapEcusByRequestId.values_mut() {
             *runningEcu = VirtualEcu::New(runningEcu.Config().clone());
@@ -330,7 +381,15 @@ impl SimulationService {
             // rather than flood the tester with "I do not support that" (ISO 14229-1
             // clause 7.5.3.3 Table 5 and clause 7.5.4.3 Table 7). The state change, if any,
             // has already been applied.
-            if IsNegativeResponseSuppressedFunctionally(&response.m_vecResponse) {
+            //
+            // Unless it already answered with a ResponsePending: having told the tester it is
+            // there and working, going silent would strand it until P2* expires, so the final
+            // negative response must be sent after all (ISO 14229-1 clause 7.5.5 and
+            // Annex A.1).
+            let bMustAnswerAfterPending = response.HasResponsePending();
+            if !bMustAnswerAfterPending
+                && IsNegativeResponseSuppressedFunctionally(&response.m_vecResponse)
+            {
                 tracing::debug!(
                     ecu = %response.m_strEcuName,
                     nrc = format!("{:02X}", NegativeResponseCodeOf(&response.m_vecResponse).unwrap_or(0)),
@@ -368,13 +427,25 @@ fn ProcessOnEcu(
         .m_u32ResponseCanId;
     let strEcuName = runningEcu.Config().m_strName.clone();
 
-    let vecResponse = runningEcu.ProcessRequest(protocol, vecRequest);
+    let plan = runningEcu.ProcessRequestWithTiming(protocol, vecRequest);
+    let vecResponse = plan.FinalResponse().to_vec();
+
+    if !plan.m_bIsIsoConformant {
+        for strWarning in &plan.m_vecConformanceWarnings {
+            tracing::warn!(
+                ecu = %strEcuName,
+                requestCanId = format!("{u32RequestCanId:03X}"),
+                "response timing is not ISO 14229-2 conformant: {strWarning}"
+            );
+        }
+    }
 
     if vecResponse.is_empty() {
         tracing::info!(
             ecu = %strEcuName,
             requestCanId = format!("{u32RequestCanId:03X}"),
-            "response suppressed by the ECU"
+            dropped = plan.m_bIsFinalResponseDropped,
+            "nothing will be transmitted for this request"
         );
     } else {
         tracing::info!(
@@ -382,6 +453,8 @@ fn ProcessOnEcu(
             requestCanId = format!("{u32RequestCanId:03X}"),
             responseCanId = format!("{u32ResponseCanId:03X}"),
             responseBytes = vecResponse.len(),
+            responsePending = plan.m_u8ResponsePendingCount,
+            finalAtMs = plan.FinalAtMs(),
             "request answered"
         );
     }
@@ -392,6 +465,7 @@ fn ProcessOnEcu(
         m_vecResponse: vecResponse,
         m_bySession: runningEcu.CurrentSession(),
         m_bIsSecurityUnlocked: runningEcu.IsSecurityUnlocked(),
+        m_plan: plan,
     }
 }
 
@@ -509,6 +583,25 @@ fn BuildFunctionalTargetMap(
     }
 
     Ok(mapOrdered)
+}
+
+/// Mirror a timing change into the loaded model, so the model JSON matches what is running.
+fn UpdateVehicleTiming(optVehicle: Option<&mut Vehicle>, u32RequestCanId: u32, timing: EcuTiming) {
+    let vehicle = match optVehicle {
+        Some(vehicle) => vehicle,
+        None => return,
+    };
+
+    for config in &mut vehicle.m_vecEcus {
+        let bIsTarget = matches!(
+            config.m_optCanAddress,
+            Some(address) if address.m_u32RequestCanId == u32RequestCanId
+        );
+        if bIsTarget {
+            config.m_timing = timing;
+            return;
+        }
+    }
 }
 
 /// The NRC of a negative response, or `None` if the bytes are not one.

@@ -34,6 +34,19 @@ const c_bySessionControlPositiveResponse: u8 = 0x50;
 /// Length of a conformant DiagnosticSessionControl positive response: SID, echoed
 /// sub-function, and the four-byte sessionParameterRecord (ISO 14229-1 Table 28).
 const c_uSessionControlResponseLength: usize = 6;
+/// UDS services whose sub-function byte carries the suppressPosRspMsgIndicationBit
+/// (ISO 14229-1 Table 11): DiagnosticSessionControl, ECUReset, CommunicationControl,
+/// RoutineControl, TesterPresent, AccessTimingParameter, ControlDTCSetting, ResponseOnEvent
+/// and LinkControl.
+///
+/// This has to be a whitelist rather than "byte 1 of any request": in a
+/// ReadDataByIdentifier, byte 1 is the high byte of the DID, so clearing bit 7 would silently
+/// change which DID is read (`22 F1 90` would become `22 71 90`) instead of un-suppressing
+/// anything. Services with a sub-function that never suppress — SecurityAccess,
+/// ReadDTCInformation — are excluded for the same reason.
+const c_arrSuppressCapableServices: [u8; 9] =
+    [0x10, 0x11, 0x28, 0x31, 0x3E, 0x83, 0x85, 0x86, 0x87];
+
 /// Bit 7 of a sub-function byte: suppressPosRspMsgIndicationBit (ISO 14229-1 Table 11).
 const c_bySuppressPositiveResponseBit: u8 = 0x80;
 
@@ -181,11 +194,14 @@ impl VirtualEcu {
     /// Clear the suppressPosRspMsgIndicationBit when a ResponsePending sequence is planned, so
     /// the handler produces the final response the standard requires.
     fn ClearSuppressBitIfPending(&self, vecRequest: &[u8], u8PendingCount: u8) -> Vec<u8> {
-        let bHasSubFunction = vecRequest.len() >= 2;
-        let bIsSuppressRequested =
-            bHasSubFunction && (vecRequest[1] & c_bySuppressPositiveResponseBit) != 0;
+        if u8PendingCount == 0 || vecRequest.len() < 2 {
+            return vecRequest.to_vec();
+        }
 
-        if u8PendingCount == 0 || !bIsSuppressRequested {
+        let bHasSubFunction = c_arrSuppressCapableServices.contains(&vecRequest[0]);
+        let bIsSuppressRequested = (vecRequest[1] & c_bySuppressPositiveResponseBit) != 0;
+
+        if !bHasSubFunction || !bIsSuppressRequested {
             return vecRequest.to_vec();
         }
 
