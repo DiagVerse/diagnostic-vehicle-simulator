@@ -5,11 +5,36 @@ import { Overview } from './features/Overview'
 import { Simulate } from './features/Simulate'
 import { Hardware } from './features/Hardware'
 import { Topology } from './features/Topology'
+import { TrafficMonitor } from './features/TrafficMonitor'
 import { api, type Health } from './shared/api'
 
 type Tab = 'simulate' | 'topology' | 'hardware' | 'diagnostics' | 'overview'
 
 export default function App() {
+  // The monitor opens as its own browser window, addressed by a hash rather than a route: it
+  // needs its own document — and therefore its own memory for the traffic buffer — which is the
+  // whole reason it is a separate window rather than a panel.
+  //
+  // A popup always arrives as a fresh load, so reading the hash once would be enough for it.
+  // The listener is for the other way in: someone editing the address bar of a tab that is
+  // already open, where a hash change navigates nothing and would otherwise appear to do
+  // nothing at all.
+  const [isMonitor, setMonitor] = useState(window.location.hash === '#monitor')
+
+  useEffect(() => {
+    const onHashChange = () => setMonitor(window.location.hash === '#monitor')
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  if (isMonitor) {
+    return <TrafficMonitor standalone />
+  }
+
+  return <Workbench />
+}
+
+function Workbench() {
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
   const [health, setHealth] = useState<Health | null>(null)
   const [tab, setTab] = useState<Tab>('simulate')

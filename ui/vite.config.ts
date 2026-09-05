@@ -7,13 +7,22 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     // Proxy API calls to the engine during development so the UI can use same-origin
-    // relative paths (/health, /plugins, /ecu, /simulation, /hw) and CORS is a non-issue.
+    // relative paths (/health, /plugins, /ecu, /simulation, /hw, /events) and CORS is a
+    // non-issue.
     proxy: {
       '/health': 'http://127.0.0.1:8080',
       '/plugins': 'http://127.0.0.1:8080',
       '/ecu': 'http://127.0.0.1:8080',
       '/simulation': 'http://127.0.0.1:8080',
       '/hw': 'http://127.0.0.1:8080',
+      // The live traffic feed. It must not be buffered or compressed: an SSE stream that is
+      // held back until some buffer fills is indistinguishable from an engine with nothing to
+      // say, which is exactly the confusion the monitor exists to end.
+      '/events': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+        headers: { 'Accept-Encoding': 'identity' },
+      },
     },
   },
 })
