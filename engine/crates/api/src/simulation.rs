@@ -21,7 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use core_domain::model::{CanAddress, CanAddressingMode, EcuTiming};
+use core_domain::model::{CanAddress, CanAddressingMode, Ecu, EcuTiming, SessionType};
 use core_domain::Confidence;
 use ecu::schedule::ScheduledResponse;
 use ecu::VirtualEcu;
@@ -93,6 +93,39 @@ impl IntoResponse for ApiError {
 #[serde(rename_all = "camelCase")]
 pub struct LoadSimulationBody {
     pub log_text: String,
+}
+
+/// Request body for `POST /simulation/vehicle`: the name of the vehicle to start building.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVehicleBody {
+    pub name: String,
+}
+
+/// Request body for `POST /simulation/ecus`: one ECU to add to the loaded vehicle.
+///
+/// Only the name and the identifier pair are required. The addressing mode follows from the
+/// identifier width unless it is stated, and an ECU created without an explicit capability set
+/// gets the default one, so it answers plausibly the moment it exists.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateEcuBody {
+    pub name: String,
+    pub request_can_id_hex: String,
+    pub response_can_id_hex: String,
+    #[serde(default)]
+    pub addressing_mode: Option<String>,
+    #[serde(default)]
+    pub supported_services: Option<Vec<u8>>,
+    #[serde(default)]
+    pub logical_address: Option<u16>,
+}
+
+/// Request body for renaming an ECU.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameEcuBody {
+    pub name: String,
 }
 
 /// Request body for `POST /simulation/request`: which CAN identifier to address, and the UDS
@@ -438,6 +471,129 @@ impl Drop for BusyEcuGuard {
     }
 }
 
+/// POST /simulation/vehicle — start an empty vehicle to build up by hand.
+pub async fn PostCreateVehicle(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateVehicleBody>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    let strName = body.name.trim();
+    if strName.is_empty() {
+        return Err(ApiError::BadRequest("the vehicle needs a name".to_string()));
+    }
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation.CreateEmptyVehicle(strName);
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// POST /simulation/ecus — add one ECU to the loaded vehicle and start it.
+pub async fn PostAddEcu(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateEcuBody>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    let config = BuildEcuFromBody(&body)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .AddEcu(config)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// DELETE /simulation/ecus/{requestCanIdHex} — remove one ECU and stop it.
+pub async fn DeleteEcu(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .RemoveEcu(u32RequestCanId)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// PUT /simulation/ecus/{requestCanIdHex}/name — rename one ECU.
+pub async fn PutEcuName(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+    Json(body): Json<RenameEcuBody>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let strName = body.name.trim();
+    if strName.is_empty() {
+        return Err(ApiError::BadRequest("the ECU needs a name".to_string()));
+    }
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .RenameEcu(u32RequestCanId, strName)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// Turn a create-ECU request into a domain ECU, rejecting anything that could not be routed.
+fn BuildEcuFromBody(body: &CreateEcuBody) -> Result<Ecu, ApiError> {
+    let strName = body.name.trim();
+    if strName.is_empty() {
+        return Err(ApiError::BadRequest("the ECU needs a name".to_string()));
+    }
+
+    let u32RequestCanId = ParseCanId(&body.request_can_id_hex).map_err(ApiError::BadRequest)?;
+    let u32ResponseCanId = ParseCanId(&body.response_can_id_hex).map_err(ApiError::BadRequest)?;
+
+    if u32RequestCanId == u32ResponseCanId {
+        return Err(ApiError::BadRequest(
+            "an ECU cannot request and respond on the same CAN id".to_string(),
+        ));
+    }
+
+    let mode = ResolveAddressingMode(body, u32RequestCanId, u32ResponseCanId)?;
+
+    let mut config = Ecu::New(strName, body.logical_address.unwrap_or(0));
+    config.m_optCanAddress = Some(CanAddress::NewSpecified(
+        u32RequestCanId,
+        u32ResponseCanId,
+        mode,
+    ));
+    config.m_vecSupportedServices = body
+        .supported_services
+        .clone()
+        .unwrap_or_else(DefaultSupportedServices);
+    config.m_vecSupportedSessions = DefaultSupportedSessions();
+
+    Ok(config)
+}
+
+/// Decide the addressing mode: what the caller said, or what the identifiers imply.
+fn ResolveAddressingMode(
+    body: &CreateEcuBody,
+    u32RequestCanId: u32,
+    u32ResponseCanId: u32,
+) -> Result<CanAddressingMode, ApiError> {
+    match body.addressing_mode.as_deref() {
+        None => {
+            // A 29-bit identifier cannot be an 11-bit address, so the width decides.
+            let bIsExtended = u32RequestCanId > 0x7FF || u32ResponseCanId > 0x7FF;
+            Ok(if bIsExtended {
+                CanAddressingMode::NormalFixed29Bit
+            } else {
+                CanAddressingMode::Normal11Bit
+            })
+        }
+        Some("Normal11Bit") => Ok(CanAddressingMode::Normal11Bit),
+        Some("NormalFixed29Bit") => Ok(CanAddressingMode::NormalFixed29Bit),
+        Some(strOther) => Err(ApiError::BadRequest(format!(
+            "unknown addressing mode '{strOther}'; use Normal11Bit or NormalFixed29Bit"
+        ))),
+    }
+}
+
 /// GET /simulation/ecus/{requestCanIdHex}/timing — one ECU's timing parameters.
 pub async fn GetEcuTiming(
     State(state): State<Arc<AppState>>,
@@ -571,6 +727,31 @@ fn BuildEcuDto(runningEcu: &VirtualEcu) -> SimulationEcuDto {
         dids: config.m_mapDids.keys().copied().collect(),
         dtc_count: config.m_vecDtcs.len(),
     }
+}
+
+/// The services a newly created ECU supports unless the caller says otherwise: everything the
+/// loaded UDS plugin implements, so the ECU answers plausibly the moment it exists rather than
+/// refusing every request with NRC 0x11 serviceNotSupported.
+fn DefaultSupportedServices() -> Vec<u8> {
+    vec![
+        0x10, // DiagnosticSessionControl
+        0x11, // ECUReset
+        0x19, // ReadDTCInformation
+        0x22, // ReadDataByIdentifier
+        0x27, // SecurityAccess
+        0x31, // RoutineControl
+        0x3E, // TesterPresent
+    ]
+}
+
+/// The sessions a newly created ECU can enter. Default is mandatory (ISO 14229-1: an ECU powers
+/// up in it); the other two are what a tester actually asks for.
+fn DefaultSupportedSessions() -> Vec<SessionType> {
+    vec![
+        SessionType::Default,
+        SessionType::Extended,
+        SessionType::Programming,
+    ]
 }
 
 /// Name an addressing mode for display.
