@@ -5,7 +5,9 @@
 //! the UI. Everything outward (protocols, parsers, transports, persistence) is an adapter
 //! that this layer defines ports for elsewhere; see `plugin-contract`.
 //!
-//! Phase 0 intentionally keeps this minimal — the Unified Vehicle Model lands in Phase 1.
+//! The Unified Vehicle Model lives in [`model`].
+
+pub mod model;
 
 /// Domain-level error type. Grows as the model gains behaviour.
 #[derive(Debug, thiserror::Error)]

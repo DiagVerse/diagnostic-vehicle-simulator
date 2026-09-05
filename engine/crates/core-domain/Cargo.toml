@@ -8,7 +8,5 @@ description = "Pure business logic: the Unified Vehicle Model and domain rules. 
 
 [dependencies]
 serde.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true
