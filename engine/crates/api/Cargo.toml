@@ -17,3 +17,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `start_paused` runs the response emitter against tokio's virtual clock, so the timing test
+# asserts real millisecond behaviour without actually waiting. It lives behind `test-util`,
+# which the workspace's "full" feature set does not include.
+tokio = { workspace = true, features = ["test-util"] }

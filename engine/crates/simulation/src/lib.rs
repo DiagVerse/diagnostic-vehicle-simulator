@@ -107,6 +107,10 @@ pub enum SimulationError {
 pub struct RoutedResponse {
     /// Which ECU answered.
     pub m_strEcuName: String,
+    /// The identifier that ECU is physically addressed on. For a broadcast this is the ECU's
+    /// own identifier, not the broadcast one, so a caller can tell exactly which ECUs a
+    /// request occupied.
+    pub m_u32RequestCanId: u32,
     /// The CAN identifier the answer is sent on.
     pub m_u32ResponseCanId: u32,
     /// The UDS response bytes. Empty when the ECU deliberately suppressed its response
@@ -420,11 +424,12 @@ fn ProcessOnEcu(
 ) -> RoutedResponse {
     // Only ECUs that carry a CAN address are ever started, so reading it back here cannot
     // fail: `BuildEcuMap` skips the rest.
-    let u32ResponseCanId = runningEcu
+    let address = runningEcu
         .Config()
         .m_optCanAddress
-        .expect("a started ECU always has a CAN address; BuildEcuMap only starts those")
-        .m_u32ResponseCanId;
+        .expect("a started ECU always has a CAN address; BuildEcuMap only starts those");
+    let u32ResponseCanId = address.m_u32ResponseCanId;
+    let u32EcuRequestCanId = address.m_u32RequestCanId;
     let strEcuName = runningEcu.Config().m_strName.clone();
 
     let plan = runningEcu.ProcessRequestWithTiming(protocol, vecRequest);
@@ -461,6 +466,7 @@ fn ProcessOnEcu(
 
     RoutedResponse {
         m_strEcuName: strEcuName,
+        m_u32RequestCanId: u32EcuRequestCanId,
         m_u32ResponseCanId: u32ResponseCanId,
         m_vecResponse: vecResponse,
         m_bySession: runningEcu.CurrentSession(),

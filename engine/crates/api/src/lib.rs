@@ -6,6 +6,7 @@ pub mod diagnostics;
 pub mod simulation;
 
 use std::{
+    collections::BTreeSet,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -34,6 +35,10 @@ pub struct AppState {
     /// The loaded vehicle simulation the `/simulation/*` endpoints drive. Guarded by a mutex
     /// for the same reason as `ecu`: it holds live ECU state and is mutated by requests.
     pub simulation: Mutex<SimulationService>,
+    /// Request CAN identifiers whose ECU is part-way through a ResponsePending sequence. Such
+    /// an ECU has told the tester it cannot receive another request (ISO 14229-1 Annex A.1),
+    /// so a second one is refused instead of mutating its state mid-answer.
+    pub busy_ecus: Mutex<BTreeSet<u32>>,
 }
 
 /// Response body for `GET /health`.
@@ -60,6 +65,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(simulation::PostSimulationRequest),
         )
         .route("/simulation/reset", post(simulation::PostSimulationReset))
+        .route(
+            "/simulation/ecus/{requestCanIdHex}/timing",
+            get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
