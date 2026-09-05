@@ -33,8 +33,17 @@ for lib in "$ROOT"/engine/target/debug/lib*_plugin.*; do
   esac
 done
 
-echo "==> Starting engine on http://127.0.0.1:8080 ..."
-"$ROOT/engine/target/debug/dvsim" serve --plugins "$ROOT/plugins.d" &
+# Free the engine port if a previous run (or a stray process) is still holding it, so the
+# engine can always bind. Only touches the fixed engine port; Vite picks its own port.
+ENGINE_PORT=8080
+if lsof -ti "tcp:${ENGINE_PORT}" >/dev/null 2>&1; then
+  echo "==> Port ${ENGINE_PORT} is in use; stopping the previous listener ..."
+  lsof -ti "tcp:${ENGINE_PORT}" | xargs kill 2>/dev/null || true
+  sleep 1
+fi
+
+echo "==> Starting engine on http://127.0.0.1:${ENGINE_PORT} ..."
+"$ROOT/engine/target/debug/dvsim" serve --addr "127.0.0.1:${ENGINE_PORT}" --plugins "$ROOT/plugins.d" &
 ENGINE_PID=$!
 
 cleanup() {
