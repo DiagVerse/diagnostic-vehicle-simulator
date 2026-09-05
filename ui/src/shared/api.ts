@@ -136,6 +136,20 @@ export interface SimulationRequestResult {
   responses: SimulationResponse[]
 }
 
+/**
+ * An ECU to add to the loaded vehicle. Only a name and the identifier pair are required: the
+ * addressing mode follows from the identifier width, and the capability set defaults to
+ * everything the engine's UDS plugin implements.
+ */
+export interface NewEcu {
+  name: string
+  requestCanIdHex: string
+  responseCanIdHex: string
+  addressingMode?: string
+  supportedServices?: number[]
+  logicalAddress?: number
+}
+
 /** The engine returns a JSON body with an `error` field for a 4xx. */
 interface ApiErrorBody {
   error?: string
@@ -155,6 +169,14 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 
 async function putJson<T>(path: string, body: unknown): Promise<T> {
   return sendJson<T>('PUT', path, body)
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: 'DELETE' })
+  if (!res.ok) {
+    throw new Error(await describeFailure(path, res))
+  }
+  return (await res.json()) as T
 }
 
 async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
@@ -194,6 +216,13 @@ export const api = {
   ecuRequest: (requestHex: string) => postJson<RequestResult>('/ecu/request', { requestHex }),
 
   simulationState: () => getJson<SimulationState>('/simulation/state'),
+  simulationCreateVehicle: (name: string) =>
+    postJson<SimulationState>('/simulation/vehicle', { name }),
+  simulationAddEcu: (ecu: NewEcu) => postJson<SimulationState>('/simulation/ecus', ecu),
+  simulationRemoveEcu: (requestCanIdHex: string) =>
+    deleteJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}`),
+  simulationRenameEcu: (requestCanIdHex: string, name: string) =>
+    putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/name`, { name }),
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationRequest: (canIdHex: string, requestHex: string) =>

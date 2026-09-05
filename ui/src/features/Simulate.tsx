@@ -3,6 +3,7 @@ import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
 import {
   api,
   type EcuTiming,
+  type NewEcu,
   type SimulationEcu,
   type SimulationRequestResult,
   type SimulationResponse,
@@ -38,6 +39,7 @@ export function Simulate() {
   const [canIdHex, setCanIdHex] = useState('')
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
+  const [source, setSource] = useState<VehicleSource>('log')
   const nextEntryId = useRef(1)
 
   useEffect(() => {
@@ -122,13 +124,25 @@ export function Simulate() {
         </div>
       )}
 
-      <LogLoader onLoad={load} busy={busy} />
+      <SourcePicker source={source} onChange={setSource} />
+
+      {source === 'log' ? (
+        <LogLoader onLoad={load} busy={busy} />
+      ) : (
+        <VehicleBuilder onChanged={setState} onError={setError} busy={busy} />
+      )}
 
       {!state?.loaded ? (
         <EmptyState />
       ) : (
         <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-          <EcuList state={state} onReset={reset} busy={busy} />
+          <EcuList
+            state={state}
+            onReset={reset}
+            onChanged={setState}
+            onError={setError}
+            busy={busy}
+          />
 
           <section className="space-y-4">
             <RequestPanel
@@ -154,6 +168,190 @@ export function Simulate() {
         </div>
       )}
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// Where the vehicle comes from
+// ---------------------------------------------------------------------------------------
+
+/** A vehicle is either reconstructed from a capture or stated by hand. */
+type VehicleSource = 'log' | 'build'
+
+function SourcePicker({
+  source,
+  onChange,
+}: {
+  source: VehicleSource
+  onChange: (source: VehicleSource) => void
+}) {
+  return (
+    <div className="flex gap-1 rounded-lg border border-slate-800 bg-slate-900/50 p-1">
+      <SourceTab active={source === 'log'} onClick={() => onChange('log')}>
+        From a CAN log
+      </SourceTab>
+      <SourceTab active={source === 'build'} onClick={() => onChange('build')}>
+        Build from scratch
+      </SourceTab>
+    </div>
+  )
+}
+
+function SourceTab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex-1 rounded-md px-3 py-2 text-sm transition ${
+        active ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-800/50'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+/**
+ * Start an empty vehicle and add ECUs to it one at a time — for someone working from a wiring
+ * diagram rather than a capture.
+ */
+function VehicleBuilder({
+  onChanged,
+  onError,
+  busy,
+}: {
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [vehicleName, setVehicleName] = useState('Bench vehicle')
+  const [draft, setDraft] = useState<NewEcu>({
+    name: '',
+    requestCanIdHex: '',
+    responseCanIdHex: '',
+  })
+  const [working, setWorking] = useState(false)
+
+  async function run(action: () => Promise<SimulationState>) {
+    setWorking(true)
+    try {
+      onChanged(await action())
+      onError(null)
+      return true
+    } catch (e) {
+      onError(DescribeError(e))
+      return false
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  async function addEcu() {
+    const ok = await run(() => api.simulationAddEcu(draft))
+    if (ok) {
+      setDraft({ name: '', requestCanIdHex: '', responseCanIdHex: '' })
+    }
+  }
+
+  const bCanAdd =
+    draft.name.trim().length > 0 &&
+    draft.requestCanIdHex.trim().length > 0 &&
+    draft.responseCanIdHex.trim().length > 0
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+      <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+        Build a vehicle
+      </h3>
+
+      <div className="mt-3 flex flex-wrap items-end gap-2">
+        <label className="min-w-48 flex-1">
+          <span className="text-xs text-slate-400">Vehicle name</span>
+          <input
+            value={vehicleName}
+            onChange={(e) => setVehicleName(e.target.value)}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+          />
+        </label>
+        <button
+          onClick={() => run(() => api.simulationCreateVehicle(vehicleName))}
+          disabled={busy || working || vehicleName.trim().length === 0}
+          className="rounded-md border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+        >
+          Start empty vehicle
+        </button>
+      </div>
+
+      <p className="mt-2 text-xs text-slate-600">
+        Starting a vehicle replaces whatever is loaded. Then add ECUs one at a time — each gets
+        every service the engine&rsquo;s UDS plugin implements, so it answers straight away.
+      </p>
+
+      <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_7rem_7rem_auto] sm:items-end">
+        <TextField
+          label="ECU name"
+          placeholder="Engine"
+          value={draft.name}
+          onChange={(v) => setDraft({ ...draft, name: v })}
+        />
+        <TextField
+          label="Request id"
+          placeholder="7E0"
+          mono
+          value={draft.requestCanIdHex}
+          onChange={(v) => setDraft({ ...draft, requestCanIdHex: v })}
+        />
+        <TextField
+          label="Response id"
+          placeholder="7E8"
+          mono
+          value={draft.responseCanIdHex}
+          onChange={(v) => setDraft({ ...draft, responseCanIdHex: v })}
+        />
+        <button
+          onClick={addEcu}
+          disabled={busy || working || !bCanAdd}
+          className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Add ECU
+        </button>
+      </div>
+    </section>
+  )
+}
+
+function TextField({
+  label,
+  placeholder,
+  value,
+  onChange,
+  mono,
+}: {
+  label: string
+  placeholder: string
+  value: string
+  onChange: (value: string) => void
+  mono?: boolean
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs text-slate-400">{label}</span>
+      <input
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className={`mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500 ${
+          mono ? 'font-mono' : ''
+        }`}
+      />
+    </label>
   )
 }
 
@@ -236,10 +434,14 @@ function EmptyState() {
 function EcuList({
   state,
   onReset,
+  onChanged,
+  onError,
   busy,
 }: {
   state: SimulationState
   onReset: () => void
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
   busy: boolean
 }) {
   return (
@@ -254,7 +456,13 @@ function EcuList({
       </div>
 
       {state.ecus.map((ecu) => (
-        <EcuCard key={ecu.requestCanIdHex} ecu={ecu} />
+        <EcuCard
+          key={ecu.requestCanIdHex}
+          ecu={ecu}
+          onChanged={onChanged}
+          onError={onError}
+          busy={busy}
+        />
       ))}
 
       <button
@@ -268,14 +476,99 @@ function EcuList({
   )
 }
 
-function EcuCard({ ecu }: { ecu: SimulationEcu }) {
+function EcuCard({
+  ecu,
+  onChanged,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [renaming, setRenaming] = useState(false)
+  const [name, setName] = useState(ecu.name)
+  const [working, setWorking] = useState(false)
+
+  async function run(action: () => Promise<SimulationState>) {
+    setWorking(true)
+    try {
+      onChanged(await action())
+      onError(null)
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  async function rename() {
+    await run(() => api.simulationRenameEcu(ecu.requestCanIdHex, name))
+    setRenaming(false)
+  }
+
   return (
     <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-      <div className="flex items-center justify-between">
-        <h4 className="font-semibold">{ecu.name}</h4>
-        <span className="font-mono text-xs text-slate-400">
-          {ecu.requestCanIdHex} → {ecu.responseCanIdHex}
-        </span>
+      <div className="flex items-center justify-between gap-2">
+        {renaming ? (
+          <form
+            className="flex flex-1 gap-1"
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (name.trim()) rename()
+            }}
+          >
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-200 outline-none focus:border-slate-500"
+            />
+            <button
+              type="submit"
+              disabled={working || name.trim().length === 0}
+              className="rounded-md bg-sky-700 px-2 py-1 text-xs text-white disabled:opacity-40"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setName(ecu.name)
+                setRenaming(false)
+              }}
+              className="px-1 text-xs text-slate-400"
+            >
+              Cancel
+            </button>
+          </form>
+        ) : (
+          <>
+            <h4 className="font-semibold">{ecu.name}</h4>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-xs text-slate-400">
+                {ecu.requestCanIdHex} → {ecu.responseCanIdHex}
+              </span>
+              <button
+                onClick={() => setRenaming(true)}
+                disabled={busy || working}
+                title="Rename this ECU"
+                className="text-xs text-slate-500 transition hover:text-slate-300 disabled:opacity-40"
+              >
+                rename
+              </button>
+              <button
+                onClick={() => run(() => api.simulationRemoveEcu(ecu.requestCanIdHex))}
+                disabled={busy || working}
+                title="Remove this ECU from the vehicle"
+                className="text-xs text-slate-500 transition hover:text-rose-400 disabled:opacity-40"
+              >
+                remove
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
       <dl className="mt-3 space-y-2 text-sm">
