@@ -1,0 +1,13 @@
+[package]
+name = "reconstruct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CAN-log -> Unified Vehicle Model reconstruction pipeline."
+
+[dependencies]
+can.workspace = true
+isotp.workspace = true
+core-domain.workspace = true
+thiserror.workspace = true
