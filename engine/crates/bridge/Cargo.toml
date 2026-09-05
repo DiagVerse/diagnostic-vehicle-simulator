@@ -1,0 +1,28 @@
+[package]
+name = "bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Puts the simulation on a CAN bus: frames in, routed requests, ISO-TP framed answers out."
+
+[features]
+default = ["serial"]
+serial = ["serial-can/serial"]
+
+[dependencies]
+can.workspace = true
+isotp.workspace = true
+slcan.workspace = true
+serial-can.workspace = true
+simulation.workspace = true
+application.workspace = true
+core-domain.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uds-plugin.workspace = true
+plugin-contract.workspace = true
+abi_stable.workspace = true

@@ -209,6 +209,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "bridge"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "application",
+ "can",
+ "core-domain",
+ "isotp",
+ "plugin-contract",
+ "serial-can",
+ "simulation",
+ "slcan",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uds-plugin",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
