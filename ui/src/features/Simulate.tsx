@@ -3,6 +3,8 @@ import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
 import {
   api,
   type EcuTiming,
+  type NewEcu,
+  type ResponseOverride,
   type SimulationEcu,
   type SimulationRequestResult,
   type SimulationResponse,
@@ -38,6 +40,7 @@ export function Simulate() {
   const [canIdHex, setCanIdHex] = useState('')
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
+  const [source, setSource] = useState<VehicleSource>('log')
   const nextEntryId = useRef(1)
 
   useEffect(() => {
@@ -122,13 +125,25 @@ export function Simulate() {
         </div>
       )}
 
-      <LogLoader onLoad={load} busy={busy} />
+      <SourcePicker source={source} onChange={setSource} />
+
+      {source === 'log' ? (
+        <LogLoader onLoad={load} busy={busy} />
+      ) : (
+        <VehicleBuilder onChanged={setState} onError={setError} busy={busy} />
+      )}
 
       {!state?.loaded ? (
         <EmptyState />
       ) : (
         <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-          <EcuList state={state} onReset={reset} busy={busy} />
+          <EcuList
+            state={state}
+            onReset={reset}
+            onChanged={setState}
+            onError={setError}
+            busy={busy}
+          />
 
           <section className="space-y-4">
             <RequestPanel
@@ -142,6 +157,12 @@ export function Simulate() {
             />
             {/* Keyed by the ECU so switching address remounts the form: an unsaved draft for
                 one ECU must never be applied to another. */}
+            <OverridePanel
+              key={`ov-${strSelectedCanId}`}
+              ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onError={setError}
+              busy={busy}
+            />
             <TimingPanel
               key={strSelectedCanId}
               ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
@@ -154,6 +175,190 @@ export function Simulate() {
         </div>
       )}
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// Where the vehicle comes from
+// ---------------------------------------------------------------------------------------
+
+/** A vehicle is either reconstructed from a capture or stated by hand. */
+type VehicleSource = 'log' | 'build'
+
+function SourcePicker({
+  source,
+  onChange,
+}: {
+  source: VehicleSource
+  onChange: (source: VehicleSource) => void
+}) {
+  return (
+    <div className="flex gap-1 rounded-lg border border-slate-800 bg-slate-900/50 p-1">
+      <SourceTab active={source === 'log'} onClick={() => onChange('log')}>
+        From a CAN log
+      </SourceTab>
+      <SourceTab active={source === 'build'} onClick={() => onChange('build')}>
+        Build from scratch
+      </SourceTab>
+    </div>
+  )
+}
+
+function SourceTab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex-1 rounded-md px-3 py-2 text-sm transition ${
+        active ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-800/50'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+/**
+ * Start an empty vehicle and add ECUs to it one at a time — for someone working from a wiring
+ * diagram rather than a capture.
+ */
+function VehicleBuilder({
+  onChanged,
+  onError,
+  busy,
+}: {
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [vehicleName, setVehicleName] = useState('Bench vehicle')
+  const [draft, setDraft] = useState<NewEcu>({
+    name: '',
+    requestCanIdHex: '',
+    responseCanIdHex: '',
+  })
+  const [working, setWorking] = useState(false)
+
+  async function run(action: () => Promise<SimulationState>) {
+    setWorking(true)
+    try {
+      onChanged(await action())
+      onError(null)
+      return true
+    } catch (e) {
+      onError(DescribeError(e))
+      return false
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  async function addEcu() {
+    const ok = await run(() => api.simulationAddEcu(draft))
+    if (ok) {
+      setDraft({ name: '', requestCanIdHex: '', responseCanIdHex: '' })
+    }
+  }
+
+  const bCanAdd =
+    draft.name.trim().length > 0 &&
+    draft.requestCanIdHex.trim().length > 0 &&
+    draft.responseCanIdHex.trim().length > 0
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+      <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+        Build a vehicle
+      </h3>
+
+      <div className="mt-3 flex flex-wrap items-end gap-2">
+        <label className="min-w-48 flex-1">
+          <span className="text-xs text-slate-400">Vehicle name</span>
+          <input
+            value={vehicleName}
+            onChange={(e) => setVehicleName(e.target.value)}
+            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+          />
+        </label>
+        <button
+          onClick={() => run(() => api.simulationCreateVehicle(vehicleName))}
+          disabled={busy || working || vehicleName.trim().length === 0}
+          className="rounded-md border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+        >
+          Start empty vehicle
+        </button>
+      </div>
+
+      <p className="mt-2 text-xs text-slate-600">
+        Starting a vehicle replaces whatever is loaded. Then add ECUs one at a time — each gets
+        every service the engine&rsquo;s UDS plugin implements, so it answers straight away.
+      </p>
+
+      <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_7rem_7rem_auto] sm:items-end">
+        <TextField
+          label="ECU name"
+          placeholder="Engine"
+          value={draft.name}
+          onChange={(v) => setDraft({ ...draft, name: v })}
+        />
+        <TextField
+          label="Request id"
+          placeholder="7E0"
+          mono
+          value={draft.requestCanIdHex}
+          onChange={(v) => setDraft({ ...draft, requestCanIdHex: v })}
+        />
+        <TextField
+          label="Response id"
+          placeholder="7E8"
+          mono
+          value={draft.responseCanIdHex}
+          onChange={(v) => setDraft({ ...draft, responseCanIdHex: v })}
+        />
+        <button
+          onClick={addEcu}
+          disabled={busy || working || !bCanAdd}
+          className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Add ECU
+        </button>
+      </div>
+    </section>
+  )
+}
+
+function TextField({
+  label,
+  placeholder,
+  value,
+  onChange,
+  mono,
+}: {
+  label: string
+  placeholder: string
+  value: string
+  onChange: (value: string) => void
+  mono?: boolean
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs text-slate-400">{label}</span>
+      <input
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className={`mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500 ${
+          mono ? 'font-mono' : ''
+        }`}
+      />
+    </label>
   )
 }
 
@@ -236,10 +441,14 @@ function EmptyState() {
 function EcuList({
   state,
   onReset,
+  onChanged,
+  onError,
   busy,
 }: {
   state: SimulationState
   onReset: () => void
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
   busy: boolean
 }) {
   return (
@@ -254,7 +463,13 @@ function EcuList({
       </div>
 
       {state.ecus.map((ecu) => (
-        <EcuCard key={ecu.requestCanIdHex} ecu={ecu} />
+        <EcuCard
+          key={ecu.requestCanIdHex}
+          ecu={ecu}
+          onChanged={onChanged}
+          onError={onError}
+          busy={busy}
+        />
       ))}
 
       <button
@@ -268,14 +483,99 @@ function EcuList({
   )
 }
 
-function EcuCard({ ecu }: { ecu: SimulationEcu }) {
+function EcuCard({
+  ecu,
+  onChanged,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [renaming, setRenaming] = useState(false)
+  const [name, setName] = useState(ecu.name)
+  const [working, setWorking] = useState(false)
+
+  async function run(action: () => Promise<SimulationState>) {
+    setWorking(true)
+    try {
+      onChanged(await action())
+      onError(null)
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  async function rename() {
+    await run(() => api.simulationRenameEcu(ecu.requestCanIdHex, name))
+    setRenaming(false)
+  }
+
   return (
     <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-      <div className="flex items-center justify-between">
-        <h4 className="font-semibold">{ecu.name}</h4>
-        <span className="font-mono text-xs text-slate-400">
-          {ecu.requestCanIdHex} → {ecu.responseCanIdHex}
-        </span>
+      <div className="flex items-center justify-between gap-2">
+        {renaming ? (
+          <form
+            className="flex flex-1 gap-1"
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (name.trim()) rename()
+            }}
+          >
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-200 outline-none focus:border-slate-500"
+            />
+            <button
+              type="submit"
+              disabled={working || name.trim().length === 0}
+              className="rounded-md bg-sky-700 px-2 py-1 text-xs text-white disabled:opacity-40"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setName(ecu.name)
+                setRenaming(false)
+              }}
+              className="px-1 text-xs text-slate-400"
+            >
+              Cancel
+            </button>
+          </form>
+        ) : (
+          <>
+            <h4 className="font-semibold">{ecu.name}</h4>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-xs text-slate-400">
+                {ecu.requestCanIdHex} → {ecu.responseCanIdHex}
+              </span>
+              <button
+                onClick={() => setRenaming(true)}
+                disabled={busy || working}
+                title="Rename this ECU"
+                className="text-xs text-slate-500 transition hover:text-slate-300 disabled:opacity-40"
+              >
+                rename
+              </button>
+              <button
+                onClick={() => run(() => api.simulationRemoveEcu(ecu.requestCanIdHex))}
+                disabled={busy || working}
+                title="Remove this ECU from the vehicle"
+                className="text-xs text-slate-500 transition hover:text-rose-400 disabled:opacity-40"
+              >
+                remove
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
       <dl className="mt-3 space-y-2 text-sm">
@@ -409,6 +709,241 @@ function RequestPanel({
         </form>
       </div>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// Response overrides
+// ---------------------------------------------------------------------------------------
+
+/** The requests worth offering first — the ones a tester actually sends. */
+const REQUEST_CATALOGUE: { label: string; requestHex: string; responseHex: string }[] = [
+  { label: '0x22 ReadDataByIdentifier', requestHex: '22 F1 90', responseHex: '62 F1 90 00' },
+  { label: '0x2E WriteDataByIdentifier', requestHex: '2E F1 90 00', responseHex: '6E F1 90' },
+  { label: '0x14 ClearDiagnosticInformation', requestHex: '14 FF FF FF', responseHex: '54' },
+  { label: '0x19 ReadDTCInformation', requestHex: '19 02 FF', responseHex: '59 02 FF' },
+  { label: '0x2F InputOutputControl', requestHex: '2F F1 90 03 01', responseHex: '6F F1 90 03' },
+  { label: '0x31 RoutineControl', requestHex: '31 01 F0 00', responseHex: '71 01 F0 00' },
+  { label: '0x34 RequestDownload', requestHex: '34 00 44 00 00 00 00 00 00 01 00', responseHex: '74 20 04 00' },
+  { label: '0x36 TransferData', requestHex: '36 01', responseHex: '76 01' },
+  { label: '0x37 RequestTransferExit', requestHex: '37', responseHex: '77' },
+  { label: '0x28 CommunicationControl', requestHex: '28 01 01', responseHex: '68 01' },
+  { label: '0x85 ControlDTCSetting', requestHex: '85 02', responseHex: 'C5 02' },
+  { label: '0x87 LinkControl', requestHex: '87 01 01', responseHex: 'C7 01' },
+  { label: '0x23 ReadMemoryByAddress', requestHex: '23 14 20 00 00 04', responseHex: '63 00 00 00 00' },
+]
+
+/** Services the engine's UDS plugin answers without help. */
+const IMPLEMENTED_SERVICES = ['10', '11', '19', '22', '27', '31', '3E']
+
+/**
+ * Edit what one ECU answers to a particular request.
+ *
+ * This is the only way to get a positive response out of the services the engine's UDS plugin
+ * does not implement, and the only way to make an ECU refuse or ignore a request it would
+ * otherwise answer.
+ */
+function OverridePanel({
+  ecu,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu | null
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [overrides, setOverrides] = useState<ResponseOverride[] | null>(null)
+  const [working, setWorking] = useState(false)
+
+  const requestCanIdHex = ecu?.requestCanIdHex
+
+  useEffect(() => {
+    // The panel is keyed by the selected identifier, so it remounts when the ECU changes and
+    // cannot show one ECU's overrides against another. Nothing to reset here.
+    if (!requestCanIdHex) {
+      return
+    }
+    let cancelled = false
+    api
+      .ecuOverrides(requestCanIdHex)
+      .then((loaded) => {
+        if (!cancelled) setOverrides(loaded)
+      })
+      .catch((e) => {
+        if (!cancelled) onError(DescribeError(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [requestCanIdHex, onError])
+
+  if (!ecu) {
+    return null
+  }
+
+  const vecOverrides = overrides ?? []
+
+  async function save(vecNext: ResponseOverride[]) {
+    if (!ecu) return
+    setWorking(true)
+    try {
+      setOverrides(await api.setEcuOverrides(ecu.requestCanIdHex, vecNext))
+      onError(null)
+    } catch (e) {
+      // The engine explains exactly which override it refused and why.
+      onError(DescribeError(e))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  function addFromCatalogue(requestHex: string, responseHex: string) {
+    save([
+      ...vecOverrides,
+      {
+        requestHex,
+        matchTrailingBytes: false,
+        action: 'substitute',
+        responseHex,
+        echoSpans: [],
+        enabled: true,
+        respondEvenIfSuppressed: false,
+        note: '',
+      },
+    ])
+  }
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Responses — {ecu.name}
+        </h3>
+        <span className="text-xs text-slate-500">{vecOverrides.length} override(s)</span>
+      </div>
+
+      <p className="mt-2 text-xs text-slate-600">
+        The engine&rsquo;s UDS plugin answers {IMPLEMENTED_SERVICES.map((s) => '0x' + s).join(', ')}.
+        Every other service returns <span className="font-mono">7F .. 11</span> until you define
+        a response here.
+      </p>
+
+      <div className="mt-3">
+        <select
+          value=""
+          disabled={busy || working}
+          onChange={(e) => {
+            const entry = REQUEST_CATALOGUE.find((c) => c.requestHex === e.target.value)
+            if (entry) addFromCatalogue(entry.requestHex, entry.responseHex)
+          }}
+          className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+        >
+          <option value="">Add a response for…</option>
+          {REQUEST_CATALOGUE.map((entry) => (
+            <option key={entry.requestHex} value={entry.requestHex}>
+              {entry.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {vecOverrides.length > 0 && (
+        <ul className="mt-3 space-y-2">
+          {vecOverrides.map((rule, iIndex) => (
+            <OverrideRow
+              key={`${rule.requestHex}-${iIndex}`}
+              rule={rule}
+              disabled={busy || working}
+              onChange={(next) =>
+                save(vecOverrides.map((existing, i) => (i === iIndex ? next : existing)))
+              }
+              onRemove={() => save(vecOverrides.filter((_, i) => i !== iIndex))}
+            />
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+function OverrideRow({
+  rule,
+  disabled,
+  onChange,
+  onRemove,
+}: {
+  rule: ResponseOverride
+  disabled: boolean
+  onChange: (rule: ResponseOverride) => void
+  onRemove: () => void
+}) {
+  const [draft, setDraft] = useState(rule)
+  const bIsDirty =
+    draft.requestHex !== rule.requestHex ||
+    draft.responseHex !== rule.responseHex ||
+    draft.action !== rule.action
+
+  return (
+    <li className="rounded-md border border-slate-800 bg-slate-950/60 p-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          value={draft.requestHex}
+          onChange={(e) => setDraft({ ...draft, requestHex: e.target.value })}
+          className="w-36 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-300 outline-none focus:border-slate-500"
+        />
+        <span className="text-slate-600">→</span>
+        {draft.action === 'suppress' ? (
+          <span className="flex-1 font-mono text-xs text-slate-500">(silence)</span>
+        ) : (
+          <input
+            value={draft.responseHex ?? ''}
+            onChange={(e) => setDraft({ ...draft, responseHex: e.target.value })}
+            className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs text-emerald-300 outline-none focus:border-slate-500"
+          />
+        )}
+        <button
+          onClick={() =>
+            setDraft({
+              ...draft,
+              action: draft.action === 'suppress' ? 'substitute' : 'suppress',
+            })
+          }
+          disabled={disabled}
+          title="Answer with bytes, or stay silent for this request"
+          className="text-[11px] text-slate-500 hover:text-slate-300 disabled:opacity-40"
+        >
+          {draft.action === 'suppress' ? 'answer' : 'silence'}
+        </button>
+        <button
+          onClick={() => onChange({ ...draft, enabled: !draft.enabled })}
+          disabled={disabled}
+          className="text-[11px] text-slate-500 hover:text-slate-300 disabled:opacity-40"
+        >
+          {rule.enabled ? 'disable' : 'enable'}
+        </button>
+        <button
+          onClick={onRemove}
+          disabled={disabled}
+          className="text-[11px] text-slate-500 hover:text-rose-400 disabled:opacity-40"
+        >
+          remove
+        </button>
+      </div>
+
+      <div className="mt-1.5 flex items-center gap-2">
+        {!rule.enabled && <Badge tone="slate">disabled</Badge>}
+        {rule.maskHex && rule.maskHex.includes('00') && <Badge tone="amber">wildcard</Badge>}
+        {bIsDirty && (
+          <button
+            onClick={() => onChange(draft)}
+            disabled={disabled}
+            className="rounded bg-sky-700 px-2 py-0.5 text-[11px] text-white disabled:opacity-40"
+          >
+            Apply
+          </button>
+        )}
+      </div>
+    </li>
   )
 }
 

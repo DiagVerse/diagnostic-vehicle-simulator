@@ -136,6 +136,78 @@ export interface SimulationRequestResult {
   responses: SimulationResponse[]
 }
 
+/** A run of request bytes copied into the response, so a wildcard override still echoes. */
+export interface EchoSpan {
+  requestOffset: number
+  length: number
+  responseOffset: number
+}
+
+/**
+ * A user-defined answer to a request.
+ *
+ * Declaring a service supported does not implement it — the engine's UDS plugin answers seven
+ * services, and an override is the only way to get a positive response out of the rest.
+ */
+export interface ResponseOverride {
+  requestHex: string
+  /** One mask byte per pattern byte: FF must match, 00 is a wildcard. */
+  maskHex?: string | null
+  matchTrailingBytes: boolean
+  /** 'substitute' or 'suppress'. */
+  action: string
+  responseHex?: string | null
+  echoSpans: EchoSpan[]
+  enabled: boolean
+  respondEvenIfSuppressed: boolean
+  note: string
+}
+
+/** One link in the topology view. Deliberately not called a bus — see `caveats`. */
+export interface TopologyLink {
+  id: string
+  label: string
+  kind: string
+  functionalCanIdsHex: string[]
+  membershipConfidence: string
+}
+
+/** One node hanging off a link. */
+export interface TopologyNode {
+  id: string
+  label: string
+  /** 'ecu' or 'tester'. */
+  kind: string
+  linkId: string | null
+  requestCanIdHex: string | null
+  responseCanIdHex: string | null
+  addressingMode: string | null
+  addressConfidence: string | null
+  isUnreachable: boolean
+}
+
+/** The diagram, plus what it cannot know. */
+export interface Topology {
+  vehicleName: string | null
+  links: TopologyLink[]
+  nodes: TopologyNode[]
+  caveats: string[]
+}
+
+/**
+ * An ECU to add to the loaded vehicle. Only a name and the identifier pair are required: the
+ * addressing mode follows from the identifier width, and the capability set defaults to
+ * everything the engine's UDS plugin implements.
+ */
+export interface NewEcu {
+  name: string
+  requestCanIdHex: string
+  responseCanIdHex: string
+  addressingMode?: string
+  supportedServices?: number[]
+  logicalAddress?: number
+}
+
 /** The engine returns a JSON body with an `error` field for a 4xx. */
 interface ApiErrorBody {
   error?: string
@@ -155,6 +227,14 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 
 async function putJson<T>(path: string, body: unknown): Promise<T> {
   return sendJson<T>('PUT', path, body)
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: 'DELETE' })
+  if (!res.ok) {
+    throw new Error(await describeFailure(path, res))
+  }
+  return (await res.json()) as T
 }
 
 async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
@@ -194,10 +274,22 @@ export const api = {
   ecuRequest: (requestHex: string) => postJson<RequestResult>('/ecu/request', { requestHex }),
 
   simulationState: () => getJson<SimulationState>('/simulation/state'),
+  simulationCreateVehicle: (name: string) =>
+    postJson<SimulationState>('/simulation/vehicle', { name }),
+  simulationAddEcu: (ecu: NewEcu) => postJson<SimulationState>('/simulation/ecus', ecu),
+  simulationRemoveEcu: (requestCanIdHex: string) =>
+    deleteJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}`),
+  simulationRenameEcu: (requestCanIdHex: string, name: string) =>
+    putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/name`, { name }),
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationRequest: (canIdHex: string, requestHex: string) =>
     postJson<SimulationRequestResult>('/simulation/request', { canIdHex, requestHex }),
+  simulationTopology: () => getJson<Topology>('/simulation/topology'),
+  ecuOverrides: (requestCanIdHex: string) =>
+    getJson<ResponseOverride[]>(`/simulation/ecus/${requestCanIdHex}/overrides`),
+  setEcuOverrides: (requestCanIdHex: string, overrides: ResponseOverride[]) =>
+    putJson<ResponseOverride[]>(`/simulation/ecus/${requestCanIdHex}/overrides`, { overrides }),
   ecuTiming: (requestCanIdHex: string) =>
     getJson<EcuTiming>(`/simulation/ecus/${requestCanIdHex}/timing`),
   setEcuTiming: (requestCanIdHex: string, timing: EcuTiming) =>

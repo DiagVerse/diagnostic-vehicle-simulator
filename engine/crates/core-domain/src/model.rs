@@ -436,6 +436,25 @@ impl CanAddress {
         }
     }
 
+    /// Build an address pair a user stated rather than one observed on a bus.
+    ///
+    /// `Confirmed` rather than `Observed`: nothing was seen on a bus, but nothing was guessed
+    /// either — the identifiers came from someone who knows the vehicle, which is the same
+    /// standing a specification has (README §7).
+    pub fn NewSpecified(
+        u32RequestCanId: u32,
+        u32ResponseCanId: u32,
+        mode: CanAddressingMode,
+    ) -> Self {
+        CanAddress {
+            m_u32RequestCanId: u32RequestCanId,
+            m_u32ResponseCanId: u32ResponseCanId,
+            m_optU32FunctionalCanId: DefaultFunctionalCanId(u32RequestCanId, mode),
+            m_addressingMode: mode,
+            m_confidence: Confidence::Confirmed,
+        }
+    }
+
     /// True when the identifiers are 29-bit extended.
     ///
     /// Derived from the addressing mode rather than from the identifier value: a value below
@@ -472,6 +491,388 @@ pub fn DefaultFunctionalCanId(u32RequestCanId: u32, mode: CanAddressingMode) -> 
     }
 }
 
+/// Copy a run of bytes out of the request into the response, so one override can answer a
+/// whole family of requests without lying about which one it answered.
+///
+/// A wildcard override on ReadDataByIdentifier is the motivating case: the response must echo
+/// the DID that was asked for (ISO 14229-1 clause 10.2), and a fixed response would answer a
+/// read of 0xF18C with 0xF190 in it — which any tester correlating on the identifier rejects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EchoSpan {
+    /// Where the run starts in the request.
+    pub m_uRequestOffset: usize,
+    /// How many bytes to copy.
+    pub m_uLength: usize,
+    /// Where the run lands in the response.
+    pub m_uResponseOffset: usize,
+}
+
+/// What an override does when it matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OverrideAction {
+    /// Send these bytes instead of whatever the protocol produced.
+    Substitute {
+        /// The response bytes, before any echo spans are applied.
+        m_vecResponse: Vec<u8>,
+        /// Runs of the request to copy into the response.
+        #[serde(default)]
+        m_vecEchoSpans: Vec<EchoSpan>,
+    },
+    /// Send nothing at all.
+    ///
+    /// A distinct action rather than an empty substitution: "present but silent for this one
+    /// request" is a real failure that no negative response can express, and the engine
+    /// already distinguishes several kinds of silence — a fourth has to be nameable in the log
+    /// or an operator debugging it cannot tell which they are looking at.
+    Suppress,
+}
+
+/// A user-defined answer to a particular request.
+///
+/// Overrides exist because declaring a service supported does not implement it: the bundled
+/// UDS plugin answers seven services, and for everything else — WriteDataByIdentifier,
+/// RequestDownload, ClearDiagnosticInformation — an override is the only way to get a positive
+/// response at all.
+///
+/// An override changes **what the ECU says, not what it does**: the protocol still runs, and
+/// the session and security state machines still behave normally. ISO 14229-1 clause 8.2 makes
+/// the same separation for the suppressPosRspMsgIndicationBit — "the execution of the service
+/// must be completely passed" even when nothing is transmitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseOverride {
+    /// The request bytes to match. Bytes where the mask is zero are ignored.
+    pub m_vecRequestPattern: Vec<u8>,
+    /// One mask byte per pattern byte: 0xFF means "must match", 0x00 means "any value".
+    pub m_vecRequestMask: Vec<u8>,
+    /// When true the pattern is a prefix and a longer request still matches — needed for
+    /// requests with a variable tail, such as a SecurityAccess key or a TransferData block.
+    /// Off by default, so a short pattern cannot accidentally become a catch-all.
+    #[serde(default)]
+    pub m_bMatchTrailingBytes: bool,
+    /// What to send when it matches.
+    pub m_action: OverrideAction,
+    /// Off keeps the override in the model without applying it, so an operator can park one
+    /// mid-investigation rather than retyping it.
+    pub m_bIsEnabled: bool,
+    /// Apply even when the protocol suppressed its response because the tester set the
+    /// suppressPosRspMsgIndicationBit. Off by default: the tester asked not to be answered and
+    /// is not listening, so answering anyway is fault injection, not a fix.
+    #[serde(default)]
+    pub m_bRespondEvenIfSuppressed: bool,
+    /// Why this override exists, for whoever reads the model next.
+    #[serde(default)]
+    pub m_strNote: String,
+}
+
+impl ResponseOverride {
+    /// Build an override that matches one exact request.
+    pub fn NewExact(vecRequest: &[u8], action: OverrideAction) -> Self {
+        ResponseOverride {
+            m_vecRequestPattern: vecRequest.to_vec(),
+            m_vecRequestMask: vec![0xFF; vecRequest.len()],
+            m_bMatchTrailingBytes: false,
+            m_action: action,
+            m_bIsEnabled: true,
+            m_bRespondEvenIfSuppressed: false,
+            m_strNote: String::new(),
+        }
+    }
+
+    /// True when this override applies to the given request.
+    pub fn Matches(&self, vecRequest: &[u8]) -> bool {
+        if !self.m_bIsEnabled || self.m_vecRequestPattern.is_empty() {
+            return false;
+        }
+        if self.m_vecRequestMask.len() != self.m_vecRequestPattern.len() {
+            return false;
+        }
+
+        let bIsLengthAcceptable = if self.m_bMatchTrailingBytes {
+            vecRequest.len() >= self.m_vecRequestPattern.len()
+        } else {
+            vecRequest.len() == self.m_vecRequestPattern.len()
+        };
+        if !bIsLengthAcceptable {
+            return false;
+        }
+
+        // Walk pattern, mask and request together. `vecRequest` may be longer when the
+        // pattern is a prefix; zip stops at the pattern, which is exactly right.
+        let itBytes = self
+            .m_vecRequestPattern
+            .iter()
+            .zip(&self.m_vecRequestMask)
+            .zip(vecRequest);
+        for ((byPattern, byMask), byActual) in itBytes {
+            if (*byActual & *byMask) != (*byPattern & *byMask) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// How specific this override is, most specific first when sorted descending.
+    ///
+    /// More fixed bytes beats fewer, then a longer pattern, then an anchored pattern beats a
+    /// prefix. Deliberately not "last one wins": reordering the list in a UI must never change
+    /// behaviour silently.
+    pub fn Specificity(&self) -> (usize, usize, bool) {
+        let uFixedBytes = self
+            .m_vecRequestMask
+            .iter()
+            .filter(|byMask| **byMask != 0x00)
+            .count();
+        (
+            uFixedBytes,
+            self.m_vecRequestPattern.len(),
+            !self.m_bMatchTrailingBytes,
+        )
+    }
+
+    /// The response bytes this override produces for a request, with echo spans applied.
+    /// `None` when the override suppresses the response instead.
+    pub fn BuildResponse(&self, vecRequest: &[u8]) -> Option<Vec<u8>> {
+        let (vecTemplate, vecEchoSpans) = match &self.m_action {
+            OverrideAction::Suppress => return None,
+            OverrideAction::Substitute {
+                m_vecResponse,
+                m_vecEchoSpans,
+            } => (m_vecResponse, m_vecEchoSpans),
+        };
+
+        let mut vecResponse = vecTemplate.clone();
+        for span in vecEchoSpans {
+            ApplyEchoSpan(span, vecRequest, &mut vecResponse);
+        }
+        Some(vecResponse)
+    }
+
+    /// The request service identifier this override answers, if the pattern states one.
+    pub fn RequestServiceId(&self) -> Option<u8> {
+        let byFirstMask = *self.m_vecRequestMask.first()?;
+        if byFirstMask != 0xFF {
+            return None;
+        }
+        self.m_vecRequestPattern.first().copied()
+    }
+}
+
+/// Copy one run of request bytes into the response, ignoring a span that would not fit rather
+/// than growing the response — a span past the end is a configuration error, and silently
+/// extending the response would hide it.
+fn ApplyEchoSpan(span: &EchoSpan, vecRequest: &[u8], vecResponse: &mut [u8]) {
+    let uRequestEnd = span.m_uRequestOffset + span.m_uLength;
+    let uResponseEnd = span.m_uResponseOffset + span.m_uLength;
+    if uRequestEnd > vecRequest.len() || uResponseEnd > vecResponse.len() {
+        return;
+    }
+
+    let vecCopied = vecRequest[span.m_uRequestOffset..uRequestEnd].to_vec();
+    vecResponse[span.m_uResponseOffset..uResponseEnd].copy_from_slice(&vecCopied);
+}
+
+/// Offset between a request service identifier and its positive response (ISO 14229-1
+/// Table 2: bit 6 of the SID is the response flag).
+pub const c_byPositiveResponseOffset: u8 = 0x40;
+/// First byte of a negative response.
+pub const c_byNegativeResponseSid: u8 = 0x7F;
+/// NRC 0x78 requestCorrectlyReceived-ResponsePending.
+pub const c_byNrcResponsePending: u8 = 0x78;
+
+/// Why a response override was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OverrideValidationError {
+    /// Nothing to match on.
+    #[error("the request pattern is empty")]
+    EmptyRequestPattern,
+
+    /// One mask byte per pattern byte, or the match is undefined.
+    #[error("the request pattern is {uPatternLength} bytes but the mask is {uMaskLength}")]
+    MaskLengthMismatch {
+        uPatternLength: usize,
+        uMaskLength: usize,
+    },
+
+    /// A pattern that fixes nothing answers everything, turning the ECU into a replayer.
+    #[error("every byte of the request pattern is a wildcard, so it would answer every request")]
+    EverythingWildcarded,
+
+    /// The service identifier has to be fixed, or the override cannot be reasoned about.
+    #[error(
+        "the first pattern byte (the service identifier) must be matched exactly, not wildcarded"
+    )]
+    ServiceIdWildcarded,
+
+    /// Requests live in two ranges; anything else is a response or not UDS at all.
+    #[error("0x{byServiceId:02X} is not a UDS request service identifier (ISO 14229-1 clause 7.3 defines 0x10..=0x3E and 0x83..=0x88)")]
+    NotARequestServiceId { byServiceId: u8 },
+
+    /// Silence is its own action, so the log can name which kind of silence it is.
+    #[error(
+        "a substituting override needs response bytes; use the suppress action to send nothing"
+    )]
+    EmptySubstituteResponse,
+
+    /// The response has to answer the request it replaces.
+    #[error("the response starts with 0x{byResponseSid:02X}, which is neither the positive response to 0x{byRequestSid:02X} (0x{byExpected:02X}) nor a negative response (0x7F)")]
+    ResponseSidMismatch {
+        byResponseSid: u8,
+        byRequestSid: u8,
+        byExpected: u8,
+    },
+
+    /// A negative response is exactly three bytes (ISO 14229-1 clause 7.4).
+    #[error("a negative response is exactly 3 bytes (7F <sid> <nrc>), but this one is {uLength}")]
+    MalformedNegativeResponse { uLength: usize },
+
+    /// The echoed service identifier has to be the one that was requested.
+    #[error("the negative response echoes service 0x{byEchoedSid:02X} but the request is 0x{byRequestSid:02X}")]
+    NegativeResponseSidMismatch { byEchoedSid: u8, byRequestSid: u8 },
+
+    /// ResponsePending is the session layer's to send, and it obliges a final response.
+    #[error("NRC 0x78 cannot be an override: it is a promise to answer later, and the timing layer owns that sequence")]
+    ResponsePendingAsOverride,
+
+    /// An echo span that reaches past either buffer is a configuration mistake.
+    #[error("an echo span reads request bytes {uRequestOffset}..{uRequestEnd}, which a request matching this pattern may not have")]
+    EchoSpanOutsideRequest {
+        uRequestOffset: usize,
+        uRequestEnd: usize,
+    },
+
+    /// Same, on the response side.
+    #[error("an echo span writes response bytes {uResponseOffset}..{uResponseEnd}, past the end of a {uResponseLength}-byte response")]
+    EchoSpanOutsideResponse {
+        uResponseOffset: usize,
+        uResponseEnd: usize,
+        uResponseLength: usize,
+    },
+}
+
+impl ResponseOverride {
+    /// Check that this override could be a real exchange on a real bus.
+    ///
+    /// Rejects what cannot be true — a response that does not answer its request, a negative
+    /// response of the wrong shape, an NRC the session layer owns. It does **not** reject
+    /// implausible-but-possible behaviour: an ECU that refuses a read it should allow is a
+    /// legitimate fault to inject, and the same "reject values, execute behaviours" rule the
+    /// timing layer follows applies here.
+    pub fn Validate(&self) -> Result<(), OverrideValidationError> {
+        if self.m_vecRequestPattern.is_empty() {
+            return Err(OverrideValidationError::EmptyRequestPattern);
+        }
+        if self.m_vecRequestMask.len() != self.m_vecRequestPattern.len() {
+            return Err(OverrideValidationError::MaskLengthMismatch {
+                uPatternLength: self.m_vecRequestPattern.len(),
+                uMaskLength: self.m_vecRequestMask.len(),
+            });
+        }
+        if self.m_vecRequestMask.iter().all(|byMask| *byMask == 0x00) {
+            return Err(OverrideValidationError::EverythingWildcarded);
+        }
+        if self.m_vecRequestMask[0] != 0xFF {
+            return Err(OverrideValidationError::ServiceIdWildcarded);
+        }
+
+        let byRequestSid = self.m_vecRequestPattern[0];
+        if !IsRequestServiceId(byRequestSid) {
+            return Err(OverrideValidationError::NotARequestServiceId {
+                byServiceId: byRequestSid,
+            });
+        }
+
+        self.ValidateAction(byRequestSid)
+    }
+
+    /// The half of validation that depends on what the override sends.
+    fn ValidateAction(&self, byRequestSid: u8) -> Result<(), OverrideValidationError> {
+        let (vecResponse, vecEchoSpans) = match &self.m_action {
+            OverrideAction::Suppress => return Ok(()),
+            OverrideAction::Substitute {
+                m_vecResponse,
+                m_vecEchoSpans,
+            } => (m_vecResponse, m_vecEchoSpans),
+        };
+
+        if vecResponse.is_empty() {
+            return Err(OverrideValidationError::EmptySubstituteResponse);
+        }
+
+        if vecResponse[0] == c_byNegativeResponseSid {
+            ValidateNegativeResponse(vecResponse, byRequestSid)?;
+        } else {
+            let byExpected = byRequestSid.wrapping_add(c_byPositiveResponseOffset);
+            if vecResponse[0] != byExpected {
+                return Err(OverrideValidationError::ResponseSidMismatch {
+                    byResponseSid: vecResponse[0],
+                    byRequestSid,
+                    byExpected,
+                });
+            }
+        }
+
+        for span in vecEchoSpans {
+            ValidateEchoSpan(span, &self.m_vecRequestPattern, vecResponse)?;
+        }
+        Ok(())
+    }
+}
+
+/// A negative response is `7F <sid> <nrc>`, echoing the service it refuses.
+fn ValidateNegativeResponse(
+    vecResponse: &[u8],
+    byRequestSid: u8,
+) -> Result<(), OverrideValidationError> {
+    if vecResponse.len() != 3 {
+        return Err(OverrideValidationError::MalformedNegativeResponse {
+            uLength: vecResponse.len(),
+        });
+    }
+    if vecResponse[1] != byRequestSid {
+        return Err(OverrideValidationError::NegativeResponseSidMismatch {
+            byEchoedSid: vecResponse[1],
+            byRequestSid,
+        });
+    }
+    if vecResponse[2] == c_byNrcResponsePending {
+        return Err(OverrideValidationError::ResponsePendingAsOverride);
+    }
+    Ok(())
+}
+
+/// An echo span must fit both the shortest matching request and the response template.
+fn ValidateEchoSpan(
+    span: &EchoSpan,
+    vecRequestPattern: &[u8],
+    vecResponse: &[u8],
+) -> Result<(), OverrideValidationError> {
+    let uRequestEnd = span.m_uRequestOffset + span.m_uLength;
+    if uRequestEnd > vecRequestPattern.len() {
+        return Err(OverrideValidationError::EchoSpanOutsideRequest {
+            uRequestOffset: span.m_uRequestOffset,
+            uRequestEnd,
+        });
+    }
+
+    let uResponseEnd = span.m_uResponseOffset + span.m_uLength;
+    if uResponseEnd > vecResponse.len() {
+        return Err(OverrideValidationError::EchoSpanOutsideResponse {
+            uResponseOffset: span.m_uResponseOffset,
+            uResponseEnd,
+            uResponseLength: vecResponse.len(),
+        });
+    }
+    Ok(())
+}
+
+/// True for a UDS request service identifier (ISO 14229-1 clause 7.3, Table 2).
+pub fn IsRequestServiceId(byServiceId: u8) -> bool {
+    (0x10..=0x3E).contains(&byServiceId) || (0x83..=0x88).contains(&byServiceId)
+}
+
 /// A single virtual ECU's static diagnostic configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -498,6 +899,11 @@ pub struct Ecu {
     pub m_vecSecurityLevels: Vec<SecurityLevel>,
     /// Timing parameters.
     pub m_timing: EcuTiming,
+    /// User-defined answers to particular requests, tried most-specific-first before the
+    /// protocol's own response is used. Defaulted on deserialization so models written before
+    /// this field existed still load.
+    #[serde(default)]
+    pub m_vecResponseOverrides: Vec<ResponseOverride>,
 }
 
 impl Ecu {
@@ -514,7 +920,18 @@ impl Ecu {
             m_vecDtcs: Vec::new(),
             m_vecSecurityLevels: Vec::new(),
             m_timing: EcuTiming::default(),
+            m_vecResponseOverrides: Vec::new(),
         }
+    }
+
+    /// The override that answers this request, or `None` if none applies.
+    ///
+    /// Most specific wins, so a rule for one exact request always beats a wildcard family.
+    pub fn FindMatchingOverride(&self, vecRequest: &[u8]) -> Option<&ResponseOverride> {
+        self.m_vecResponseOverrides
+            .iter()
+            .filter(|candidate| candidate.Matches(vecRequest))
+            .max_by_key(|candidate| candidate.Specificity())
     }
 
     /// True if the ECU advertises support for the given request service id.
@@ -612,6 +1029,127 @@ mod tests {
             m_vecExpectedKey: vec![0x33, 0x44],
         };
         assert_eq!(level.SendKeySubFunction(), 0x02);
+    }
+
+    fn ExactOverride(vecRequest: &[u8], vecResponse: &[u8]) -> ResponseOverride {
+        ResponseOverride::NewExact(
+            vecRequest,
+            OverrideAction::Substitute {
+                m_vecResponse: vecResponse.to_vec(),
+                m_vecEchoSpans: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_well_formed_override_validates() {
+        assert_eq!(
+            ExactOverride(&[0x2E, 0xF1, 0x90, 0x01], &[0x6E, 0xF1, 0x90]).Validate(),
+            Ok(())
+        );
+        // A refusal is just as valid as a positive answer.
+        assert_eq!(
+            ExactOverride(&[0x22, 0xF1, 0x90], &[0x7F, 0x22, 0x33]).Validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_override_whose_response_does_not_answer_the_request_is_refused() {
+        // 0x6E answers 0x2E, not 0x22.
+        assert!(matches!(
+            ExactOverride(&[0x22, 0xF1, 0x90], &[0x6E, 0xF1, 0x90]).Validate(),
+            Err(OverrideValidationError::ResponseSidMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_negative_response_is_refused() {
+        // A negative response is exactly three bytes.
+        assert!(matches!(
+            ExactOverride(&[0x22, 0xF1, 0x90], &[0x7F, 0x22]).Validate(),
+            Err(OverrideValidationError::MalformedNegativeResponse { .. })
+        ));
+        // And it echoes the service it refuses.
+        assert!(matches!(
+            ExactOverride(&[0x22, 0xF1, 0x90], &[0x7F, 0x2E, 0x33]).Validate(),
+            Err(OverrideValidationError::NegativeResponseSidMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn response_pending_cannot_be_an_override() {
+        // NRC 0x78 is a promise to answer later, and only the timing layer can keep it.
+        assert_eq!(
+            ExactOverride(&[0x22, 0xF1, 0x90], &[0x7F, 0x22, 0x78]).Validate(),
+            Err(OverrideValidationError::ResponsePendingAsOverride)
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_matches_everything_is_refused() {
+        let catchAll = ResponseOverride {
+            m_vecRequestPattern: vec![0x00, 0x00],
+            m_vecRequestMask: vec![0x00, 0x00],
+            m_bMatchTrailingBytes: true,
+            m_action: OverrideAction::Suppress,
+            m_bIsEnabled: true,
+            m_bRespondEvenIfSuppressed: false,
+            m_strNote: String::new(),
+        };
+        assert_eq!(
+            catchAll.Validate(),
+            Err(OverrideValidationError::EverythingWildcarded)
+        );
+    }
+
+    #[test]
+    fn a_response_byte_is_not_a_request() {
+        // 0x62 is the positive response to 0x22, not something a tester sends.
+        assert!(matches!(
+            ExactOverride(&[0x62, 0xF1, 0x90], &[0xA2]).Validate(),
+            Err(OverrideValidationError::NotARequestServiceId { .. })
+        ));
+    }
+
+    #[test]
+    fn an_echo_span_past_the_end_of_the_response_is_refused() {
+        let overrideRule = ResponseOverride {
+            m_vecRequestPattern: vec![0x22, 0x00, 0x00],
+            m_vecRequestMask: vec![0xFF, 0x00, 0x00],
+            m_bMatchTrailingBytes: false,
+            m_action: OverrideAction::Substitute {
+                m_vecResponse: vec![0x62, 0x00],
+                m_vecEchoSpans: vec![EchoSpan {
+                    m_uRequestOffset: 1,
+                    m_uLength: 2,
+                    m_uResponseOffset: 1,
+                }],
+            },
+            m_bIsEnabled: true,
+            m_bRespondEvenIfSuppressed: false,
+            m_strNote: String::new(),
+        };
+        assert!(matches!(
+            overrideRule.Validate(),
+            Err(OverrideValidationError::EchoSpanOutsideResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn a_more_specific_override_sorts_above_a_wildcard() {
+        let wildcard = ResponseOverride {
+            m_vecRequestPattern: vec![0x22, 0x00, 0x00],
+            m_vecRequestMask: vec![0xFF, 0x00, 0x00],
+            ..ExactOverride(&[0x22, 0xF1, 0x90], &[0x62, 0xF1, 0x90])
+        };
+        let exact = ExactOverride(&[0x22, 0xF1, 0x90], &[0x62, 0xF1, 0x90]);
+
+        assert!(exact.Specificity() > wildcard.Specificity());
+        assert!(exact.Matches(&[0x22, 0xF1, 0x90]));
+        assert!(wildcard.Matches(&[0x22, 0xF1, 0x90]));
+        assert!(!exact.Matches(&[0x22, 0xF1, 0x8C]));
+        assert!(wildcard.Matches(&[0x22, 0xF1, 0x8C]));
     }
 
     #[test]

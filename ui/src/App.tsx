@@ -3,9 +3,10 @@ import { StatusPill, type ConnectionStatus } from './components/StatusPill'
 import { Diagnostics } from './features/Diagnostics'
 import { Overview } from './features/Overview'
 import { Simulate } from './features/Simulate'
+import { Topology } from './features/Topology'
 import { api, type Health } from './shared/api'
 
-type Tab = 'simulate' | 'diagnostics' | 'overview'
+type Tab = 'simulate' | 'topology' | 'diagnostics' | 'overview'
 
 export default function App() {
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
@@ -49,6 +50,9 @@ export default function App() {
           <TabButton active={tab === 'simulate'} onClick={() => setTab('simulate')}>
             Simulate
           </TabButton>
+          <TabButton active={tab === 'topology'} onClick={() => setTab('topology')}>
+            Topology
+          </TabButton>
           <TabButton active={tab === 'diagnostics'} onClick={() => setTab('diagnostics')}>
             Diagnostics
           </TabButton>
@@ -60,6 +64,7 @@ export default function App() {
 
       <main className="mx-auto max-w-6xl px-8 py-10">
         {tab === 'simulate' && <Simulate />}
+        {tab === 'topology' && <Topology />}
         {tab === 'diagnostics' && <Diagnostics />}
         {tab === 'overview' && <Overview />}
       </main>

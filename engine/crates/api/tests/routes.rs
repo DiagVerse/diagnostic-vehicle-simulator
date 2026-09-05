@@ -60,6 +60,12 @@ async fn every_simulation_route_is_reachable() {
             "/simulation/request",
             r#"{"canIdHex":"7E0","requestHex":"22F190"}"#,
         ),
+        ("POST", "/simulation/vehicle", r#"{"name":"Bench"}"#),
+        (
+            "POST",
+            "/simulation/ecus",
+            r#"{"name":"Engine","requestCanIdHex":"7E0","responseCanIdHex":"7E8"}"#,
+        ),
     ];
 
     for (strMethod, strPath, strBody) in vecRoutes {
@@ -101,4 +107,19 @@ async fn the_per_ecu_timing_route_matches_a_can_identifier() {
             StatusCode::NOT_FOUND
         );
     }
+}
+
+#[tokio::test]
+async fn the_per_ecu_builder_routes_match_a_can_identifier() {
+    // Same trap as the timing route: a path parameter written `{name}` would make these
+    // unreachable, and a 404 for a missing ECU looks identical to a 404 for a missing route.
+    // A malformed identifier separates them — it can only be rejected by a handler that ran.
+    assert_eq!(
+        StatusOf("DELETE", "/simulation/ecus/ZZZ", "").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        StatusOf("PUT", "/simulation/ecus/ZZZ/name", r#"{"name":"Engine"}"#).await,
+        StatusCode::BAD_REQUEST
+    );
 }

@@ -15,7 +15,7 @@ use ::simulation::SimulationService;
 use application::{PluginInfo, ProtocolPlugin};
 use axum::{
     extract::State,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use ecu::VirtualEcu;
@@ -65,8 +65,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(simulation::PostSimulationRequest),
         )
         .route("/simulation/reset", post(simulation::PostSimulationReset))
+        .route("/simulation/topology", get(simulation::GetTopology))
+        .route("/simulation/vehicle", post(simulation::PostCreateVehicle))
+        .route("/simulation/ecus", post(simulation::PostAddEcu))
+        .route(
+            "/simulation/ecus/:requestCanIdHex",
+            delete(simulation::DeleteEcu),
+        )
+        .route(
+            "/simulation/ecus/:requestCanIdHex/name",
+            put(simulation::PutEcuName),
+        )
         // axum 0.7 path parameters are `:name`; `{name}` would be matched as a literal
         // segment, so the route would silently never match.
+        .route(
+            "/simulation/ecus/:requestCanIdHex/overrides",
+            get(simulation::GetEcuOverrides).put(simulation::PutEcuOverrides),
+        )
         .route(
             "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
