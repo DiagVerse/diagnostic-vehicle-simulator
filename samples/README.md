@@ -62,3 +62,71 @@ Everything except `simfileVersion`, `vehicle`, `ecus`, and each ECU's `name`,
 
 Everything a simfile states is recorded as `Confirmed`: nothing was observed on a bus, but
 nothing was guessed either — it came from someone who knows the vehicle.
+
+
+## `gateway-architecture.simfile.json` — a vehicle with depth
+
+The other two samples describe flat vehicles: a tester addresses every ECU directly. This one
+describes an architecture, which is what a real vehicle has.
+
+```
+Tester
+  └── Diagnostic Ethernet          (entryPoint: the tester attaches here)
+        ├── Central Gateway         CAN + DoIP, gatewayFor: powertrain, body
+        ├── Airbag                  DoIP only
+        ├── Powertrain CAN                     (1 gateway deep)
+        │     ├── Engine
+        │     └── Transmission
+        └── Body CAN                           (1 gateway deep)
+              ├── Body Control Module
+              ├── Body Zone Controller
+              └── Chassis Domain Controller    gatewayFor: chassis
+                    └── Chassis CAN-FD         (2 gateways deep)
+                          └── ABS              29-bit normal fixed addressing
+```
+
+Three fields do all of that:
+
+- **`entryPoint`** on a network — the link a tester actually attaches to. Leave it off every
+  network and each link nothing gateways onto becomes one, which is why the flat samples need no
+  entry point at all. Set it on one and the guess stops running, so you can model a tester
+  plugged in behind a gateway if that is what you are doing.
+- **`gatewayFor`** on an ECU — the networks it forwards diagnostics onto. This is the whole of
+  what makes an ECU a gateway. Depth is worked out from it, not written down, so it cannot go
+  stale.
+- **`can` and `doip`** on an ECU — how a tester addresses it. Give either, or both. A gateway
+  usually has both, since that is what makes it a gateway.
+
+```json
+{
+  "name": "Central Gateway",
+  "network": "diag-ethernet",
+  "gatewayFor": ["powertrain", "body"],
+  "doip": { "logicalAddress": "0x0010" },
+  "can": { "request": "0x7E7", "response": "0x7EF" }
+}
+```
+
+**An ECU with only `doip` is declared, not simulated.** The engine drives CAN on the wire, so
+the Airbag in this sample appears in the diagram — correctly placed, on the right link — with a
+note saying nothing is answering for it. That is deliberate: dropping it would hide part of the
+vehicle, and pretending it answers would be worse.
+
+**Requests are still routed in one flat CAN-identifier namespace.** The diagram tells you the
+ABS sits two gateways back; the simulation answers it as quickly as it answers the gateway. The
+architecture is described, not yet enforced.
+
+### The version 1 spellings still work
+
+`requestCanId` and `responseCanId` written flat on the ECU are read exactly as before, so every
+file written against version 1 loads unchanged. Writing both spellings on one ECU is refused
+rather than resolved — preferring one silently would make the other a lie you never find out
+about.
+
+### The same thing without a file
+
+Architecture is not a simfile feature. A vehicle reconstructed from a CAN log arrives with no
+buses at all, because a capture taken at one connector cannot observe which bus an ECU is on.
+The **Topology** tab's *Edit architecture* panel declares buses and places ECUs on them for any
+loaded vehicle, whatever it came from, and the from-scratch builder can declare a bus and place
+each ECU as it is added.

@@ -12,7 +12,7 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -909,11 +909,28 @@ pub struct Ecu {
     #[serde(default)]
     pub m_mapSessionServices: BTreeMap<u8, Vec<u8>>,
 
+    /// Networks this ECU forwards diagnostics onto, by id.
+    ///
+    /// This is what makes an ECU a gateway, and it is the piece that lets a topology show
+    /// depth rather than a flat list: a tester reaches an ECU on one of these networks only by
+    /// going through this one. Empty for an ordinary ECU.
+    #[serde(default)]
+    pub m_vecGatewayForNetworkIds: Vec<String>,
+
     /// Which network this ECU sits on, by id. `None` means nobody has said — not "the default
     /// bus". An ECU reconstructed from a log is always `None`, because a capture cannot
     /// observe bus membership.
     #[serde(default)]
     pub m_optStrNetworkId: Option<String>,
+    /// True when `m_u16LogicalAddress` is a real DoIP logical address a tester can route to,
+    /// rather than the placeholder a CAN-only ECU carries.
+    ///
+    /// An ECU may be reachable on CAN, on DoIP, or on both — a gateway usually is both, since
+    /// that is what makes it a gateway. Keeping this a flag rather than a second address field
+    /// means there is only ever one logical address, which cannot disagree with itself.
+    #[serde(default)]
+    pub m_bHasDoIpAddress: bool,
+
     /// User-defined answers to particular requests, tried most-specific-first before the
     /// protocol's own response is used. Defaulted on deserialization so models written before
     /// this field existed still load.
@@ -936,6 +953,8 @@ impl Ecu {
             m_vecSecurityLevels: Vec::new(),
             m_timing: EcuTiming::default(),
             m_mapSessionServices: BTreeMap::new(),
+            m_vecGatewayForNetworkIds: Vec::new(),
+            m_bHasDoIpAddress: false,
             m_optStrNetworkId: None,
             m_vecResponseOverrides: Vec::new(),
         }
@@ -1031,6 +1050,10 @@ pub struct Network {
     /// The CAN-FD data-phase bit rate, when the link has one.
     #[serde(default)]
     pub m_optU32DataBitrateBps: Option<u32>,
+    /// True for the link a tester actually connects to — the diagnostic socket, or the
+    /// Ethernet interface a DoIP tester opens. Everything else is reached *through* something.
+    #[serde(default)]
+    pub m_bIsDiagnosticEntryPoint: bool,
     /// How the existence of this network was established.
     pub m_confidence: Confidence,
 }
@@ -1056,6 +1079,26 @@ impl Vehicle {
         self.m_vecNetworks
             .iter()
             .find(|network| network.m_strId == strNetworkId)
+    }
+
+    /// The ECU that forwards diagnostics onto a network, if one does.
+    pub fn FindGatewayForNetwork(&self, strNetworkId: &str) -> Option<&Ecu> {
+        self.m_vecEcus.iter().find(|ecu| {
+            ecu.m_vecGatewayForNetworkIds
+                .iter()
+                .any(|strBehind| strBehind == strNetworkId)
+        })
+    }
+
+    /// The networks a tester can attach to directly.
+    ///
+    /// A network nothing gateways onto and that is not marked as an entry point is
+    /// unreachable, which is worth being able to see rather than hiding.
+    pub fn EntryPointNetworks(&self) -> Vec<&Network> {
+        self.m_vecNetworks
+            .iter()
+            .filter(|network| network.m_bIsDiagnosticEntryPoint)
+            .collect()
     }
 }
 
@@ -1251,5 +1294,291 @@ mod tests {
         assert_eq!(loaded.m_strName, "TestVehicle");
         assert_eq!(loaded.m_vecEcus.len(), 1);
         assert_eq!(loaded.m_vecEcus[0].m_u16LogicalAddress, 0x1001);
+    }
+}
+
+// ==========================================================================================
+// Vehicle wiring: which ECU sits behind which gateway, and on what.
+//
+// A vehicle is not a flat list of ECUs. A tester attaches to one link — a diagnostic socket or
+// an Ethernet interface — and reaches everything else *through* something. The types below are
+// the one place that fact is worked out, so a simulation file, a hand-built vehicle and a
+// log-reconstructed one all get the same answer rather than three approximations of it.
+// ==========================================================================================
+
+/// Why a vehicle's declared wiring does not describe something that could exist.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TopologyError {
+    /// An ECU sits on, or gateways onto, a network the vehicle does not define.
+    #[error(
+        "ECU '{strEcuName}' refers to network '{strNetworkId}', which this vehicle does not define"
+    )]
+    UnknownNetwork {
+        /// The ECU making the reference.
+        strEcuName: String,
+        /// The network id nothing defines.
+        strNetworkId: String,
+    },
+
+    /// An ECU gateways onto the network it is already on, which is a loop of length one.
+    #[error("ECU '{strEcuName}' gateways onto '{strNetworkId}', the network it is itself on")]
+    GatewayOntoOwnNetwork {
+        /// The ECU.
+        strEcuName: String,
+        /// The network it both sits on and claims to forward onto.
+        strNetworkId: String,
+    },
+
+    /// Two ECUs both claim to forward onto one network, so there is no single path to it.
+    #[error("network '{strNetworkId}' is gatewayed by both '{strFirstEcu}' and '{strSecondEcu}'; a network is reached through one gateway")]
+    NetworkHasTwoGateways {
+        /// The contested network.
+        strNetworkId: String,
+        /// The ECU that claimed it first.
+        strFirstEcu: String,
+        /// The ECU that claimed it second.
+        strSecondEcu: String,
+    },
+
+    /// Following the gateways leads back to where it started, so nothing is reachable.
+    #[error(
+        "the gateways form a loop: {strCycle}. Every network would be reached only through itself"
+    )]
+    GatewayCycle {
+        /// The loop, written as a chain of network ids.
+        strCycle: String,
+    },
+}
+
+/// How a tester reaches one ECU: through how many gateways, and which ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticPath {
+    /// Gateway ECUs between the tester and this one, nearest the tester first. Empty for an
+    /// ECU the tester can address directly.
+    pub m_vecGatewayEcuNames: Vec<String>,
+    /// How many gateways the request crosses. `0` means the ECU is on an entry-point link.
+    pub m_uHopCount: usize,
+    /// False when no chain of gateways connects an entry point to this ECU's network. Such an
+    /// ECU is in the model but nothing could talk to it, which is worth showing rather than
+    /// hiding.
+    pub m_bIsReachable: bool,
+}
+
+impl Vehicle {
+    /// Check that the declared wiring describes a vehicle that could exist.
+    ///
+    /// Called before a vehicle is accepted from any of the three sources, so a bad file, a bad
+    /// API call and a bad hand-built model all fail the same way and at the same moment,
+    /// rather than producing a diagram that quietly makes no sense.
+    pub fn ValidateTopology(&self) -> Result<(), TopologyError> {
+        for ecu in &self.m_vecEcus {
+            if let Some(strNetworkId) = &ecu.m_optStrNetworkId {
+                if self.FindNetwork(strNetworkId).is_none() {
+                    return Err(TopologyError::UnknownNetwork {
+                        strEcuName: ecu.m_strName.clone(),
+                        strNetworkId: strNetworkId.clone(),
+                    });
+                }
+            }
+
+            for strBehindId in &ecu.m_vecGatewayForNetworkIds {
+                if self.FindNetwork(strBehindId).is_none() {
+                    return Err(TopologyError::UnknownNetwork {
+                        strEcuName: ecu.m_strName.clone(),
+                        strNetworkId: strBehindId.clone(),
+                    });
+                }
+                if ecu.m_optStrNetworkId.as_deref() == Some(strBehindId.as_str()) {
+                    return Err(TopologyError::GatewayOntoOwnNetwork {
+                        strEcuName: ecu.m_strName.clone(),
+                        strNetworkId: strBehindId.clone(),
+                    });
+                }
+            }
+        }
+
+        self.RejectSharedGateways()?;
+        self.RejectGatewayCycles()
+    }
+
+    /// Refuse two ECUs forwarding onto the same network.
+    ///
+    /// Real vehicles do sometimes have redundant paths, but the model has one path per network
+    /// and a diagram drawn from an ambiguous one would simply pick whichever came first.
+    fn RejectSharedGateways(&self) -> Result<(), TopologyError> {
+        let mut mapClaims: BTreeMap<&str, &str> = BTreeMap::new();
+
+        for ecu in &self.m_vecEcus {
+            for strBehindId in &ecu.m_vecGatewayForNetworkIds {
+                match mapClaims.get(strBehindId.as_str()) {
+                    Some(strFirstEcu) => {
+                        return Err(TopologyError::NetworkHasTwoGateways {
+                            strNetworkId: strBehindId.clone(),
+                            strFirstEcu: (*strFirstEcu).to_string(),
+                            strSecondEcu: ecu.m_strName.clone(),
+                        });
+                    }
+                    None => {
+                        mapClaims.insert(strBehindId.as_str(), ecu.m_strName.as_str());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse wiring where following the gateways never reaches the tester.
+    ///
+    /// Walk upward from every network: a network is reached through its gateway ECU, which
+    /// sits on another network, and so on. Meeting a network twice on one walk is a loop.
+    fn RejectGatewayCycles(&self) -> Result<(), TopologyError> {
+        for network in &self.m_vecNetworks {
+            let mut vecWalked: Vec<&str> = vec![network.m_strId.as_str()];
+            let mut strCurrentId: &str = network.m_strId.as_str();
+
+            // Nothing forwarding onto the current network ends the walk, loop-free.
+            while let Some(gateway) = self.FindGatewayForNetwork(strCurrentId) {
+                let strUpstreamId = match &gateway.m_optStrNetworkId {
+                    Some(strUpstreamId) => strUpstreamId.as_str(),
+                    // The gateway is on no declared network, so the walk cannot continue.
+                    None => break,
+                };
+
+                if vecWalked.contains(&strUpstreamId) {
+                    vecWalked.push(strUpstreamId);
+                    return Err(TopologyError::GatewayCycle {
+                        strCycle: vecWalked.join(" → "),
+                    });
+                }
+                vecWalked.push(strUpstreamId);
+                strCurrentId = strUpstreamId;
+            }
+        }
+        Ok(())
+    }
+
+    /// Decide which links a tester can attach to, when nobody has said.
+    ///
+    /// A file or a user that never marks an entry point still deserves a working diagram, so
+    /// every network nothing gateways onto becomes one: those are exactly the links that are
+    /// not behind anything. Called after any change to networks or gateways. An explicit
+    /// choice is left alone — if the author marked even one entry point, that is the answer.
+    pub fn NormalizeEntryPoints(&mut self) {
+        let bHasExplicitChoice = self
+            .m_vecNetworks
+            .iter()
+            .any(|network| network.m_bIsDiagnosticEntryPoint);
+        if bHasExplicitChoice {
+            return;
+        }
+
+        let mut setGatewayedIds: BTreeSet<&str> = BTreeSet::new();
+        for ecu in &self.m_vecEcus {
+            for strBehindId in &ecu.m_vecGatewayForNetworkIds {
+                setGatewayedIds.insert(strBehindId.as_str());
+            }
+        }
+
+        let vecEntryPointIds: Vec<String> = self
+            .m_vecNetworks
+            .iter()
+            .filter(|network| !setGatewayedIds.contains(network.m_strId.as_str()))
+            .map(|network| network.m_strId.clone())
+            .collect();
+
+        for network in &mut self.m_vecNetworks {
+            network.m_bIsDiagnosticEntryPoint = vecEntryPointIds.contains(&network.m_strId);
+        }
+    }
+
+    /// How many gateways a tester crosses to reach each network, keyed by network id.
+    ///
+    /// A network missing from the result is one no chain of gateways connects to an entry
+    /// point. Breadth-first from the entry points, so the answer is the shortest path.
+    pub fn NetworkDepths(&self) -> BTreeMap<String, usize> {
+        let mut mapDepths: BTreeMap<String, usize> = BTreeMap::new();
+        let mut queueFrontier: VecDeque<(String, usize)> = VecDeque::new();
+
+        for network in &self.m_vecNetworks {
+            if network.m_bIsDiagnosticEntryPoint {
+                mapDepths.insert(network.m_strId.clone(), 0);
+                queueFrontier.push_back((network.m_strId.clone(), 0));
+            }
+        }
+
+        while let Some((strNetworkId, uDepth)) = queueFrontier.pop_front() {
+            // Every ECU on this network may forward onto further ones, which are one hop
+            // deeper than the network the gateway itself sits on.
+            for ecu in &self.m_vecEcus {
+                if ecu.m_optStrNetworkId.as_deref() != Some(strNetworkId.as_str()) {
+                    continue;
+                }
+                for strBehindId in &ecu.m_vecGatewayForNetworkIds {
+                    if mapDepths.contains_key(strBehindId) {
+                        continue;
+                    }
+                    mapDepths.insert(strBehindId.clone(), uDepth + 1);
+                    queueFrontier.push_back((strBehindId.clone(), uDepth + 1));
+                }
+            }
+        }
+        mapDepths
+    }
+
+    /// The chain of gateways a tester goes through to reach one ECU.
+    ///
+    /// An ECU on no declared network is treated as directly reachable: "nobody said how it is
+    /// wired" must not become "it is unreachable", or every log-reconstructed vehicle would
+    /// render as a set of unreachable ECUs.
+    pub fn DiagnosticPathTo(&self, ecu: &Ecu) -> DiagnosticPath {
+        let strNetworkId = match &ecu.m_optStrNetworkId {
+            Some(strNetworkId) => strNetworkId.clone(),
+            None => {
+                return DiagnosticPath {
+                    m_vecGatewayEcuNames: Vec::new(),
+                    m_uHopCount: 0,
+                    m_bIsReachable: true,
+                }
+            }
+        };
+
+        let mut vecGatewayNames: Vec<String> = Vec::new();
+        let mut strCurrentId = strNetworkId;
+
+        // Walk from the ECU's own network up towards a tester, collecting the gateways
+        // crossed. The cycle check in `ValidateTopology` is what makes this terminate; the
+        // hop limit is a belt-and-braces stop for a model that never went through it.
+        let uHopLimit = self.m_vecNetworks.len() + 1;
+        for _ in 0..uHopLimit {
+            let bIsEntryPoint = self
+                .FindNetwork(&strCurrentId)
+                .map(|network| network.m_bIsDiagnosticEntryPoint)
+                .unwrap_or(false);
+            if bIsEntryPoint {
+                // Collected nearest-the-ECU first; a reader wants tester-first.
+                vecGatewayNames.reverse();
+                return DiagnosticPath {
+                    m_uHopCount: vecGatewayNames.len(),
+                    m_vecGatewayEcuNames: vecGatewayNames,
+                    m_bIsReachable: true,
+                };
+            }
+
+            let gateway = match self.FindGatewayForNetwork(&strCurrentId) {
+                Some(gateway) => gateway,
+                None => break,
+            };
+            vecGatewayNames.push(gateway.m_strName.clone());
+            strCurrentId = match &gateway.m_optStrNetworkId {
+                Some(strUpstreamId) => strUpstreamId.clone(),
+                None => break,
+            };
+        }
+
+        DiagnosticPath {
+            m_uHopCount: vecGatewayNames.len(),
+            m_vecGatewayEcuNames: Vec::new(),
+            m_bIsReachable: false,
+        }
     }
 }

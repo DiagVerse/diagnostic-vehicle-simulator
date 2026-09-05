@@ -81,6 +81,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/hw/start", post(hardware::PostHardwareStart))
         .route("/hw/stop", post(hardware::PostHardwareStop))
         .route("/simulation/topology", get(simulation::GetTopology))
+        .route("/simulation/networks", post(simulation::PostDeclareNetwork))
+        .route(
+            "/simulation/networks/:networkId",
+            delete(simulation::DeleteNetwork),
+        )
+        .route(
+            "/simulation/ecus/:requestCanIdHex/placement",
+            put(simulation::PutEcuPlacement),
+        )
         .route("/simulation/vehicle", post(simulation::PostCreateVehicle))
         .route("/simulation/ecus", post(simulation::PostAddEcu))
         .route(

@@ -13,8 +13,17 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The format version. Bumped only for a change that would break existing files.
-pub const c_uCurrentVersion: u32 = 1;
+/// The version this engine writes. Bumped for a change that adds expressive power.
+///
+/// Version 2 added vehicle architecture: an ECU may declare itself the gateway for other
+/// networks, a network may declare itself the link a tester attaches to, and addressing became
+/// a superset — an ECU carries CAN identifiers, a DoIP logical address, or both.
+pub const c_uCurrentVersion: u32 = 2;
+
+/// The oldest version this engine still reads. Version 1 files describe a flat CAN vehicle,
+/// which is a valid version 2 vehicle that happens to declare no architecture, so they keep
+/// working unchanged.
+pub const c_uMinSupportedVersion: u32 = 1;
 
 /// A whole vehicle, as written in a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +50,13 @@ pub struct NetworkDto {
     pub name: String,
     /// `"CAN"`, `"CAN-FD"` or `"Ethernet"`.
     pub kind: String,
+    /// True for a link a tester attaches to directly — the diagnostic socket, or the Ethernet
+    /// interface a DoIP tester opens.
+    ///
+    /// Left out on every network, the engine treats each link nothing gateways onto as an
+    /// entry point, so a file that does not model gateways needs no entry point either.
+    #[serde(default)]
+    pub entry_point: bool,
     /// Arbitration bit rate. Left out means unknown, which is rendered as unknown rather than
     /// filled in with a plausible default.
     #[serde(default)]
@@ -59,14 +75,30 @@ pub struct EcuDto {
     /// The id of the bus it sits on. Left out means nobody has said.
     #[serde(default)]
     pub network: Option<String>,
-    /// The identifier a tester addresses it on, in hex.
-    pub request_can_id: String,
-    /// The identifier it answers on, in hex.
-    pub response_can_id: String,
-    /// `"Normal11Bit"` or `"NormalFixed29Bit"`. Left out, it follows from the identifier width.
+    /// The networks this ECU forwards diagnostics onto, making it a gateway.
+    ///
+    /// This is what gives a vehicle depth: an ECU on one of these networks is reached by the
+    /// tester only through this one. A gateway is usually on an Ethernet link and forwards
+    /// onto several CAN segments, but nothing here requires that — it forwards onto whatever
+    /// it says it does.
+    #[serde(default)]
+    pub gateway_for: Vec<String>,
+    /// How a tester addresses it on CAN. Left out for an ECU reachable only over DoIP.
+    #[serde(default)]
+    pub can: Option<CanAddressDto>,
+    /// How a tester addresses it over DoIP. Left out for an ECU reachable only over CAN.
+    #[serde(default)]
+    pub doip: Option<DoIpAddressDto>,
+    /// Version 1 spelling of `can.request`. Kept so existing files load unchanged.
+    #[serde(default)]
+    pub request_can_id: Option<String>,
+    /// Version 1 spelling of `can.response`.
+    #[serde(default)]
+    pub response_can_id: Option<String>,
+    /// Version 1 spelling of `can.addressing`.
     #[serde(default)]
     pub addressing: Option<String>,
-    /// Its DoIP logical address, if it has one worth recording.
+    /// Version 1 spelling of `doip.logicalAddress`, as a decimal number.
     #[serde(default)]
     pub logical_address: Option<u16>,
     /// Sessions it can enter: `"default"`, `"programming"`, `"extended"`, `"safety"`.
@@ -101,6 +133,35 @@ pub struct EcuDto {
     /// behaviour that differs from the default.
     #[serde(default)]
     pub responses: Vec<ResponseDto>,
+}
+
+/// How a tester reaches an ECU on CAN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanAddressDto {
+    /// The identifier a tester addresses it on, in hex.
+    pub request: String,
+    /// The identifier it answers on, in hex.
+    pub response: String,
+    /// `"Normal11Bit"` or `"NormalFixed29Bit"`. Left out, it follows from the identifier width.
+    #[serde(default)]
+    pub addressing: Option<String>,
+    /// A broadcast identifier it also listens on, in hex. Left out, the legislated 0x7DF is
+    /// used for an 11-bit ECU in the OBD range and nothing is assumed for anything else.
+    #[serde(default)]
+    pub functional: Option<String>,
+}
+
+/// How a tester reaches an ECU over DoIP.
+///
+/// Declaring this makes the ECU part of the vehicle's architecture and puts it in the topology
+/// diagram. The engine's wire-level simulation is CAN today, so an ECU with only this is shown
+/// as declared but not yet driveable rather than silently dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DoIpAddressDto {
+    /// The ISO 13400 logical address, in hex: `"0x1056"`.
+    pub logical_address: String,
 }
 
 /// A byte string, written either as hex or as text.

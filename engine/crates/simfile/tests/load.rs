@@ -244,3 +244,157 @@ fn restricting_a_session_the_ecu_cannot_enter_is_refused() {
         "{strError}"
     );
 }
+
+// ==========================================================================================
+// Version 2: vehicle architecture, and addressing that may be CAN, DoIP, or both.
+// ==========================================================================================
+
+const c_strGatewaySample: &str =
+    include_str!("../../../../samples/gateway-architecture.simfile.json");
+
+#[test]
+fn the_gateway_sample_describes_the_architecture_it_claims_to() {
+    let vehicle = LoadFromText(c_strGatewaySample).expect("the shipped sample must load");
+
+    assert_eq!(vehicle.m_vecNetworks.len(), 4);
+    assert_eq!(vehicle.m_vecEcus.len(), 8);
+
+    // A tester attaches to the Ethernet link and nothing else.
+    let vecEntryPoints = vehicle.EntryPointNetworks();
+    assert_eq!(vecEntryPoints.len(), 1);
+    assert_eq!(vecEntryPoints[0].m_strId, "diag-ethernet");
+
+    let depths = vehicle.NetworkDepths();
+    assert_eq!(depths.get("diag-ethernet"), Some(&0));
+    assert_eq!(depths.get("powertrain"), Some(&1));
+    assert_eq!(depths.get("body"), Some(&1));
+    // Two gateways deep: Central Gateway → Chassis Domain Controller → chassis.
+    assert_eq!(depths.get("chassis"), Some(&2));
+}
+
+#[test]
+fn an_ecu_two_gateways_deep_reports_both_of_them_in_order() {
+    let vehicle = LoadFromText(c_strGatewaySample).expect("the shipped sample must load");
+
+    let abs = vehicle
+        .m_vecEcus
+        .iter()
+        .find(|ecu| ecu.m_strName == "ABS")
+        .expect("the sample has an ABS");
+
+    let path = vehicle.DiagnosticPathTo(abs);
+    assert!(path.m_bIsReachable);
+    assert_eq!(path.m_uHopCount, 2);
+    assert_eq!(
+        path.m_vecGatewayEcuNames,
+        vec![
+            "Central Gateway".to_string(),
+            "Chassis Domain Controller".to_string()
+        ]
+    );
+}
+
+#[test]
+fn an_ecu_may_be_addressed_on_can_and_doip_at_once() {
+    let vehicle = LoadFromText(c_strGatewaySample).expect("the shipped sample must load");
+
+    let gateway = &vehicle.m_vecEcus[0];
+    assert_eq!(gateway.m_strName, "Central Gateway");
+    assert!(gateway.m_optCanAddress.is_some(), "reachable on CAN");
+    assert!(gateway.m_bHasDoIpAddress, "and over DoIP");
+    assert_eq!(gateway.m_u16LogicalAddress, 0x0010);
+}
+
+#[test]
+fn an_ecu_may_be_addressed_over_doip_alone() {
+    // The engine drives CAN on the wire today, so this ECU is declared rather than started —
+    // but it belongs in the architecture, and dropping it would hide part of the vehicle.
+    let vehicle = LoadFromText(c_strGatewaySample).expect("the shipped sample must load");
+
+    let airbag = vehicle
+        .m_vecEcus
+        .iter()
+        .find(|ecu| ecu.m_strName == "Airbag")
+        .expect("the sample has an Airbag");
+
+    assert!(airbag.m_optCanAddress.is_none());
+    assert!(airbag.m_bHasDoIpAddress);
+    assert_eq!(airbag.m_u16LogicalAddress, 0x1030);
+}
+
+#[test]
+fn an_ecu_with_no_addressing_at_all_is_refused() {
+    let strFile = r#"{"simfileVersion":2,"vehicle":"V","ecus":[{"name":"Ghost"}]}"#;
+    assert!(matches!(
+        LoadFromText(strFile),
+        Err(SimFileError::NoAddressing { .. })
+    ));
+}
+
+#[test]
+fn giving_can_identifiers_in_both_spellings_is_refused() {
+    // Silently preferring one would make the other a lie that never surfaces.
+    let strFile = r#"{"simfileVersion":2,"vehicle":"V","ecus":[
+        {"name":"E","requestCanId":"7E0","responseCanId":"7E8",
+         "can":{"request":"7A0","response":"7A8"}}
+    ]}"#;
+    assert!(matches!(
+        LoadFromText(strFile),
+        Err(SimFileError::DuplicateCanAddressing { .. })
+    ));
+}
+
+#[test]
+fn half_a_can_identifier_pair_is_refused() {
+    let strFile = r#"{"simfileVersion":2,"vehicle":"V","ecus":[
+        {"name":"E","requestCanId":"7E0"}
+    ]}"#;
+    assert!(matches!(
+        LoadFromText(strFile),
+        Err(SimFileError::BadField { .. })
+    ));
+}
+
+#[test]
+fn a_gateway_onto_an_undeclared_network_is_refused() {
+    let strFile = r#"{"simfileVersion":2,"vehicle":"V",
+        "networks":[{"id":"eth","name":"Eth","kind":"Ethernet"}],
+        "ecus":[{"name":"GW","network":"eth","gatewayFor":["no-such-bus"],
+                 "can":{"request":"7E0","response":"7E8"}}]}"#;
+    assert!(
+        matches!(LoadFromText(strFile), Err(SimFileError::Topology(_))),
+        "a gateway must not forward onto a bus nothing defines"
+    );
+}
+
+#[test]
+fn two_gateways_onto_one_network_are_refused() {
+    let strFile = r#"{"simfileVersion":2,"vehicle":"V",
+        "networks":[{"id":"eth","name":"Eth","kind":"Ethernet"},
+                    {"id":"can","name":"CAN","kind":"CAN"}],
+        "ecus":[{"name":"GW1","network":"eth","gatewayFor":["can"],
+                 "can":{"request":"7E0","response":"7E8"}},
+                {"name":"GW2","network":"eth","gatewayFor":["can"],
+                 "can":{"request":"7E1","response":"7E9"}}]}"#;
+    assert!(matches!(
+        LoadFromText(strFile),
+        Err(SimFileError::Topology(_))
+    ));
+}
+
+#[test]
+fn a_version_1_file_still_loads_and_gets_a_flat_architecture() {
+    // Version 1 files describe a vehicle with buses but no gateways. Every bus is therefore a
+    // link a tester attaches to, and nothing sits behind anything.
+    let vehicle = LoadFromText(c_strSample).expect("the version 1 sample must still load");
+
+    assert_eq!(
+        vehicle.EntryPointNetworks().len(),
+        vehicle.m_vecNetworks.len(),
+        "nothing gateways onto anything, so every bus is directly reachable"
+    );
+    for ecu in &vehicle.m_vecEcus {
+        assert!(ecu.m_vecGatewayForNetworkIds.is_empty());
+        assert_eq!(vehicle.DiagnosticPathTo(ecu).m_uHopCount, 0);
+    }
+}

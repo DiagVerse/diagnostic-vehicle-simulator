@@ -19,7 +19,7 @@ pub mod execute;
 use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
-use core_domain::model::{CanAddress, Ecu, EcuTiming, ResponseOverride, Vehicle};
+use core_domain::model::{CanAddress, Ecu, EcuTiming, Network, ResponseOverride, Vehicle};
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
 
@@ -86,6 +86,28 @@ pub enum SimulationError {
         strFirstEcu: String,
         /// ECU that claimed it second.
         strSecondEcu: String,
+    },
+
+    /// The change would leave the vehicle's wiring describing something impossible.
+    #[error("{0}")]
+    Topology(#[from] core_domain::model::TopologyError),
+
+    /// A network was named that the vehicle does not define.
+    #[error("no network with id '{strNetworkId}' is defined on this vehicle")]
+    NetworkNotFound {
+        /// The id that matched nothing.
+        strNetworkId: String,
+    },
+
+    /// A network still has ECUs on it, or behind it.
+    #[error(
+        "network '{strNetworkId}' still has {uEcuCount} ECU(s) on it; move or remove them first"
+    )]
+    NetworkInUse {
+        /// The network being removed.
+        strNetworkId: String,
+        /// How many ECUs still refer to it.
+        uEcuCount: usize,
     },
 
     /// The caller tried to change a vehicle before there was one.
@@ -502,6 +524,120 @@ impl SimulationService {
         );
     }
 
+    /// Add a network to the loaded vehicle, or replace one that already has its id.
+    ///
+    /// Networks are the one thing a CAN capture can never tell us, so this is how a vehicle
+    /// reconstructed from a log — or built from scratch — gets an architecture at all.
+    pub fn UpsertNetwork(&mut self, network: Network) -> Result<(), SimulationError> {
+        let mut vehicle = self.CloneVehicleForEdit()?;
+
+        match vehicle
+            .m_vecNetworks
+            .iter_mut()
+            .find(|existing| existing.m_strId == network.m_strId)
+        {
+            Some(existing) => *existing = network.clone(),
+            None => vehicle.m_vecNetworks.push(network.clone()),
+        }
+
+        self.CommitVehicleEdit(vehicle)?;
+        tracing::info!(
+            network = %network.m_strId,
+            kind = ?network.m_kind,
+            "network declared"
+        );
+        Ok(())
+    }
+
+    /// Remove a network, refusing while anything still refers to it.
+    ///
+    /// Removing it out from under its ECUs would silently move them to "nobody said", which
+    /// looks the same on screen as an ECU that was never placed.
+    pub fn RemoveNetwork(&mut self, strNetworkId: &str) -> Result<(), SimulationError> {
+        let mut vehicle = self.CloneVehicleForEdit()?;
+
+        if vehicle.FindNetwork(strNetworkId).is_none() {
+            return Err(SimulationError::NetworkNotFound {
+                strNetworkId: strNetworkId.to_string(),
+            });
+        }
+
+        let uEcuCount = vehicle
+            .m_vecEcus
+            .iter()
+            .filter(|ecu| IsOnOrBehindNetwork(ecu, strNetworkId))
+            .count();
+        if uEcuCount > 0 {
+            return Err(SimulationError::NetworkInUse {
+                strNetworkId: strNetworkId.to_string(),
+                uEcuCount,
+            });
+        }
+
+        vehicle
+            .m_vecNetworks
+            .retain(|network| network.m_strId != strNetworkId);
+        self.CommitVehicleEdit(vehicle)?;
+
+        tracing::info!(network = %strNetworkId, "network removed");
+        Ok(())
+    }
+
+    /// Say where one ECU sits and what it gateways onto.
+    ///
+    /// The same call serves all three sources: an ECU reconstructed from a log, one clicked
+    /// together by hand and one read from a file are placed in the architecture identically.
+    pub fn SetEcuPlacement(
+        &mut self,
+        u32RequestCanId: u32,
+        optStrNetworkId: Option<String>,
+        vecGatewayForNetworkIds: Vec<String>,
+    ) -> Result<(), SimulationError> {
+        let mut vehicle = self.CloneVehicleForEdit()?;
+
+        let config = vehicle
+            .m_vecEcus
+            .iter_mut()
+            .find(|config| IsAddressedOn(config, u32RequestCanId))
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+
+        config.m_optStrNetworkId = optStrNetworkId.clone();
+        config.m_vecGatewayForNetworkIds = vecGatewayForNetworkIds.clone();
+        let strEcuName = config.m_strName.clone();
+
+        self.CommitVehicleEdit(vehicle)?;
+
+        // The running ECU carries its own copy of the configuration; leaving it stale would
+        // make the diagram and the simulation disagree about the same ECU.
+        if let Some(runningEcu) = self.m_mapEcusByRequestId.get_mut(&u32RequestCanId) {
+            runningEcu.SetPlacement(optStrNetworkId.clone(), vecGatewayForNetworkIds.clone());
+        }
+
+        tracing::info!(
+            ecu = %strEcuName,
+            network = ?optStrNetworkId,
+            gatewayFor = ?vecGatewayForNetworkIds,
+            "ECU placement set"
+        );
+        Ok(())
+    }
+
+    /// Take a copy of the loaded vehicle to edit, so a rejected change leaves nothing behind.
+    fn CloneVehicleForEdit(&self) -> Result<Vehicle, SimulationError> {
+        self.m_optVehicle
+            .as_ref()
+            .cloned()
+            .ok_or(SimulationError::NoVehicleLoaded)
+    }
+
+    /// Accept an edited vehicle only if its wiring still describes something that could exist.
+    fn CommitVehicleEdit(&mut self, mut vehicle: Vehicle) -> Result<(), SimulationError> {
+        vehicle.NormalizeEntryPoints();
+        vehicle.ValidateTopology()?;
+        self.m_optVehicle = Some(vehicle);
+        Ok(())
+    }
+
     /// Route one inbound UDS request, addressed to `u32RequestCanId`, and return the answers.
     ///
     /// Three cases, kept as separate branches because they behave differently on the wire:
@@ -850,4 +986,14 @@ fn IsNegativeResponseSuppressedFunctionally(vecResponse: &[u8]) -> bool {
         Some(byNrc) => c_arrFunctionallySuppressedNrcs.contains(&byNrc),
         None => false,
     }
+}
+
+/// True when an ECU sits on this network or forwards onto it.
+fn IsOnOrBehindNetwork(ecu: &Ecu, strNetworkId: &str) -> bool {
+    if ecu.m_optStrNetworkId.as_deref() == Some(strNetworkId) {
+        return true;
+    }
+    ecu.m_vecGatewayForNetworkIds
+        .iter()
+        .any(|strBehindId| strBehindId == strNetworkId)
 }

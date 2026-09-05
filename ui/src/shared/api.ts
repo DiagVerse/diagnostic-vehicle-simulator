@@ -193,6 +193,12 @@ export interface TopologyLink {
   kind: string
   functionalCanIdsHex: string[]
   membershipConfidence: string
+  /** True for a link a tester attaches to directly; everything else hangs off a gateway. */
+  isEntryPoint: boolean
+  /** Gateways crossed to reach it. 0 for an entry point, null when nothing reaches it. */
+  depth: number | null
+  /** The node id of the ECU that forwards onto this link. */
+  reachedViaNodeId: string | null
 }
 
 /** One node hanging off a link. */
@@ -207,6 +213,19 @@ export interface TopologyNode {
   addressingMode: string | null
   addressConfidence: string | null
   isUnreachable: boolean
+  /** Why, in plain words, when `isUnreachable` is set. */
+  unreachableReason: string | null
+  /** Its DoIP logical address in hex, when it has one. */
+  logicalAddressHex: string | null
+  /** Which transports address it: 'CAN', 'DoIP', or both. */
+  transports: string[]
+  /** The links it forwards onto, making it a gateway. */
+  gatewayForLinkIds: string[]
+  /** The gateways a tester crosses to reach it, nearest the tester first. */
+  reachedViaEcuNames: string[]
+  hopCount: number
+  /** False when the ECU is declared but the engine cannot drive it on the wire yet. */
+  isSimulated: boolean
 }
 
 /** The diagram, plus what it cannot know. */
@@ -229,6 +248,28 @@ export interface NewEcu {
   addressingMode?: string
   supportedServices?: number[]
   logicalAddress?: number
+  /** The id of the network it sits on. Left out means nobody has said. */
+  networkId?: string | null
+  /** The networks it forwards diagnostics onto, making it a gateway. */
+  gatewayForNetworkIds?: string[]
+}
+
+/** A bus to declare on the loaded vehicle. */
+export interface NewNetwork {
+  id: string
+  name: string
+  /** 'CAN', 'CAN-FD' or 'Ethernet'. */
+  kind: string
+  bitrateBps?: number | null
+  dataBitrateBps?: number | null
+  /** True for the link a tester attaches to directly. */
+  entryPoint?: boolean
+}
+
+/** Where one ECU sits, and what it gateways onto. */
+export interface EcuPlacement {
+  networkId: string | null
+  gatewayForNetworkIds: string[]
 }
 
 /** The engine returns a JSON body with an `error` field for a 4xx. */
@@ -313,6 +354,12 @@ export const api = {
   simulationRequest: (canIdHex: string, requestHex: string) =>
     postJson<SimulationRequestResult>('/simulation/request', { canIdHex, requestHex }),
   simulationTopology: () => getJson<Topology>('/simulation/topology'),
+  simulationDeclareNetwork: (network: NewNetwork) =>
+    postJson<Topology>('/simulation/networks', network),
+  simulationRemoveNetwork: (networkId: string) =>
+    deleteJson<Topology>(`/simulation/networks/${encodeURIComponent(networkId)}`),
+  simulationSetEcuPlacement: (requestCanIdHex: string, placement: EcuPlacement) =>
+    putJson<Topology>(`/simulation/ecus/${requestCanIdHex}/placement`, placement),
   serialPorts: () => getJson<SerialPorts>('/hw/ports'),
   hardwareStatus: () => getJson<HardwareStatus>('/hw/status'),
   hardwareStart: (port: string, bitrateBps: number) =>

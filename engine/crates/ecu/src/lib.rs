@@ -121,6 +121,19 @@ impl VirtualEcu {
         self.m_config.m_strName = strName.to_string();
     }
 
+    /// Record where this ECU sits in the vehicle and what it gateways onto.
+    ///
+    /// Configuration only: placement describes how a tester reaches the ECU, not how it
+    /// answers, so no diagnostic state changes.
+    pub fn SetPlacement(
+        &mut self,
+        optStrNetworkId: Option<String>,
+        vecGatewayForNetworkIds: Vec<String>,
+    ) {
+        self.m_config.m_optStrNetworkId = optStrNetworkId;
+        self.m_config.m_vecGatewayForNetworkIds = vecGatewayForNetworkIds;
+    }
+
     /// Replace the ECU's response overrides. Configuration only — no diagnostic state changes.
     pub fn SetResponseOverrides(
         &mut self,
