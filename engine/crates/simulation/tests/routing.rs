@@ -14,6 +14,11 @@ use simulation::{RoutingOutcome, SimulationService};
 
 const c_strSingleEcuLog: &str = include_str!("fixtures/single_ecu.log");
 const c_strTwoEcuLog: &str = include_str!("fixtures/two_ecus.log");
+/// The VINs the two-ECU fixture's ECUs report for DID 0xF190. A VIN is 17 characters
+/// (ISO 3779), so each is returned as a segmented ISO-TP message rather than a single frame.
+const c_strFirstEcuVin: &str = "1HGCM82633A004352";
+const c_strSecondEcuVin: &str = "JH4KA7561PC008269";
+
 /// Three ECUs covering every addressing shape the MVP simulates: a legislated 11-bit pair, an
 /// OEM 11-bit pair, and a 29-bit normal-fixed pair. See the fixture for the identifier map.
 const c_strThreeEcuLog: &str = include_str!("fixtures/three_ecus.log");
@@ -116,12 +121,12 @@ fn each_ecu_of_a_two_ecu_log_answers_on_its_own_identifier() {
     let (u32FirstResponseId, vecFirstResponse) =
         SendExpectingOneAnswer(&mut simulation, 0x7E0, &[0x22, 0xF1, 0x90]);
     assert_eq!(u32FirstResponseId, 0x7E8);
-    assert_eq!(&vecFirstResponse[3..], b"EAA");
+    assert_eq!(&vecFirstResponse[3..], c_strFirstEcuVin.as_bytes());
 
     let (u32SecondResponseId, vecSecondResponse) =
         SendExpectingOneAnswer(&mut simulation, 0x7E1, &[0x22, 0xF1, 0x90]);
     assert_eq!(u32SecondResponseId, 0x7E9);
-    assert_eq!(&vecSecondResponse[3..], b"TCM");
+    assert_eq!(&vecSecondResponse[3..], c_strSecondEcuVin.as_bytes());
 }
 
 #[test]

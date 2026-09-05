@@ -13,18 +13,42 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 
 pub mod sample;
+pub mod schedule;
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
-use core_domain::model::Ecu;
+use core_domain::model::{c_u32P2StarResolutionMs, Ecu, EcuTiming};
 use plugin_contract::protocol::{
     c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
     c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, RDataIdentifier, RDtc, REcuSnapshot,
     RSecurityLevel, RStateChange,
 };
 
+use crate::schedule::{BuildResponsePlan, ResolveResponsePendingCount, ResponsePlan};
+
 /// UDS default-session sub-function; the session an ECU powers up in.
 const c_bySessionDefault: u8 = 0x01;
+
+/// Positive response SID for DiagnosticSessionControl (0x10 + 0x40).
+const c_bySessionControlPositiveResponse: u8 = 0x50;
+/// Length of a conformant DiagnosticSessionControl positive response: SID, echoed
+/// sub-function, and the four-byte sessionParameterRecord (ISO 14229-1 Table 28).
+const c_uSessionControlResponseLength: usize = 6;
+/// UDS services whose sub-function byte carries the suppressPosRspMsgIndicationBit
+/// (ISO 14229-1 Table 11): DiagnosticSessionControl, ECUReset, CommunicationControl,
+/// RoutineControl, TesterPresent, AccessTimingParameter, ControlDTCSetting, ResponseOnEvent
+/// and LinkControl.
+///
+/// This has to be a whitelist rather than "byte 1 of any request": in a
+/// ReadDataByIdentifier, byte 1 is the high byte of the DID, so clearing bit 7 would silently
+/// change which DID is read (`22 F1 90` would become `22 71 90`) instead of un-suppressing
+/// anything. Services with a sub-function that never suppress — SecurityAccess,
+/// ReadDTCInformation — are excluded for the same reason.
+const c_arrSuppressCapableServices: [u8; 9] =
+    [0x10, 0x11, 0x28, 0x31, 0x3E, 0x83, 0x85, 0x86, 0x87];
+
+/// Bit 7 of a sub-function byte: suppressPosRspMsgIndicationBit (ISO 14229-1 Table 11).
+const c_bySuppressPositiveResponseBit: u8 = 0x80;
 
 /// A running virtual ECU: static configuration plus live diagnostic state.
 pub struct VirtualEcu {
@@ -70,18 +94,163 @@ impl VirtualEcu {
         self.m_bySecurityUnlockedLevel != 0
     }
 
-    /// Process one diagnostic request: snapshot state, ask the protocol for a response and
-    /// state changes, apply them, and return the response bytes (empty = suppressed).
-    pub fn ProcessRequest(&mut self, protocol: &dyn ProtocolHandler, vecRequest: &[u8]) -> Vec<u8> {
-        let snapshot = self.BuildSnapshot();
+    /// The ECU's timing parameters.
+    pub fn Timing(&self) -> EcuTiming {
+        self.m_config.m_timing
+    }
 
-        let outcome = protocol.Handle(RVec::from(vecRequest.to_vec()), snapshot);
+    /// Replace the ECU's timing parameters.
+    ///
+    /// The caller is responsible for validating them first ([`EcuTiming::Validate`]). A change
+    /// affects the **next** request only: a response plan already computed keeps the values it
+    /// was built with, and the tester learns the new P2/P2* at the next
+    /// DiagnosticSessionControl response, which is the only place ISO 14229-1 carries them.
+    /// Timing is configuration, so it survives a diagnostic reset.
+    pub fn SetTiming(&mut self, timing: EcuTiming) {
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            p2Ms = timing.m_u32P2ServerMaxMs,
+            p2StarMs = timing.m_u32P2StarServerMaxMs,
+            delayMs = timing.m_u32ResponseDelayMs,
+            forcePending = timing.m_bForceResponsePending,
+            "ECU timing updated"
+        );
+        self.m_config.m_timing = timing;
+    }
+
+    /// Process one diagnostic request and return only the final response bytes (empty =
+    /// nothing is sent).
+    ///
+    /// This is the instantaneous path: it discards the schedule, so no delay is applied and
+    /// any ResponsePending messages are dropped. It backs the dev `/ecu/*` endpoints and the
+    /// in-process tests, where timing is not the subject. The `/simulation/*` path uses
+    /// [`VirtualEcu::ProcessRequestWithTiming`] and honours the schedule in full.
+    pub fn ProcessRequest(&mut self, protocol: &dyn ProtocolHandler, vecRequest: &[u8]) -> Vec<u8> {
+        let plan = self.ProcessRequestWithTiming(protocol, vecRequest);
+        plan.FinalResponse().to_vec()
+    }
+
+    /// Process one diagnostic request and return the whole timed answer: the ResponsePending
+    /// messages, the final response, and when each goes on the wire.
+    ///
+    /// State changes are applied here, once, exactly as before — the plan describes only what
+    /// is transmitted. The caller executes the plan against a real clock; nothing in this
+    /// crate sleeps.
+    pub fn ProcessRequestWithTiming(
+        &mut self,
+        protocol: &dyn ProtocolHandler,
+        vecRequest: &[u8],
+    ) -> ResponsePlan {
+        if vecRequest.is_empty() {
+            return BuildResponsePlan(&self.m_config.m_timing, 0x00, &[], 0);
+        }
+
+        let byRequestSid = vecRequest[0];
+        let u8PendingCount = self.ResolvePendingCountFor(byRequestSid);
+
+        // A ResponsePending sequence obliges the server to send a final response whatever the
+        // suppressPosRspMsgIndicationBit says (ISO 14229-1 Annex A.1, and the third condition
+        // of the clause 7.5.5 pseudocode). The handler is a pure function that only reports
+        // what it was asked for, so the bit is cleared before asking rather than trying to
+        // recover a response it was never told to produce.
+        let vecEffectiveRequest = self.ClearSuppressBitIfPending(vecRequest, u8PendingCount);
+
+        let snapshot = self.BuildSnapshot();
+        let outcome = protocol.Handle(RVec::from(vecEffectiveRequest), snapshot);
 
         for change in outcome.m_vecChanges.iter() {
             self.ApplyStateChange(change);
         }
 
-        outcome.m_vecResponse.into_vec()
+        let mut vecResponse = outcome.m_vecResponse.into_vec();
+        self.ApplySessionTimingRecord(&mut vecResponse);
+
+        BuildResponsePlan(
+            &self.m_config.m_timing,
+            byRequestSid,
+            &vecResponse,
+            u8PendingCount,
+        )
+    }
+
+    /// How many ResponsePending messages this request may carry.
+    ///
+    /// Two cases forbid NRC 0x78 outright, both from ISO 14229-2 clause 7.1.1: an unsupported
+    /// service (whose P4Server_max always equals P2Server_max), and any server configured with
+    /// `P4 == P2`. Both are decidable before the handler runs, which is what lets the
+    /// suppress-bit decision above be made in time.
+    fn ResolvePendingCountFor(&self, byRequestSid: u8) -> u8 {
+        let bIsServiceSupported = self.m_config.IsServiceSupported(byRequestSid);
+        let bHasEnhancedBudget =
+            self.m_config.m_timing.m_u32P4ServerMaxMs > self.m_config.m_timing.m_u32P2ServerMaxMs;
+
+        if !bIsServiceSupported || !bHasEnhancedBudget {
+            return 0;
+        }
+
+        ResolveResponsePendingCount(&self.m_config.m_timing)
+    }
+
+    /// Clear the suppressPosRspMsgIndicationBit when a ResponsePending sequence is planned, so
+    /// the handler produces the final response the standard requires.
+    fn ClearSuppressBitIfPending(&self, vecRequest: &[u8], u8PendingCount: u8) -> Vec<u8> {
+        if u8PendingCount == 0 || vecRequest.len() < 2 {
+            return vecRequest.to_vec();
+        }
+
+        let bHasSubFunction = c_arrSuppressCapableServices.contains(&vecRequest[0]);
+        let bIsSuppressRequested = (vecRequest[1] & c_bySuppressPositiveResponseBit) != 0;
+
+        if !bHasSubFunction || !bIsSuppressRequested {
+            return vecRequest.to_vec();
+        }
+
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            sid = format!("{:02X}", vecRequest[0]),
+            "suppressPosRspMsgIndicationBit overridden: a ResponsePending sequence obliges the server to send a final response (ISO 14229-1 Annex A.1)"
+        );
+
+        let mut vecEffective = vecRequest.to_vec();
+        vecEffective[1] &= !c_bySuppressPositiveResponseBit;
+        vecEffective
+    }
+
+    /// Stamp this ECU's live P2/P2* into a DiagnosticSessionControl positive response.
+    ///
+    /// The sessionParameterRecord is a session-layer parameter (ISO 14229-2), not application
+    /// semantics, so it is applied here rather than inside the transport-agnostic UDS plugin —
+    /// the same split ADR 0004 made for functional NRC suppression. Layout and scaling come
+    /// from ISO 14229-1 clause 9.2.3.1, Tables 28 and 29: P2Server_max in two bytes at 1 ms
+    /// resolution, P2*Server_max in two bytes at 10 ms resolution.
+    fn ApplySessionTimingRecord(&self, vecResponse: &mut [u8]) {
+        if vecResponse.first() != Some(&c_bySessionControlPositiveResponse) {
+            return;
+        }
+
+        let timing = &self.m_config.m_timing;
+        let u32P2StarUnits = timing.m_u32P2StarServerMaxMs / c_u32P2StarResolutionMs;
+        let arrRecord = [
+            (timing.m_u32P2ServerMaxMs >> 8) as u8,
+            timing.m_u32P2ServerMaxMs as u8,
+            (u32P2StarUnits >> 8) as u8,
+            u32P2StarUnits as u8,
+        ];
+
+        if vecResponse.len() >= c_uSessionControlResponseLength {
+            vecResponse[2..c_uSessionControlResponseLength].copy_from_slice(&arrRecord);
+            return;
+        }
+
+        // Anything shorter has no record to stamp. ISO 14229-1 Table 28 marks all four bytes
+        // mandatory, so such a response is not conformant — but the bytes belong to whichever
+        // protocol plugin produced them, and inventing four to cover for it would hide the
+        // real problem. Report it and leave it alone.
+        tracing::warn!(
+            ecu = %self.m_config.m_strName,
+            len = vecResponse.len(),
+            "DiagnosticSessionControl positive response is shorter than the six bytes ISO 14229-1 Table 28 requires; its timing record was left untouched"
+        );
     }
 
     /// Build the FFI-safe snapshot the protocol handler needs, from config + live state.

@@ -103,24 +103,262 @@ impl SecurityLevel {
     }
 }
 
-/// UDS timing parameters (milliseconds). Used later to drive ResponsePending/timeout
-/// behaviour; carried in the model now so it need not be reshaped later.
+/// ISO 14229-1 Table 29: P2Server_max travels in the DiagnosticSessionControl response as two
+/// bytes at 1 ms resolution, so it cannot exceed this.
+pub const c_u32P2ServerMaxLimitMs: u32 = 65_535;
+/// ISO 14229-1 Table 29: P2*Server_max travels as two bytes at 10 ms resolution.
+pub const c_u32P2StarServerMaxLimitMs: u32 = 655_350;
+/// The resolution P2*Server_max is advertised at (ISO 14229-1 Table 29).
+pub const c_u32P2StarResolutionMs: u32 = 10;
+
+/// P2Server_max recommended by ISO 14229-2 Table 4.
+pub const c_u32DefaultP2ServerMaxMs: u32 = 50;
+/// P2*Server_max recommended by ISO 14229-2 Table 4.
+pub const c_u32DefaultP2StarServerMaxMs: u32 = 5_000;
+/// P4Server_max default. ISO 14229-2 Table 4 fixes only the minimum (P4 >= P2) and leaves the
+/// maximum to the manufacturer; 30 s is a common enhanced-diagnostics value and leaves room
+/// for a realistic ResponsePending sequence.
+pub const c_u32DefaultP4ServerMaxMs: u32 = 30_000;
+
+/// Upper bound on the operator-injected response delay. Not an ISO limit — a simulator
+/// control must not be able to wedge a diagnostic session for an hour.
+pub const c_u32MaxResponseDelayMs: u32 = 60_000;
+/// Upper bound on P4Server_max, for the same reason.
+pub const c_u32MaxP4ServerMaxMs: u32 = 600_000;
+/// Upper bound on forced ResponsePending repetitions. ISO 14229-1 sets no ceiling ("may be
+/// repeated"), but a control that can emit hundreds is a footgun rather than a feature.
+pub const c_u8MaxForcedResponsePendingCount: u8 = 10;
+
+/// UDS server timing (ISO 14229-2 clause 7), in milliseconds.
+///
+/// Two kinds of value live here and are kept apart by name: the parameters the ECU
+/// **advertises and is judged against** (P2, P2*, P4), and the operator's **fault-injection**
+/// knobs (response delay, forced ResponsePending, dropped final response). The first group
+/// comes from the standard; the second exists so a demo can show the ResponsePending path
+/// without waiting, and can simulate a server that never finishes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EcuTiming {
-    /// P2server_max — max time to answer a request before a pending response is required.
+    /// P2Server_max — the deadline to *start* the response after the request has been
+    /// completely received. ISO 14229-2 Table 3; recommended 50 ms (Table 4). Advertised in
+    /// the DiagnosticSessionControl response at 1 ms resolution.
     pub m_u32P2ServerMaxMs: u32,
-    /// P2*server_max — max time between ResponsePending (NRC 0x78) messages.
+
+    /// P2*Server_max — the deadline to start the response after a ResponsePending (NRC 0x78)
+    /// has finished transmitting. ISO 14229-2 Table 3; recommended 5000 ms. Advertised at
+    /// 10 ms resolution, so it must be a whole multiple of 10.
     pub m_u32P2StarServerMaxMs: u32,
+
+    /// P4Server_max — the deadline for the *final* response, measured from request reception.
+    /// ISO 14229-2 clause 7.1.1. `P4 == P2` means this server may not use NRC 0x78 at all.
+    ///
+    /// A named default is required: `#[serde(default)]` would use `u32`'s default of 0, which
+    /// would make `P4 < P2` on every model written before this field existed and silently
+    /// forbid ResponsePending everywhere.
+    #[serde(default = "DefaultP4ServerMaxMs")]
+    pub m_u32P4ServerMaxMs: u32,
+
+    /// Operator-injected think-time before the final response, measured from request
+    /// reception. 0 answers immediately. A value above P2 automatically produces the
+    /// ResponsePending sequence the standard requires. Not an ISO parameter.
+    #[serde(default)]
+    pub m_u32ResponseDelayMs: u32,
+
+    /// Emit a ResponsePending sequence even when the delay alone would not require one, so
+    /// the pending path can be demonstrated without a long wait.
+    #[serde(default)]
+    pub m_bForceResponsePending: bool,
+
+    /// How many NRC 0x78 messages to emit when forcing. Ignored unless
+    /// `m_bForceResponsePending` is set. If the delay demands more, the larger value wins.
+    #[serde(default = "DefaultForcedResponsePendingCount")]
+    pub m_u8ForcedResponsePendingCount: u8,
+
+    /// Withhold the final response entirely after any pending messages: a hung server, so a
+    /// tester's P2*Client timeout handling can be exercised. Fault injection.
+    #[serde(default)]
+    pub m_bDropFinalResponse: bool,
+}
+
+/// Named serde default for P4Server_max — see the field's doc comment.
+fn DefaultP4ServerMaxMs() -> u32 {
+    c_u32DefaultP4ServerMaxMs
+}
+
+/// Named serde default for the forced pending count: forcing zero repetitions is a
+/// contradiction, so the type default of 0 would be wrong.
+fn DefaultForcedResponsePendingCount() -> u8 {
+    1
 }
 
 impl Default for EcuTiming {
     fn default() -> Self {
-        // ISO 14229 default-ish values; adjustable per ECU.
         EcuTiming {
-            m_u32P2ServerMaxMs: 50,
-            m_u32P2StarServerMaxMs: 5000,
+            m_u32P2ServerMaxMs: c_u32DefaultP2ServerMaxMs,
+            m_u32P2StarServerMaxMs: c_u32DefaultP2StarServerMaxMs,
+            m_u32P4ServerMaxMs: c_u32DefaultP4ServerMaxMs,
+            m_u32ResponseDelayMs: 0,
+            m_bForceResponsePending: false,
+            m_u8ForcedResponsePendingCount: DefaultForcedResponsePendingCount(),
+            m_bDropFinalResponse: false,
         }
+    }
+}
+
+/// Why a proposed set of timing parameters was refused.
+///
+/// The rule these encode: a value that **cannot be truthfully put on the wire** is rejected,
+/// while a *behaviour* that is on the wire but non-conformant (a flooding server, one that
+/// never answers) is allowed — that is the point of a fault injector — and is flagged on the
+/// resulting response plan instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TimingValidationError {
+    /// P2Server_max does not fit the two advertised bytes.
+    #[error("P2Server_max is {u32ValueMs} ms; it is advertised in two bytes at 1 ms resolution, so the limit is {u32LimitMs} ms")]
+    P2ServerMaxTooLarge { u32ValueMs: u32, u32LimitMs: u32 },
+
+    /// P2*Server_max does not fit the two advertised bytes.
+    #[error("P2*Server_max is {u32ValueMs} ms; it is advertised in two bytes at 10 ms resolution, so the limit is {u32LimitMs} ms")]
+    P2StarServerMaxTooLarge { u32ValueMs: u32, u32LimitMs: u32 },
+
+    /// P2*Server_max is advertised in 10 ms units, so a value between units cannot be stated.
+    #[error("P2*Server_max is {u32ValueMs} ms; it is advertised in 10 ms units, so use {u32LowerMs} ms or {u32UpperMs} ms")]
+    P2StarServerMaxNotAMultiple {
+        u32ValueMs: u32,
+        u32LowerMs: u32,
+        u32UpperMs: u32,
+    },
+
+    /// ISO 14229-2 Table 4: P4Server_max's minimum is P2Server_max.
+    #[error(
+        "P4Server_max is {u32P4Ms} ms but must be at least P2Server_max, which is {u32P2Ms} ms"
+    )]
+    P4ServerMaxBelowP2 { u32P4Ms: u32, u32P2Ms: u32 },
+
+    /// P4Server_max beyond the simulator's sanity limit.
+    #[error("P4Server_max is {u32ValueMs} ms; the simulator's limit is {u32LimitMs} ms")]
+    P4ServerMaxTooLarge { u32ValueMs: u32, u32LimitMs: u32 },
+
+    /// The injected delay is beyond the simulator's sanity limit.
+    #[error("response delay is {u32ValueMs} ms; the simulator's limit is {u32LimitMs} ms")]
+    ResponseDelayTooLarge { u32ValueMs: u32, u32LimitMs: u32 },
+
+    /// The final response must start by P4Server_max, so a longer delay is unreachable.
+    #[error("response delay is {u32DelayMs} ms but the final response must start by P4Server_max, which is {u32P4Ms} ms")]
+    ResponseDelayBeyondP4 { u32DelayMs: u32, u32P4Ms: u32 },
+
+    /// Forcing zero repetitions is a contradiction.
+    #[error("ResponsePending is forced but the repetition count is 0")]
+    ForcedResponsePendingCountIsZero,
+
+    /// Too many forced repetitions.
+    #[error("forced ResponsePending count is {u8Value}; the simulator's limit is {u8Limit}")]
+    ForcedResponsePendingCountTooLarge { u8Value: u8, u8Limit: u8 },
+
+    /// A ResponsePending with no enhanced budget to spend says nothing.
+    #[error("ResponsePending is forced but P2*Server_max is 0, so there is no enhanced timing budget to announce")]
+    ForcedResponsePendingWithoutP2Star,
+
+    /// ISO 14229-2 clause 7.1.1: `P4 == P2` means NRC 0x78 is not allowed for this server.
+    #[error("ResponsePending is forced but P4Server_max equals P2Server_max ({u32P2Ms} ms), which means NRC 0x78 is not allowed for this server")]
+    ForcedResponsePendingWithP4EqualToP2 { u32P2Ms: u32 },
+}
+
+impl EcuTiming {
+    /// Check that these parameters can be honestly advertised and honoured.
+    ///
+    /// Rejects values, never behaviours: a delay above P2 is fine (the schedule inserts the
+    /// ResponsePending messages the standard requires), and so is a deliberately flooding or
+    /// hung server. What is refused is a number that cannot be put on the wire truthfully.
+    pub fn Validate(&self) -> Result<(), TimingValidationError> {
+        if self.m_u32P2ServerMaxMs > c_u32P2ServerMaxLimitMs {
+            return Err(TimingValidationError::P2ServerMaxTooLarge {
+                u32ValueMs: self.m_u32P2ServerMaxMs,
+                u32LimitMs: c_u32P2ServerMaxLimitMs,
+            });
+        }
+
+        if self.m_u32P2StarServerMaxMs > c_u32P2StarServerMaxLimitMs {
+            return Err(TimingValidationError::P2StarServerMaxTooLarge {
+                u32ValueMs: self.m_u32P2StarServerMaxMs,
+                u32LimitMs: c_u32P2StarServerMaxLimitMs,
+            });
+        }
+
+        if !self
+            .m_u32P2StarServerMaxMs
+            .is_multiple_of(c_u32P2StarResolutionMs)
+        {
+            let u32LowerMs =
+                (self.m_u32P2StarServerMaxMs / c_u32P2StarResolutionMs) * c_u32P2StarResolutionMs;
+            return Err(TimingValidationError::P2StarServerMaxNotAMultiple {
+                u32ValueMs: self.m_u32P2StarServerMaxMs,
+                u32LowerMs,
+                u32UpperMs: u32LowerMs + c_u32P2StarResolutionMs,
+            });
+        }
+
+        if self.m_u32P4ServerMaxMs < self.m_u32P2ServerMaxMs {
+            return Err(TimingValidationError::P4ServerMaxBelowP2 {
+                u32P4Ms: self.m_u32P4ServerMaxMs,
+                u32P2Ms: self.m_u32P2ServerMaxMs,
+            });
+        }
+
+        if self.m_u32P4ServerMaxMs > c_u32MaxP4ServerMaxMs {
+            return Err(TimingValidationError::P4ServerMaxTooLarge {
+                u32ValueMs: self.m_u32P4ServerMaxMs,
+                u32LimitMs: c_u32MaxP4ServerMaxMs,
+            });
+        }
+
+        if self.m_u32ResponseDelayMs > c_u32MaxResponseDelayMs {
+            return Err(TimingValidationError::ResponseDelayTooLarge {
+                u32ValueMs: self.m_u32ResponseDelayMs,
+                u32LimitMs: c_u32MaxResponseDelayMs,
+            });
+        }
+
+        if self.m_u32ResponseDelayMs > self.m_u32P4ServerMaxMs {
+            return Err(TimingValidationError::ResponseDelayBeyondP4 {
+                u32DelayMs: self.m_u32ResponseDelayMs,
+                u32P4Ms: self.m_u32P4ServerMaxMs,
+            });
+        }
+
+        self.ValidateForcedResponsePending()
+    }
+
+    /// The rules that only apply when the operator forces a ResponsePending sequence.
+    fn ValidateForcedResponsePending(&self) -> Result<(), TimingValidationError> {
+        if !self.m_bForceResponsePending {
+            return Ok(());
+        }
+
+        if self.m_u8ForcedResponsePendingCount == 0 {
+            return Err(TimingValidationError::ForcedResponsePendingCountIsZero);
+        }
+
+        if self.m_u8ForcedResponsePendingCount > c_u8MaxForcedResponsePendingCount {
+            return Err(TimingValidationError::ForcedResponsePendingCountTooLarge {
+                u8Value: self.m_u8ForcedResponsePendingCount,
+                u8Limit: c_u8MaxForcedResponsePendingCount,
+            });
+        }
+
+        if self.m_u32P2StarServerMaxMs == 0 {
+            return Err(TimingValidationError::ForcedResponsePendingWithoutP2Star);
+        }
+
+        if self.m_u32P4ServerMaxMs == self.m_u32P2ServerMaxMs {
+            return Err(
+                TimingValidationError::ForcedResponsePendingWithP4EqualToP2 {
+                    u32P2Ms: self.m_u32P2ServerMaxMs,
+                },
+            );
+        }
+
+        Ok(())
     }
 }
 

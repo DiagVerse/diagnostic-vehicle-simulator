@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Badge, DetailRow } from '../components/primitives'
 import { api, type EcuState, type RequestResult } from '../shared/api'
 
 /** A quick-action button maps a human label to a fixed UDS request (hex). */
@@ -158,33 +159,33 @@ function EcuStateCard({
           </div>
 
           <dl className="mt-4 space-y-3 text-sm">
-            <Row label="Session">
+            <DetailRow label="Session">
               <Badge tone="sky">{ecu.sessionName}</Badge>
-            </Row>
-            <Row label="Security">
+            </DetailRow>
+            <DetailRow label="Security">
               {ecu.securityUnlocked ? (
                 <Badge tone="emerald">Unlocked (L{ecu.securityLevel})</Badge>
               ) : (
                 <Badge tone="slate">Locked</Badge>
               )}
-            </Row>
-            <Row label="Services">
+            </DetailRow>
+            <DetailRow label="Services">
               <span className="font-mono text-xs text-slate-300">
                 {ecu.supportedServices
                   .map((s) => '0x' + s.toString(16).toUpperCase().padStart(2, '0'))
                   .join(' ')}
               </span>
-            </Row>
-            <Row label="DIDs">
+            </DetailRow>
+            <DetailRow label="DIDs">
               <span className="font-mono text-xs text-slate-300">
                 {ecu.dids
                   .map((d) => '0x' + d.toString(16).toUpperCase().padStart(4, '0'))
                   .join(' ')}
               </span>
-            </Row>
-            <Row label="DTCs">
+            </DetailRow>
+            <DetailRow label="DTCs">
               <span className="text-slate-300">{ecu.dtcCount}</span>
-            </Row>
+            </DetailRow>
           </dl>
 
           <button
@@ -197,26 +198,6 @@ function EcuStateCard({
         </>
       )}
     </aside>
-  )
-}
-
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex items-start justify-between gap-3">
-      <dt className="text-slate-500">{label}</dt>
-      <dd className="text-right">{children}</dd>
-    </div>
-  )
-}
-
-function Badge({ tone, children }: { tone: 'sky' | 'emerald' | 'slate'; children: React.ReactNode }) {
-  const tones: Record<string, string> = {
-    sky: 'bg-sky-950 text-sky-300 border-sky-800',
-    emerald: 'bg-emerald-950 text-emerald-300 border-emerald-800',
-    slate: 'bg-slate-800 text-slate-300 border-slate-700',
-  }
-  return (
-    <span className={`rounded-full border px-2 py-0.5 text-xs ${tones[tone]}`}>{children}</span>
   )
 }
 

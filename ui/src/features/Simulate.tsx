@@ -1,0 +1,808 @@
+import { useEffect, useRef, useState } from 'react'
+import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
+import {
+  api,
+  type EcuTiming,
+  type SimulationEcu,
+  type SimulationRequestResult,
+  type SimulationResponse,
+  type SimulationState,
+} from '../shared/api'
+
+/** A quick action maps a human label to a fixed UDS request (hex). */
+const QUICK_ACTIONS: { label: string; hex: string }[] = [
+  { label: 'Read VIN', hex: '22 F1 90' },
+  { label: 'Read DTCs', hex: '19 02 FF' },
+  { label: 'Enter Extended', hex: '10 03' },
+  { label: 'Enter Default', hex: '10 01' },
+  { label: 'Tester Present', hex: '3E 00' },
+]
+
+/** One sent request and everything it produced, newest first in the exchange log. */
+interface ExchangeEntry {
+  id: number
+  result: SimulationRequestResult
+}
+
+/** How many exchanges to keep on screen before dropping the oldest. */
+const MAX_LOG_ENTRIES = 50
+
+/**
+ * Load a CAN log into the engine and drive the reconstructed vehicle: pick the CAN identifier
+ * to address, send a UDS request, watch each ECU answer and change state.
+ */
+export function Simulate() {
+  const [state, setState] = useState<SimulationState | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [log, setLog] = useState<ExchangeEntry[]>([])
+  const [canIdHex, setCanIdHex] = useState('')
+  const [hexInput, setHexInput] = useState('22 F1 90')
+  const [busy, setBusy] = useState(false)
+  const nextEntryId = useRef(1)
+
+  useEffect(() => {
+    refreshState()
+  }, [])
+
+  // The address actually in use is derived, not stored: `canIdHex` is only what the user
+  // picked, and a newly loaded vehicle may not have that identifier at all. Deriving it here
+  // means loading a different log cannot leave a stale selection behind.
+  const vecAddressOptions = AddressOptions(state)
+  const bIsSelectionValid = vecAddressOptions.some((option) => option.canIdHex === canIdHex)
+  const strSelectedCanId = bIsSelectionValid
+    ? canIdHex
+    : (vecAddressOptions[0]?.canIdHex ?? '')
+
+  async function refreshState() {
+    try {
+      setState(await api.simulationState())
+      setError(null)
+    } catch (e) {
+      setError(DescribeError(e))
+    }
+  }
+
+  async function load(logText: string) {
+    setBusy(true)
+    try {
+      setState(await api.simulationLoad(logText))
+      setLog([])
+      setError(null)
+    } catch (e) {
+      // A rejected log leaves the previously loaded vehicle running, so the view stays usable.
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function send(requestHex: string) {
+    if (!strSelectedCanId) {
+      setError('Pick a CAN identifier to address first.')
+      return
+    }
+    setBusy(true)
+    try {
+      const result = await api.simulationRequest(strSelectedCanId, requestHex)
+      setLog((prev) => [{ id: nextEntryId.current++, result }, ...prev].slice(0, MAX_LOG_ENTRIES))
+      setError(null)
+      await refreshState()
+    } catch (e) {
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function reset() {
+    setBusy(true)
+    try {
+      setState(await api.simulationReset())
+      setLog([])
+      setError(null)
+    } catch (e) {
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      {error && (
+        <div className="rounded-lg border border-red-900/60 bg-red-950/40 px-4 py-3 text-sm text-red-300">
+          {error}
+        </div>
+      )}
+
+      {state && !state.protocolLoaded && (
+        <div className="rounded-lg border border-amber-900/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-300">
+          UDS protocol plugin not loaded — copy <code>libuds_plugin.*</code> into{' '}
+          <code>plugins.d/</code> and restart the engine.
+        </div>
+      )}
+
+      <LogLoader onLoad={load} busy={busy} />
+
+      {!state?.loaded ? (
+        <EmptyState />
+      ) : (
+        <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
+          <EcuList state={state} onReset={reset} busy={busy} />
+
+          <section className="space-y-4">
+            <RequestPanel
+              options={vecAddressOptions}
+              canIdHex={strSelectedCanId}
+              onCanIdChange={setCanIdHex}
+              hexInput={hexInput}
+              onHexInputChange={setHexInput}
+              onSend={send}
+              busy={busy}
+            />
+            {/* Keyed by the ECU so switching address remounts the form: an unsaved draft for
+                one ECU must never be applied to another. */}
+            <TimingPanel
+              key={strSelectedCanId}
+              ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onSaved={refreshState}
+              onError={setError}
+              busy={busy}
+            />
+            <ExchangeLog log={log} />
+          </section>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// Loading a log
+// ---------------------------------------------------------------------------------------
+
+function LogLoader({ onLoad, busy }: { onLoad: (logText: string) => void; busy: boolean }) {
+  const [text, setText] = useState('')
+  const [fileName, setFileName] = useState<string | null>(null)
+
+  async function readFile(file: File) {
+    const content = await file.text()
+    setText(content)
+    setFileName(file.name)
+  }
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Load a CAN log
+        </h3>
+        <span className="text-xs text-slate-500">Vector .asc or candump</span>
+      </div>
+
+      <textarea
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value)
+          setFileName(null)
+        }}
+        rows={6}
+        spellCheck={false}
+        placeholder={'(0.001000) can0 7E0#0210030000000000\n(0.002000) can0 7E8#065003003201F400'}
+        className="mt-3 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-300 outline-none focus:border-slate-500"
+      />
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => onLoad(text)}
+          disabled={busy || text.trim().length === 0}
+          className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Load &amp; simulate
+        </button>
+
+        <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-slate-500">
+          Choose file…
+          <input
+            type="file"
+            accept=".log,.asc,.txt,.csv"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) readFile(file)
+            }}
+          />
+        </label>
+
+        {fileName && <span className="font-mono text-xs text-slate-500">{fileName}</span>}
+      </div>
+    </section>
+  )
+}
+
+function EmptyState() {
+  return (
+    <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-10 text-center text-sm text-slate-500">
+      No vehicle loaded. Paste or choose a CAN log above — the engine reconstructs the ECUs it
+      finds and starts them.
+    </p>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// The reconstructed vehicle
+// ---------------------------------------------------------------------------------------
+
+function EcuList({
+  state,
+  onReset,
+  busy,
+}: {
+  state: SimulationState
+  onReset: () => void
+  busy: boolean
+}) {
+  return (
+    <aside className="h-fit space-y-3">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          {state.vehicleName ?? 'Vehicle'}
+        </h3>
+        <span className="text-xs text-slate-500">
+          {state.ecus.length} ECU{state.ecus.length === 1 ? '' : 's'}
+        </span>
+      </div>
+
+      {state.ecus.map((ecu) => (
+        <EcuCard key={ecu.requestCanIdHex} ecu={ecu} />
+      ))}
+
+      <button
+        onClick={onReset}
+        disabled={busy}
+        className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+      >
+        Reset all ECUs
+      </button>
+    </aside>
+  )
+}
+
+function EcuCard({ ecu }: { ecu: SimulationEcu }) {
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-center justify-between">
+        <h4 className="font-semibold">{ecu.name}</h4>
+        <span className="font-mono text-xs text-slate-400">
+          {ecu.requestCanIdHex} → {ecu.responseCanIdHex}
+        </span>
+      </div>
+
+      <dl className="mt-3 space-y-2 text-sm">
+        <DetailRow label="Addressing">
+          <span className="flex items-center justify-end gap-1.5">
+            <span className="text-xs text-slate-400">{ecu.addressingMode}</span>
+            <Badge tone={ConfidenceTone(ecu.addressConfidence)}>{ecu.addressConfidence}</Badge>
+          </span>
+        </DetailRow>
+        {ecu.functionalCanIdHex && (
+          <DetailRow label="Broadcast">
+            <span className="font-mono text-xs text-slate-300">{ecu.functionalCanIdHex}</span>
+          </DetailRow>
+        )}
+        <DetailRow label="Session">
+          <Badge tone="sky">{ecu.sessionName}</Badge>
+        </DetailRow>
+        <DetailRow label="Security">
+          {ecu.securityUnlocked ? (
+            <Badge tone="emerald">Unlocked (L{ecu.securityLevel})</Badge>
+          ) : (
+            <Badge tone="slate">Locked</Badge>
+          )}
+        </DetailRow>
+        <DetailRow label="Services">
+          <span className="font-mono text-xs text-slate-300">
+            {ecu.supportedServices.map(FormatByte).join(' ') || '—'}
+          </span>
+        </DetailRow>
+        <DetailRow label="DIDs">
+          <span className="font-mono text-xs text-slate-300">
+            {ecu.dids.map(FormatDid).join(' ') || '—'}
+          </span>
+        </DetailRow>
+        <DetailRow label="DTCs">
+          <span className="text-slate-300">{ecu.dtcCount}</span>
+        </DetailRow>
+      </dl>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// Sending a request
+// ---------------------------------------------------------------------------------------
+
+/** One entry in the address picker: an ECU's own identifier, or a shared broadcast one. */
+interface AddressOption {
+  canIdHex: string
+  label: string
+}
+
+function RequestPanel({
+  options,
+  canIdHex,
+  onCanIdChange,
+  hexInput,
+  onHexInputChange,
+  onSend,
+  busy,
+}: {
+  options: AddressOption[]
+  canIdHex: string
+  onCanIdChange: (value: string) => void
+  hexInput: string
+  onHexInputChange: (value: string) => void
+  onSend: (requestHex: string) => void
+  busy: boolean
+}) {
+  return (
+    <div className="space-y-4">
+      <div>
+        <h3 className="mb-2 text-sm font-medium uppercase tracking-wider text-slate-400">
+          Address
+        </h3>
+        <select
+          value={canIdHex}
+          onChange={(e) => onCanIdChange(e.target.value)}
+          className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-200 outline-none focus:border-slate-500"
+        >
+          {options.map((option) => (
+            <option key={option.canIdHex} value={option.canIdHex}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <h3 className="mb-2 text-sm font-medium uppercase tracking-wider text-slate-400">
+          Quick actions
+        </h3>
+        <div className="flex flex-wrap gap-2">
+          {QUICK_ACTIONS.map((action) => (
+            <button
+              key={action.label}
+              disabled={busy}
+              onClick={() => onSend(action.hex)}
+              className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm text-slate-200 transition hover:border-slate-500 hover:bg-slate-700 disabled:opacity-40"
+            >
+              {action.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <h3 className="mb-2 text-sm font-medium uppercase tracking-wider text-slate-400">
+          Send raw request
+        </h3>
+        <form
+          className="flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault()
+            if (hexInput.trim()) onSend(hexInput)
+          }}
+        >
+          <input
+            value={hexInput}
+            onChange={(e) => onHexInputChange(e.target.value)}
+            placeholder="e.g. 22 F1 90"
+            className="flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-emerald-300 outline-none focus:border-slate-500"
+          />
+          <button
+            type="submit"
+            disabled={busy}
+            className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+          >
+            Send
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// Timing controls
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Edit one ECU's UDS server timing and make it real: a delay past P2Server_max makes the ECU
+ * send NRC 0x78 ResponsePending before it answers, exactly as ISO 14229-1 requires.
+ *
+ * The form holds a draft so a half-typed number never reaches the engine, and the engine —
+ * not the browser — validates: values it refuses come back with the reason.
+ */
+function TimingPanel({
+  ecu,
+  onSaved,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu | null
+  onSaved: () => Promise<void>
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [draft, setDraft] = useState<EcuTiming | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  // A broadcast identifier addresses several ECUs, so there is no single timing to edit.
+  if (!ecu) {
+    return (
+      <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs text-slate-500">
+        Timing is set per ECU — pick one ECU's own identifier rather than a broadcast to edit
+        it.
+      </p>
+    )
+  }
+
+  const timing = draft ?? ecu.timing
+
+  function update(patch: Partial<EcuTiming>) {
+    setDraft({ ...timing, ...patch })
+  }
+
+  async function save() {
+    if (!ecu) return
+    setSaving(true)
+    try {
+      const result = await api.setEcuTiming(ecu.requestCanIdHex, timing)
+      setDraft(null)
+      onError(null)
+      setNote(
+        result.advertisedAtNextSessionControl
+          ? 'Saved. The tester sees the new P2/P2* at its next DiagnosticSessionControl (0x10) — ISO 14229-1 carries them nowhere else.'
+          : 'Saved.',
+      )
+      await onSaved()
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const bIsDirty = draft !== null
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Timing — {ecu.name}
+        </h3>
+        <span className="text-xs text-slate-500">ISO 14229-2</span>
+      </div>
+
+      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+        <NumberField
+          label="P2 (ms)"
+          hint="Deadline to start answering"
+          value={timing.p2ServerMaxMs}
+          onChange={(v) => update({ p2ServerMaxMs: v })}
+        />
+        <NumberField
+          label="P2* (ms)"
+          hint="Deadline after a 0x78"
+          step={10}
+          value={timing.p2StarServerMaxMs}
+          onChange={(v) => update({ p2StarServerMaxMs: v })}
+        />
+        <NumberField
+          label="Delay (ms)"
+          hint="Injected think-time"
+          value={timing.responseDelayMs}
+          onChange={(v) => update({ responseDelayMs: v })}
+        />
+      </div>
+
+      <div className="mt-3 space-y-2">
+        <CheckboxField
+          label="Force ResponsePending"
+          hint="Send NRC 0x78 even when the delay would not require it"
+          checked={timing.forceResponsePending}
+          onChange={(v) => update({ forceResponsePending: v })}
+        />
+        {timing.forceResponsePending && (
+          <div className="pl-6">
+            <NumberField
+              label="Repetitions"
+              hint="How many 0x78 messages"
+              value={timing.forcedResponsePendingCount}
+              onChange={(v) => update({ forcedResponsePendingCount: v })}
+            />
+          </div>
+        )}
+        <CheckboxField
+          label="Drop the final response"
+          hint="A hung server: pendings go out, the answer never does"
+          checked={timing.dropFinalResponse}
+          onChange={(v) => update({ dropFinalResponse: v })}
+        />
+      </div>
+
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          onClick={save}
+          disabled={busy || saving || !bIsDirty}
+          className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-600 disabled:opacity-40"
+        >
+          Apply timing
+        </button>
+        {bIsDirty && (
+          <button
+            onClick={() => setDraft(null)}
+            disabled={saving}
+            className="text-xs text-slate-400 underline-offset-2 hover:underline"
+          >
+            Discard changes
+          </button>
+        )}
+      </div>
+
+      {note && !bIsDirty && <p className="mt-2 text-xs text-slate-500">{note}</p>}
+    </section>
+  )
+}
+
+function NumberField({
+  label,
+  hint,
+  value,
+  onChange,
+  step,
+}: {
+  label: string
+  hint: string
+  value: number
+  onChange: (value: number) => void
+  step?: number
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs text-slate-400">{label}</span>
+      <input
+        type="number"
+        min={0}
+        step={step ?? 1}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 font-mono text-sm text-slate-200 outline-none focus:border-slate-500"
+      />
+      <span className="mt-0.5 block text-[11px] text-slate-600">{hint}</span>
+    </label>
+  )
+}
+
+function CheckboxField({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string
+  hint: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-2">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+      />
+      <span>
+        <span className="text-sm text-slate-200">{label}</span>
+        <span className="block text-[11px] text-slate-600">{hint}</span>
+      </span>
+    </label>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
+// The exchange log
+// ---------------------------------------------------------------------------------------
+
+function ExchangeLog({ log }: { log: ExchangeEntry[] }) {
+  return (
+    <div>
+      <h3 className="mb-2 text-sm font-medium uppercase tracking-wider text-slate-400">
+        Exchange log
+      </h3>
+      {log.length === 0 ? (
+        <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-6 text-center text-sm text-slate-500">
+          No requests yet. Pick an address and use a quick action.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {log.map((entry) => (
+            <ExchangeEntryView key={entry.id} result={entry.result} />
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+function ExchangeEntryView({ result }: { result: SimulationRequestResult }) {
+  return (
+    <li className="rounded-md border border-slate-800 bg-slate-950/60 p-3 font-mono text-xs">
+      <div className="flex items-center gap-2 text-slate-400">
+        <span className="text-slate-600">→</span>
+        <span className="text-slate-500">{result.canIdHex}</span>
+        <span>{result.requestHex}</span>
+        {result.addressing === 'functional' && <Badge tone="amber">broadcast</Badge>}
+      </div>
+
+      {!result.routed ? (
+        <div className="mt-1 text-slate-500">
+          <span className="text-slate-600">←</span> no ECU listens on {result.canIdHex} — silence
+        </div>
+      ) : result.responses.length === 0 ? (
+        <div className="mt-1 text-slate-500">
+          <span className="text-slate-600">←</span> every ECU stayed silent (negative responses
+          are suppressed on a broadcast)
+        </div>
+      ) : (
+        result.responses.map((response) => (
+          <ResponseView key={response.responseCanIdHex} response={response} />
+        ))
+      )}
+    </li>
+  )
+}
+
+/**
+ * One ECU's answer. An answer can be several messages over time — any NRC 0x78
+ * ResponsePending, then the final response — so each is shown with the millisecond at which
+ * it actually went out.
+ */
+function ResponseView({ response }: { response: SimulationResponse }) {
+  const bHasFrames = response.frames.length > 0
+
+  return (
+    <div className="mt-1.5">
+      {bHasFrames ? (
+        response.frames.map((frame, iIndex) => (
+          <div key={`${frame.kind}-${iIndex}`} className="flex items-start gap-2">
+            <span className="text-slate-600">←</span>
+            <span className="w-14 shrink-0 text-right text-slate-600">+{frame.actualMs}ms</span>
+            <span className="text-slate-500">{response.responseCanIdHex}</span>
+            <span className={FrameTone(frame.kind, frame.hex)}>{frame.hex}</span>
+            {frame.kind === 'responsePending' && <Badge tone="amber">pending</Badge>}
+          </div>
+        ))
+      ) : (
+        <div className="flex items-start gap-2 text-slate-500">
+          <span className="text-slate-600">←</span>
+          <span className="text-slate-500">{response.responseCanIdHex}</span>
+          <span>
+            {response.finalResponseDropped
+              ? 'final response withheld — the tester will time out'
+              : `response suppressed; now in ${response.sessionName}`}
+          </span>
+        </div>
+      )}
+
+      {response.finalResponseDropped && bHasFrames && (
+        <div className="mt-1 pl-[4.5rem] text-rose-400">
+          final response withheld — the tester will time out after P2*
+        </div>
+      )}
+
+      {!response.isoConformant &&
+        response.conformanceWarnings.map((warning) => (
+          <div key={warning} className="mt-1 pl-[4.5rem] text-amber-500/80">
+            ⚠ {warning}
+          </div>
+        ))}
+    </div>
+  )
+}
+
+/** Colour a frame: a pending is provisional, a negative response is a refusal. */
+function FrameTone(kind: string, hex: string): string {
+  if (kind === 'responsePending') {
+    return 'text-amber-400/80'
+  }
+  return IsNegative(hex) ? 'text-amber-400' : 'text-emerald-400'
+}
+
+// ---------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Every identifier a tester can address: each ECU's own request identifier, plus each distinct
+ * broadcast identifier once, with the ECUs that listen on it named.
+ */
+function AddressOptions(state: SimulationState | null): AddressOption[] {
+  if (!state?.loaded) {
+    return []
+  }
+
+  const vecOptions: AddressOption[] = state.ecus.map((ecu) => ({
+    canIdHex: ecu.requestCanIdHex,
+    label: `${ecu.requestCanIdHex} — ${ecu.name}`,
+  }))
+
+  const mapListeners = new Map<string, string[]>()
+  for (const ecu of state.ecus) {
+    if (!ecu.functionalCanIdHex) {
+      continue
+    }
+    const vecNames = mapListeners.get(ecu.functionalCanIdHex) ?? []
+    vecNames.push(ecu.name)
+    mapListeners.set(ecu.functionalCanIdHex, vecNames)
+  }
+
+  for (const [functionalCanIdHex, vecNames] of mapListeners) {
+    vecOptions.push({
+      canIdHex: functionalCanIdHex,
+      label: `${functionalCanIdHex} — broadcast (${vecNames.join(', ')})`,
+    })
+  }
+
+  return vecOptions
+}
+
+/**
+ * The ECU addressed by an identifier, or `null` when the identifier is a broadcast — those
+ * reach several ECUs, so there is no single one whose timing could be edited.
+ */
+function FindEcuByRequestCanId(
+  state: SimulationState | null,
+  canIdHex: string,
+): SimulationEcu | null {
+  if (!state?.loaded) {
+    return null
+  }
+  return state.ecus.find((ecu) => ecu.requestCanIdHex === canIdHex) ?? null
+}
+
+/** Colour a confidence state: an observed fact is stronger than a derived one. */
+function ConfidenceTone(confidence: string): BadgeTone {
+  switch (confidence) {
+    case 'Confirmed':
+      return 'emerald'
+    case 'Observed':
+      return 'sky'
+    case 'Inferred':
+      return 'amber'
+    case 'Conflict':
+      return 'rose'
+    default:
+      return 'slate'
+  }
+}
+
+/** A UDS negative response starts with 0x7F. */
+function IsNegative(responseHex: string): boolean {
+  return responseHex.trim().toUpperCase().startsWith('7F')
+}
+
+function FormatByte(byValue: number): string {
+  return '0x' + byValue.toString(16).toUpperCase().padStart(2, '0')
+}
+
+function FormatDid(u16Did: number): string {
+  return '0x' + u16Did.toString(16).toUpperCase().padStart(4, '0')
+}
+
+/** Present an unknown thrown value as a message worth showing. */
+function DescribeError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
