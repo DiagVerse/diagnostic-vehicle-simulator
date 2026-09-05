@@ -1,0 +1,22 @@
+[package]
+name = "simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Simulation use case: hold a loaded vehicle and route UDS requests to virtual ECUs by CAN address."
+
+[dependencies]
+core-domain.workspace = true
+application.workspace = true
+ecu.workspace = true
+reconstruct.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The round-trip tests drive the real UDS logic (linked as an rlib) rather than a stub, so
+# routing is proven against the same protocol implementation the engine loads as a plugin.
+uds-plugin.workspace = true
+plugin-contract.workspace = true
+abi_stable.workspace = true
