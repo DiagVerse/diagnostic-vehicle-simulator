@@ -8,3 +8,5 @@ description = "ISO-TP (ISO 15765-2) reassembly of CAN frames into UDS PDUs (OSI 
 
 [dependencies]
 can.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

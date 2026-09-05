@@ -468,6 +468,8 @@ name = "isotp"
 version = "0.1.0"
 dependencies = [
  "can",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
