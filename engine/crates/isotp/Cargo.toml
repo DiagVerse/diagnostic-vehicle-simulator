@@ -1,0 +1,10 @@
+[package]
+name = "isotp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ISO-TP (ISO 15765-2) reassembly of CAN frames into UDS PDUs (OSI L4 transport)."
+
+[dependencies]
+can.workspace = true

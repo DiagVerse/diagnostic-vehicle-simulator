@@ -1,0 +1,9 @@
+[package]
+name = "can"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CAN / CAN-FD frame types (OSI L2 data-link building block)."
+
+[dependencies]
