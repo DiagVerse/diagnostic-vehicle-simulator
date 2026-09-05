@@ -1,0 +1,15 @@
+[package]
+name = "uds-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "UDS (ISO 14229) application-layer protocol plugin — OSI L7."
+
+[lib]
+# Dynamically loaded at runtime; also built as rlib so unit tests can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+plugin-contract.workspace = true
+abi_stable.workspace = true
