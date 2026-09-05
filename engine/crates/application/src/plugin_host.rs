@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use abi_stable::library::{LibraryError, RootModule};
+use abi_stable::library::{lib_header_from_path, LibraryError};
 use plugin_contract::{PluginKind, PluginModRef};
 use serde::Serialize;
 
@@ -71,10 +71,17 @@ impl PluginHost {
         host
     }
 
-    /// Attempt to load a single library. abi_stable validates the ABI layout and the
-    /// `plugin-contract` version inside `load_from_file`, returning an error on mismatch.
+    /// Attempt to load a single library.
+    ///
+    /// We deliberately avoid `RootModule::load_from_file`: it caches the root module in a
+    /// per-type static and returns the *first* loaded library for every subsequent load of the
+    /// same root-module type, which collapses all plugins into one. Loading via the library
+    /// header and `init_root_module` returns each library's own module. `lib_header_from_path`
+    /// leaks the library so it stays resident for the process lifetime; `init_root_module`
+    /// enforces the ABI version + layout contract, returning an error on mismatch.
     fn try_load(&mut self, path: &Path) -> Result<String, LibraryError> {
-        let module = PluginModRef::load_from_file(path)?;
+        let header = lib_header_from_path(path)?;
+        let module = header.init_root_module::<PluginModRef>()?;
 
         let manifest = module.manifest()();
         let description = module.describe()();
