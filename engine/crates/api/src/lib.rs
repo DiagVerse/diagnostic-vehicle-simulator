@@ -5,6 +5,7 @@
 pub mod diagnostics;
 pub mod hardware;
 pub mod simulation;
+pub mod traffic;
 
 use std::{
     collections::BTreeSet,
@@ -44,6 +45,9 @@ pub struct AppState {
     pub busy_ecus: Mutex<BTreeSet<u32>>,
     /// The CAN bridge, when one is running.
     pub hardware: Mutex<hardware::HardwareState>,
+    /// The live traffic feed every monitor subscribes to. Publishing to it is cheap and does
+    /// nothing when nobody is watching, so the engine never has to ask whether it should.
+    pub traffic: traffic::TrafficChannel,
 }
 
 /// Response body for `GET /health`.
@@ -80,6 +84,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/hw/status", get(hardware::GetHardwareStatus))
         .route("/hw/start", post(hardware::PostHardwareStart))
         .route("/hw/stop", post(hardware::PostHardwareStop))
+        .route("/events", get(traffic::GetEvents))
         .route("/simulation/topology", get(simulation::GetTopology))
         .route("/simulation/networks", post(simulation::PostDeclareNetwork))
         .route(

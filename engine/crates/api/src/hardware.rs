@@ -16,6 +16,7 @@ use slcan::SlcanBitrate;
 use tokio::task::JoinHandle;
 
 use crate::simulation::ApiError;
+use crate::traffic::{NowMs, TrafficEvent};
 use crate::AppState;
 
 /// One serial port a user could connect to.
@@ -136,11 +137,15 @@ pub async fn PostHardwareStart(
     let bus = bridge::bus::SlcanBus::Open(boxTransport, bitrate)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
+    // The traffic channel watches the wire, so every frame a real tester exchanges with the
+    // simulation reaches the monitor. Without it the only evidence of a whole session is two
+    // counters going up.
     let mut canBridge = CanBridge::New(
         Box::new(bus),
         Arc::clone(&state.simulation),
         IsoTpParameters::default(),
-    );
+    )
+    .WithObserver(Arc::new(state.traffic.clone()));
     let arcStats = canBridge.Stats();
 
     let task = tokio::spawn(async move {
@@ -153,6 +158,10 @@ pub async fn PostHardwareStart(
     hardware.m_optStats = Some(arcStats);
 
     tracing::info!(port = %body.port, bitrate = body.bitrate_bps, "bridging the simulation onto a CAN bus");
+    state.traffic.Publish(TrafficEvent::Lifecycle {
+        at_ms: NowMs(),
+        what: format!("on the wire: {} at {} bit/s", body.port, body.bitrate_bps),
+    });
     Ok(Json(BuildStatusDto(&hardware)))
 }
 

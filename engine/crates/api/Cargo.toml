@@ -25,6 +25,9 @@ tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = "0.3"
+can.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -36,3 +39,5 @@ tokio = { workspace = true, features = ["test-util"] }
 # path-parameter syntax, say) fails a test rather than only showing up against a running engine.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The traffic tests build frames and outcomes and observe them the way the bridge does.
+can.workspace = true
