@@ -1,0 +1,12 @@
+[package]
+name = "slcan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SLCAN/LAWICEL ASCII codec: CAN frames to and from the line protocol USB-CAN adapters speak."
+
+[dependencies]
+can.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
