@@ -7,13 +7,20 @@
 use abi_stable::{
     export_root_module, prefix_type::PrefixTypeTrait, sabi_extern_fn, std_types::RString,
 };
+use plugin_contract::protocol::NoProtocolHandler;
 use plugin_contract::{PluginKind, PluginManifest, PluginMod, PluginModRef};
 
 /// Entry point abi_stable calls to build this plugin's root module. The `#[export_root_module]`
 /// attribute exports the required unmangled symbol so the host can find it by convention.
 #[export_root_module]
 fn instantiate_root_module() -> PluginModRef {
-    PluginMod { manifest, describe }.leak_into_prefix()
+    // The sample plugin provides no protocol handler.
+    PluginMod {
+        manifest,
+        describe,
+        handle_request: NoProtocolHandler,
+    }
+    .leak_into_prefix()
 }
 
 #[sabi_extern_fn]

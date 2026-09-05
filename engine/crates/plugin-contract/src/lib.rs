@@ -11,10 +11,14 @@
 //! (PhysicalLink, Transport, AppProtocol, Populator, …) are layered on in later phases as
 //! additional fields on the root module or as separate `#[sabi_trait]` objects.
 
+pub mod protocol;
+
 use abi_stable::{
     declare_root_module_statics, library::RootModule, package_version_strings,
-    sabi_types::VersionStrings, std_types::RString, StableAbi,
+    sabi_types::VersionStrings, std_types::RString, std_types::RVec, StableAbi,
 };
+
+use crate::protocol::{REcuSnapshot, RProtocolOutcome};
 
 /// Kind of capability a plugin provides. Kept as a string-ish enum so the host can group
 /// and display plugins; extended as new port kinds are added.
@@ -58,6 +62,14 @@ pub struct PluginMod {
     /// Return a short human-readable description of what the plugin does. Phase 0 uses this
     /// as a smoke-test capability to prove a loaded plugin's code actually runs.
     pub describe: extern "C" fn() -> RString,
+
+    /// Protocol (OSI application-layer) request handler. Every plugin provides a function
+    /// pointer here because a bare `fn` cannot be made optional across the stable ABI;
+    /// non-protocol plugins use [`protocol::NoProtocolHandler`]. The host only calls this for
+    /// plugins whose manifest `kind` is [`PluginKind::Protocol`]. The signature matches
+    /// [`protocol::ProtocolHandlerFn`]; it is written inline because the prefix-type derive
+    /// only recognises function-pointer fields in inline form.
+    pub handle_request: extern "C" fn(RVec<u8>, REcuSnapshot) -> RProtocolOutcome,
 }
 
 impl RootModule for PluginModRef {
