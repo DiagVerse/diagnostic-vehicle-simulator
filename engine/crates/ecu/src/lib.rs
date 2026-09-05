@@ -34,6 +34,9 @@ const c_bySessionControlPositiveResponse: u8 = 0x50;
 /// Length of a conformant DiagnosticSessionControl positive response: SID, echoed
 /// sub-function, and the four-byte sessionParameterRecord (ISO 14229-1 Table 28).
 const c_uSessionControlResponseLength: usize = 6;
+/// NRC 0x7F — the service exists but not in the session the ECU is in (ISO 14229-1 Annex A.1).
+const c_byNrcServiceNotSupportedInActiveSession: u8 = 0x7F;
+
 /// Services whose response reports a state change the ECU just made, so an override that
 /// refuses the request has to roll that change back to stay coherent.
 const c_arrStateChangingServices: [u8; 3] = [0x10, 0x11, 0x27];
@@ -183,6 +186,15 @@ impl VirtualEcu {
         }
 
         let byRequestSid = vecRequest[0];
+
+        // A service the current session does not allow is refused here rather than by the
+        // protocol handler, which has no notion of per-session availability — the same place
+        // the suppress bit and response overrides are resolved, and for the same reason: it is
+        // a session-layer rule and the handler is a pure application-layer function.
+        if let Some(plan) = self.RefuseIfSessionForbids(vecRequest) {
+            return plan;
+        }
+
         let u8PendingCount = self.ResolvePendingCountFor(byRequestSid);
 
         // A ResponsePending sequence obliges the server to send a final response whatever the
@@ -290,6 +302,48 @@ impl VirtualEcu {
         self.m_byCurrentSession = self.m_bySessionBeforeRequest;
         self.m_bySecurityUnlockedLevel = self.m_bySecurityLevelBeforeRequest;
         self.m_byActiveSeedLevel = self.m_bySeedLevelBeforeRequest;
+    }
+
+    /// Refuse a request the current session does not allow, if the ECU restricts this session.
+    ///
+    /// Returns the whole answer, because a refusal skips the handler entirely: nothing about
+    /// the ECU's state should change for a request it was never allowed to act on.
+    fn RefuseIfSessionForbids(&self, vecRequest: &[u8]) -> Option<ResponsePlan> {
+        let byRequestSid = vecRequest[0];
+
+        let bIsAllowed = self
+            .m_config
+            .IsServiceAllowedInSession(byRequestSid, self.m_byCurrentSession);
+        if bIsAllowed {
+            return None;
+        }
+
+        // An override is the author saying, of this exact request, "this ECU answers it". That
+        // is more specific than a session's service list, which describes what the protocol
+        // offers — and without this an override-only service could never be reached at all
+        // once any session was restricted.
+        if self.m_config.FindMatchingOverride(vecRequest).is_some() {
+            return None;
+        }
+
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            sid = format!("{byRequestSid:02X}"),
+            session = format!("{:02X}", self.m_byCurrentSession),
+            "refusing a service this session does not allow"
+        );
+
+        let vecResponse = vec![
+            c_byNegativeResponseSid,
+            byRequestSid,
+            c_byNrcServiceNotSupportedInActiveSession,
+        ];
+        Some(BuildResponsePlan(
+            &self.m_config.m_timing,
+            byRequestSid,
+            &vecResponse,
+            0,
+        ))
     }
 
     /// How many ResponsePending messages this request may carry.

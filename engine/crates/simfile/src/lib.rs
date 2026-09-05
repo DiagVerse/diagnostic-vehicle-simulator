@@ -187,6 +187,7 @@ fn BuildEcu(dto: &EcuDto, vecNetworks: &[Network]) -> Result<Ecu, SimFileError> 
     ecu.m_optStrNetworkId = dto.network.clone();
     ecu.m_vecSupportedSessions = ParseSessions(&dto.sessions, &strWhere)?;
     ecu.m_vecSupportedServices = ParseServices(dto, &strWhere)?;
+    ecu.m_mapSessionServices = ParseSessionServices(dto, &strWhere)?;
     ecu.m_mapDids = BuildDids(dto, &strWhere)?;
     ecu.m_vecDtcs = BuildDtcs(dto, &strWhere)?;
     ecu.m_vecSecurityLevels = BuildSecurityLevels(dto, &strWhere)?;
@@ -286,21 +287,7 @@ fn ParseSessions(vecNames: &[String], strWhere: &str) -> Result<Vec<SessionType>
 
     let mut vecSessions = Vec::with_capacity(vecNames.len());
     for strName in vecNames {
-        let session = match strName.to_ascii_lowercase().as_str() {
-            "default" => SessionType::Default,
-            "programming" => SessionType::Programming,
-            "extended" => SessionType::Extended,
-            "safety" | "safetysystem" => SessionType::SafetySystem,
-            strOther => {
-                return Err(SimFileError::BadField {
-                    strWhere: strWhere.to_string(),
-                    strReason: format!(
-                    "'{strOther}' is not a session; use default, programming, extended or safety"
-                ),
-                })
-            }
-        };
-        vecSessions.push(session);
+        vecSessions.push(ParseSessionName(strName, strWhere)?);
     }
 
     // An ECU that cannot enter the default session is incoherent: that is the one it powers up
@@ -332,6 +319,65 @@ fn ParseServices(dto: &EcuDto, strWhere: &str) -> Result<Vec<u8>, SimFileError> 
         );
     }
     Ok(vecServices)
+}
+
+/// Read which services each session allows.
+fn ParseSessionServices(
+    dto: &EcuDto,
+    strWhere: &str,
+) -> Result<std::collections::BTreeMap<u8, Vec<u8>>, SimFileError> {
+    let mut mapSessionServices = std::collections::BTreeMap::new();
+
+    for (strSession, vecServiceNames) in &dto.session_services {
+        let session = ParseSessionName(strSession, strWhere)?;
+
+        let mut vecServices = Vec::with_capacity(vecServiceNames.len());
+        for strService in vecServiceNames {
+            vecServices.push(ParseHexByte(strService).map_err(|strReason| {
+                SimFileError::BadField {
+                    strWhere: strWhere.to_string(),
+                    strReason: format!(
+                        "session '{strSession}', service '{strService}': {strReason}"
+                    ),
+                }
+            })?);
+        }
+
+        // Restricting a session the ECU cannot enter describes behaviour nothing can reach.
+        if !dto.sessions.is_empty() {
+            let bIsEnterable = dto
+                .sessions
+                .iter()
+                .any(|strName| strName.eq_ignore_ascii_case(strSession));
+            if !bIsEnterable {
+                return Err(SimFileError::BadField {
+                    strWhere: strWhere.to_string(),
+                    strReason: format!(
+                        "sessionServices restricts '{strSession}', which is not in this ECU's sessions"
+                    ),
+                });
+            }
+        }
+
+        mapSessionServices.insert(session.ToSubFunction(), vecServices);
+    }
+    Ok(mapSessionServices)
+}
+
+/// Read one session name.
+fn ParseSessionName(strName: &str, strWhere: &str) -> Result<SessionType, SimFileError> {
+    match strName.to_ascii_lowercase().as_str() {
+        "default" => Ok(SessionType::Default),
+        "programming" => Ok(SessionType::Programming),
+        "extended" => Ok(SessionType::Extended),
+        "safety" | "safetysystem" => Ok(SessionType::SafetySystem),
+        strOther => Err(SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!(
+                "'{strOther}' is not a session; use default, programming, extended or safety"
+            ),
+        }),
+    }
 }
 
 /// Read the data identifiers an ECU answers.
