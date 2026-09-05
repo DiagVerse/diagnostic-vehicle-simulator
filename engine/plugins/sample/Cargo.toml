@@ -1,0 +1,15 @@
+[package]
+name = "sample-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Trivial Phase-0 plugin that proves the dynamic-loading path end to end."
+
+[lib]
+# Built as a C dynamic library so it can be dropped into plugins.d/ and loaded at runtime.
+crate-type = ["cdylib"]
+
+[dependencies]
+plugin-contract.workspace = true
+abi_stable.workspace = true

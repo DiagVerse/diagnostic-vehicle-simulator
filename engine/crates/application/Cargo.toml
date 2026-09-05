@@ -1,0 +1,15 @@
+[package]
+name = "application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Use cases orchestrating the domain through ports, plus the runtime plugin host."
+
+[dependencies]
+core-domain.workspace = true
+plugin-contract.workspace = true
+abi_stable.workspace = true
+serde.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
