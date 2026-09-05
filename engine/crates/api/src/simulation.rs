@@ -171,6 +171,9 @@ pub struct SimulationEcuDto {
     pub supported_services: Vec<u8>,
     pub dids: Vec<u16>,
     pub dtc_count: usize,
+    /// Whether the ECU is switched on. A switched-off ECU stays listed, keeps its
+    /// configuration, and answers nothing.
+    pub is_enabled: bool,
 }
 
 /// What is currently loaded and running.
@@ -313,11 +316,16 @@ pub struct EcuTimingUpdateDto {
 pub struct SimulationRequestResultDto {
     pub can_id_hex: String,
     pub request_hex: String,
-    /// How the identifier was interpreted: `"physical"`, `"functional"`, or `"unrouted"`.
+    /// How the identifier was interpreted: `"physical"`, `"functional"`, `"unrouted"`,
+    /// `"stopped"` or `"silenced"`.
     pub addressing: String,
     /// False when no ECU listens on that identifier — nothing was sent, as on a real bus.
     pub routed: bool,
     pub responses: Vec<SimulationResponseDto>,
+    /// The ECU that would have answered had it been switched on. Set only for `"silenced"`.
+    pub silenced_ecu_name: Option<String>,
+    /// Why nothing answered, in words worth showing. Set only for `"silenced"`.
+    pub silenced_reason: Option<String>,
 }
 
 /// POST /simulation/simfile — load a vehicle from a simulation file.
@@ -447,6 +455,8 @@ pub async fn PostSimulationRequest(
                 addressing: "stopped".to_string(),
                 routed: false,
                 responses: Vec::new(),
+                silenced_ecu_name: None,
+                silenced_reason: None,
             }));
         }
         RoutingOutcome::NoTarget => {
@@ -456,6 +466,24 @@ pub async fn PostSimulationRequest(
                 addressing: "unrouted".to_string(),
                 routed: false,
                 responses: Vec::new(),
+                silenced_ecu_name: None,
+                silenced_reason: None,
+            }));
+        }
+        RoutingOutcome::Silenced {
+            strEcuName,
+            strReason,
+        } => {
+            // Silence on the wire, like `unrouted` — but the operator asking through the UI
+            // just flicked a switch, and needs to be told that is what they are looking at.
+            return Ok(Json(SimulationRequestResultDto {
+                can_id_hex: FormatCanId(u32RequestCanId),
+                request_hex: FormatHex(&vecRequest),
+                addressing: "silenced".to_string(),
+                routed: false,
+                responses: Vec::new(),
+                silenced_ecu_name: Some(strEcuName),
+                silenced_reason: Some(strReason),
             }));
         }
         RoutingOutcome::Handled(vecResponses) => vecResponses,
@@ -479,6 +507,8 @@ pub async fn PostSimulationRequest(
         },
         routed: true,
         responses: vecResponseDtos,
+        silenced_ecu_name: None,
+        silenced_reason: None,
     }))
 }
 
@@ -702,6 +732,11 @@ pub struct TopologyNodeDto {
     /// False when the ECU is declared but the engine cannot drive it on the wire — a DoIP-only
     /// ECU today, since the wire-level simulation is CAN.
     pub is_simulated: bool,
+    /// Whether this ECU is switched on. A switched-off ECU answers nothing at all.
+    pub is_enabled: bool,
+    /// The gateway between it and the tester that is switched off, when one is. The ECU itself
+    /// is on; nothing is forwarding to it.
+    pub blocked_by_ecu_name: Option<String>,
 }
 
 /// The diagram, plus the caveats that belong next to it.
@@ -864,6 +899,8 @@ fn BuildTopologyNodes(
         reached_via_ecu_names: Vec::new(),
         hop_count: 0,
         is_simulated: true,
+        is_enabled: true,
+        blocked_by_ecu_name: None,
     }];
 
     for ecu in &vehicle.m_vecEcus {
@@ -934,6 +971,8 @@ fn BuildEcuNode(
         reached_via_ecu_names: path.m_vecGatewayEcuNames,
         hop_count: path.m_uHopCount,
         is_simulated: bIsSimulated,
+        is_enabled: ecu.m_bIsEnabled,
+        blocked_by_ecu_name: path.m_optStrDisabledGatewayName,
     }
 }
 
@@ -946,6 +985,16 @@ fn DescribeUnreachable(
     path: &core_domain::model::DiagnosticPath,
     bIsSimulated: bool,
 ) -> Option<String> {
+    // Switched off is a state the operator chose and can undo with one click. It is drawn
+    // differently from a vehicle that is wired wrongly, so it is not reported as a problem.
+    if !ecu.m_bIsEnabled {
+        return None;
+    }
+    if let Some(strGatewayName) = &path.m_optStrDisabledGatewayName {
+        return Some(format!(
+            "The gateway '{strGatewayName}' is switched off, so nothing behind it can be reached."
+        ));
+    }
     if !path.m_bIsReachable {
         return Some(
             "No chain of gateways connects this ECU's network to a link a tester attaches to."
@@ -1374,6 +1423,7 @@ fn BuildEcuDto(runningEcu: &VirtualEcu) -> SimulationEcuDto {
         supported_services: config.m_vecSupportedServices.clone(),
         dids: config.m_mapDids.keys().copied().collect(),
         dtc_count: config.m_vecDtcs.len(),
+        is_enabled: config.m_bIsEnabled,
     }
 }
 
@@ -1805,4 +1855,31 @@ fn BuildNetworkFromBody(body: &DeclareNetworkBody) -> Result<Network, ApiError> 
         // nothing was guessed either — the standing a specification has.
         m_confidence: Confidence::Confirmed,
     })
+}
+
+/// Whether one ECU is switched on.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EcuEnabledBody {
+    pub enabled: bool,
+}
+
+/// PUT /simulation/ecus/{requestCanIdHex}/enabled — switch one ECU on or off.
+///
+/// Off is not a diagnostic state: the ECU answers nothing at all, which is what an unpowered
+/// or unfitted ECU does. Its configuration is kept, so switching it back on resumes rather
+/// than restarts.
+pub async fn PutEcuEnabled(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+    Json(body): Json<EcuEnabledBody>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .SetEcuEnabled(u32RequestCanId, body.enabled)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
 }

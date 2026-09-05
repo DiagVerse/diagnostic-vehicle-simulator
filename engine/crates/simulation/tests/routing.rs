@@ -380,3 +380,131 @@ fn a_physical_request_changes_only_the_addressed_ecus_session() {
         0x01
     );
 }
+
+// ==========================================================================================
+// Switching ECUs off. A switched-off ECU is not there: it is silent, not negative — the same
+// thing an unpowered or unfitted ECU does on a real vehicle.
+// ==========================================================================================
+
+/// A gatewayed vehicle: the tester attaches to a backbone, and the powertrain bus sits behind
+/// the gateway on it.
+const c_strGatewayedSimFile: &str = r#"{
+  "simfileVersion": 2,
+  "vehicle": "Switching test vehicle",
+  "networks": [
+    { "id": "backbone", "name": "Backbone", "kind": "CAN", "entryPoint": true },
+    { "id": "powertrain", "name": "Powertrain CAN", "kind": "CAN" }
+  ],
+  "ecus": [
+    { "name": "Gateway", "network": "backbone", "gatewayFor": ["powertrain"],
+      "can": { "request": "0x7E7", "response": "0x7EF", "functional": "0x7DF" } },
+    { "name": "Engine", "network": "powertrain",
+      "can": { "request": "0x7E0", "response": "0x7E8", "functional": "0x7DF" } }
+  ]
+}"#;
+
+fn LoadGatewayedSimulation() -> SimulationService {
+    let mut simulation = SimulationService::New();
+    simulation
+        .LoadFromSimFileText(c_strGatewayedSimFile)
+        .expect("the gatewayed simfile should load");
+    simulation.Start();
+    simulation
+}
+
+#[test]
+fn a_switched_off_ecu_is_silent_rather_than_negative() {
+    let mut simulation = LoadGatewayedSimulation();
+    simulation
+        .SetEcuEnabled(0x7E0, false)
+        .expect("the engine ECU is loaded");
+
+    let outcome = simulation.ProcessByCanId(0x7E0, &[0x22, 0xF1, 0x90], &UdsHandler);
+
+    // Not a negative response. A tester asking an ECU that is not fitted gets nothing back at
+    // all, and anything else would teach a tester the wrong lesson.
+    match outcome {
+        RoutingOutcome::Silenced { strEcuName, .. } => assert_eq!(strEcuName, "Engine"),
+        other => panic!("expected silence, got {other:?}"),
+    }
+}
+
+#[test]
+fn switching_an_ecu_back_on_resumes_rather_than_restarts() {
+    // Off is not a reset: an ECU that was unlocked and in the extended session is still there
+    // when the power comes back in this model, because nothing told it to reset.
+    let mut simulation = LoadGatewayedSimulation();
+    SendExpectingHandled(&mut simulation, 0x7E0, &[0x10, 0x03]);
+
+    simulation.SetEcuEnabled(0x7E0, false).expect("loaded");
+    simulation.SetEcuEnabled(0x7E0, true).expect("loaded");
+
+    let vecResponses = SendExpectingHandled(&mut simulation, 0x7E0, &[0x22, 0xF1, 0x90]);
+    assert_eq!(
+        vecResponses[0].m_bySession, 0x03,
+        "the extended session should have survived the switch"
+    );
+}
+
+#[test]
+fn a_switched_off_gateway_takes_everything_behind_it_off_the_air() {
+    let mut simulation = LoadGatewayedSimulation();
+    simulation
+        .SetEcuEnabled(0x7E7, false)
+        .expect("the gateway is loaded");
+
+    let outcome = simulation.ProcessByCanId(0x7E0, &[0x22, 0xF1, 0x90], &UdsHandler);
+
+    match outcome {
+        RoutingOutcome::Silenced {
+            strEcuName,
+            strReason,
+        } => {
+            assert_eq!(strEcuName, "Engine");
+            assert!(
+                strReason.contains("Gateway"),
+                "the reason should name the gateway that is off, got: {strReason}"
+            );
+        }
+        other => panic!("expected the engine to be unreachable, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_ecu_on_the_entry_point_still_answers_when_a_gateway_is_off() {
+    // Only what is *behind* the gateway goes quiet. The gateway being off must not silence
+    // the bus the tester is plugged into.
+    let mut simulation = LoadGatewayedSimulation();
+    simulation.SetEcuEnabled(0x7E7, false).expect("loaded");
+
+    let outcome = simulation.ProcessByCanId(0x7E7, &[0x22, 0xF1, 0x90], &UdsHandler);
+    assert!(
+        matches!(outcome, RoutingOutcome::Silenced { .. }),
+        "the gateway itself is off, so it answers nothing"
+    );
+
+    // And an ECU on the entry-point bus that is still on keeps answering. Re-enable the
+    // gateway and the ECU behind it comes back too.
+    simulation.SetEcuEnabled(0x7E7, true).expect("loaded");
+    SendExpectingHandled(&mut simulation, 0x7E0, &[0x22, 0xF1, 0x90]);
+}
+
+#[test]
+fn a_broadcast_skips_ecus_that_are_off_without_skipping_the_rest() {
+    let mut simulation = LoadGatewayedSimulation();
+    simulation.SetEcuEnabled(0x7E0, false).expect("loaded");
+
+    let vecResponses = SendExpectingHandled(&mut simulation, 0x7DF, &[0x3E, 0x00]);
+
+    assert_eq!(vecResponses.len(), 1, "only the gateway should answer");
+    assert_eq!(vecResponses[0].m_strEcuName, "Gateway");
+}
+
+#[test]
+fn switching_an_absent_ecu_is_an_error_rather_than_a_silent_no_op() {
+    let mut simulation = LoadGatewayedSimulation();
+    assert!(
+        simulation.SetEcuEnabled(0x123, false).is_err(),
+        "an operator toggling an ECU that is not there must be told"
+    );
+}

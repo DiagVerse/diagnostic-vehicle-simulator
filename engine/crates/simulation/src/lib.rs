@@ -191,6 +191,16 @@ pub enum RoutingOutcome {
     /// identifier it does not own — it does **not** answer with a negative response — so the
     /// simulator stays silent too.
     NoTarget,
+    /// An ECU owns that identifier but is switched off, or sits behind a gateway that is.
+    ///
+    /// Silence on the wire, exactly like `NoTarget` — but an operator who has just flicked a
+    /// switch needs to be told that is why, not left to conclude the request was malformed.
+    Silenced {
+        /// The ECU that would have answered.
+        strEcuName: String,
+        /// Why it did not, in words worth showing to whoever asked.
+        strReason: String,
+    },
     /// One or more ECUs handled the request, in ECU order.
     Handled(Vec<RoutedResponse>),
 }
@@ -622,6 +632,31 @@ impl SimulationService {
         Ok(())
     }
 
+    /// Switch one ECU on or off.
+    ///
+    /// Written to both the running ECU and the loaded model, so what is simulated and what
+    /// gets serialized cannot drift — the same rule every other per-ECU setting follows.
+    pub fn SetEcuEnabled(
+        &mut self,
+        u32RequestCanId: u32,
+        bIsEnabled: bool,
+    ) -> Result<(), SimulationError> {
+        let runningEcu = self
+            .m_mapEcusByRequestId
+            .get_mut(&u32RequestCanId)
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+        runningEcu.SetEnabled(bIsEnabled);
+
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            for config in &mut vehicle.m_vecEcus {
+                if IsAddressedOn(config, u32RequestCanId) {
+                    config.m_bIsEnabled = bIsEnabled;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Take a copy of the loaded vehicle to edit, so a rejected change leaves nothing behind.
     fn CloneVehicleForEdit(&self) -> Result<Vehicle, SimulationError> {
         self.m_optVehicle
@@ -688,6 +723,25 @@ impl SimulationService {
         vecRequest: &[u8],
         protocol: &dyn ProtocolHandler,
     ) -> RoutingOutcome {
+        if let Some(strReason) = self.DescribeWhySilent(u32RequestCanId) {
+            let strEcuName = self
+                .m_mapEcusByRequestId
+                .get(&u32RequestCanId)
+                .map(|runningEcu| runningEcu.Config().m_strName.clone())
+                .unwrap_or_default();
+
+            tracing::info!(
+                ecu = %strEcuName,
+                requestCanId = format!("{u32RequestCanId:03X}"),
+                reason = %strReason,
+                "request reached an ECU that is off the air; staying silent"
+            );
+            return RoutingOutcome::Silenced {
+                strEcuName,
+                strReason,
+            };
+        }
+
         let runningEcu = match self.m_mapEcusByRequestId.get_mut(&u32RequestCanId) {
             Some(runningEcu) => runningEcu,
             None => return RoutingOutcome::NoTarget,
@@ -695,6 +749,29 @@ impl SimulationService {
 
         let response = ProcessOnEcu(runningEcu, u32RequestCanId, vecRequest, protocol);
         RoutingOutcome::Handled(vec![response])
+    }
+
+    /// Say why an ECU would not answer right now, or `None` when it would.
+    ///
+    /// Two separate reasons, kept apart because they are fixed differently: the ECU is switched
+    /// off, or a gateway between it and the tester is. The second is the first thing the
+    /// declared architecture actually enforces — an unpowered gateway takes everything behind
+    /// it off the air on a real vehicle, and a switch that did not do that would be decorative.
+    fn DescribeWhySilent(&self, u32RequestCanId: u32) -> Option<String> {
+        let runningEcu = self.m_mapEcusByRequestId.get(&u32RequestCanId)?;
+        let config = runningEcu.Config();
+
+        if !config.m_bIsEnabled {
+            return Some(format!("'{}' is switched off", config.m_strName));
+        }
+
+        let vehicle = self.m_optVehicle.as_ref()?;
+        let path = vehicle.DiagnosticPathTo(config);
+        let strDisabledGateway = path.m_optStrDisabledGatewayName?;
+
+        Some(format!(
+            "the gateway '{strDisabledGateway}' is switched off, so nothing behind it can be reached"
+        ))
     }
 
     /// Case 2: a broadcast identifier every listening ECU processes on its own state.
@@ -723,6 +800,17 @@ impl SimulationService {
 
         let mut vecResponses = Vec::new();
         for u32TargetRequestId in vecTargetRequestIds {
+            // A broadcast reaches whoever is listening. An ECU that is off, or behind a
+            // gateway that is off, simply is not.
+            if let Some(strReason) = self.DescribeWhySilent(u32TargetRequestId) {
+                tracing::debug!(
+                    requestCanId = format!("{u32FunctionalCanId:03X}"),
+                    reason = %strReason,
+                    "an ECU was skipped for this broadcast"
+                );
+                continue;
+            }
+
             let runningEcu = match self.m_mapEcusByRequestId.get_mut(&u32TargetRequestId) {
                 Some(runningEcu) => runningEcu,
                 None => continue,

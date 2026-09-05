@@ -270,8 +270,11 @@ impl CanBridge {
 
         let vecResponses = match outcome {
             RoutingOutcome::Handled(vecResponses) => vecResponses,
-            // Silence either way, and both are already logged by the simulation service.
-            RoutingOutcome::NoTarget | RoutingOutcome::Stopped => return,
+            // Silence on the wire in every one of these cases, and the simulation service has
+            // already logged which it was and why.
+            RoutingOutcome::NoTarget
+            | RoutingOutcome::Stopped
+            | RoutingOutcome::Silenced { .. } => return,
         };
 
         // Collect what to send as each step comes due, then segment it. The plan's timing is
