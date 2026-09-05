@@ -3,12 +3,14 @@
 //! exposes it over HTTP. It contains no business logic.
 
 pub mod diagnostics;
+pub mod simulation;
 
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
+use ::simulation::SimulationService;
 use application::{PluginInfo, ProtocolPlugin};
 use axum::{
     extract::State,
@@ -29,6 +31,9 @@ pub struct AppState {
     /// The single demo ECU the diagnostics endpoints drive. Guarded by a mutex because it
     /// holds live, mutable diagnostic state; the lock is only held for synchronous work.
     pub ecu: Mutex<VirtualEcu>,
+    /// The loaded vehicle simulation the `/simulation/*` endpoints drive. Guarded by a mutex
+    /// for the same reason as `ecu`: it holds live ECU state and is mutated by requests.
+    pub simulation: Mutex<SimulationService>,
 }
 
 /// Response body for `GET /health`.
@@ -48,6 +53,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ecu/state", get(diagnostics::GetEcuState))
         .route("/ecu/request", post(diagnostics::PostEcuRequest))
         .route("/ecu/reset", post(diagnostics::PostEcuReset))
+        .route("/simulation/load", post(simulation::PostSimulationLoad))
+        .route("/simulation/state", get(simulation::GetSimulationState))
+        .route(
+            "/simulation/request",
+            post(simulation::PostSimulationRequest),
+        )
+        .route("/simulation/reset", post(simulation::PostSimulationReset))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

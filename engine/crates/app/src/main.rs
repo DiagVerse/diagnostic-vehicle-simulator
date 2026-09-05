@@ -37,10 +37,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Initialise structured logging. Honour `RUST_LOG`, defaulting to `info`.
+///
+/// Logs go to stderr so a command that prints a result to stdout — `dvsim reconstruct`, whose
+/// output is JSON — stays pipeable into another tool.
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
@@ -61,6 +67,7 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
         plugins: host.infos().to_vec(),
         protocol,
         ecu: std::sync::Mutex::new(ecu::VirtualEcu::New(ecu::sample::BuildEngineEcu())),
+        simulation: std::sync::Mutex::new(simulation::SimulationService::New()),
     });
 
     api::serve(addr, state)

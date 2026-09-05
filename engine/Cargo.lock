@@ -71,8 +71,11 @@ version = "0.1.0"
 dependencies = [
  "application",
  "axum",
+ "core-domain",
+ "ecu",
  "serde",
  "serde_json",
+ "simulation",
  "tokio",
  "tower-http",
  "tracing",
@@ -85,6 +88,10 @@ dependencies = [
  "anyhow",
  "api",
  "application",
+ "core-domain",
+ "ecu",
+ "reconstruct",
+ "simulation",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -199,6 +206,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "can"
+version = "0.1.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +262,18 @@ name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+
+[[package]]
+name = "ecu"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "application",
+ "core-domain",
+ "plugin-contract",
+ "tracing",
+ "uds-plugin",
+]
 
 [[package]]
 name = "errno"
@@ -403,6 +426,13 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tower-service",
+]
+
+[[package]]
+name = "isotp"
+version = "0.1.0"
+dependencies = [
+ "can",
 ]
 
 [[package]]
@@ -578,6 +608,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "reconstruct"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "application",
+ "can",
+ "core-domain",
+ "ecu",
+ "isotp",
+ "plugin-contract",
+ "thiserror",
+ "tracing",
+ "uds-plugin",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,6 +782,21 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "simulation"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "application",
+ "core-domain",
+ "ecu",
+ "plugin-contract",
+ "reconstruct",
+ "thiserror",
+ "tracing",
+ "uds-plugin",
 ]
 
 [[package]]
@@ -1010,6 +1071,14 @@ name = "typewit"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "214ca0b2191785cbc06209b9ca1861e048e39b5ba33574b3cedd58363d5bb5f6"
+
+[[package]]
+name = "uds-plugin"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "plugin-contract",
+]
 
 [[package]]
 name = "unicase"

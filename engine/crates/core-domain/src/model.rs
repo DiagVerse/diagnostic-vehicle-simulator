@@ -124,6 +124,116 @@ impl Default for EcuTiming {
     }
 }
 
+/// How an ECU is addressed on CAN (ISO 15765-2). The MVP simulates physically-addressed
+/// UDS-on-CAN only; the variant is carried so a later phase can add the other modes without
+/// reshaping the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CanAddressingMode {
+    /// Normal 11-bit addressing — one CAN ID per direction, no address byte in the payload.
+    #[default]
+    Normal11Bit,
+    /// Normal fixed 29-bit addressing — 0x18DA<target><source>, tester source address 0xF1.
+    NormalFixed29Bit,
+}
+
+/// The pair of CAN identifiers a physically-addressed ECU uses: the identifier a tester sends
+/// requests on, and the identifier the ECU answers on.
+///
+/// Both are stored as `u32` because 29-bit (extended) identifiers do not fit in a `u16`.
+/// `m_confidence` records how the pair was established: `Observed` when both identifiers were
+/// actually seen in a trace, `Inferred` when one of them was derived from the other by a
+/// convention (e.g. response = request + 8) rather than witnessed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanAddress {
+    /// CAN identifier the tester sends requests on (e.g. 0x7E0).
+    pub m_u32RequestCanId: u32,
+    /// CAN identifier the ECU sends responses on (e.g. 0x7E8).
+    pub m_u32ResponseCanId: u32,
+    /// Functional (broadcast) identifier this ECU also accepts requests on, if any: 0x7DF for
+    /// legislated 11-bit addressing, 0x18DB33F1 for 29-bit normal fixed. `None` when nothing
+    /// in the sources or the standards says the ECU listens functionally. Defaulted on
+    /// deserialization so models written before this field existed still load.
+    #[serde(default)]
+    pub m_optU32FunctionalCanId: Option<u32>,
+    /// Addressing mode the two identifiers follow.
+    pub m_addressingMode: CanAddressingMode,
+    /// How the pair was established.
+    pub m_confidence: Confidence,
+}
+
+/// Offset between an 11-bit UDS request identifier and its response identifier (0x7E0 -> 0x7E8).
+///
+/// ISO 15765-4 fixes this pairing for the legislated range 0x7E0..=0x7E7 only. Outside that
+/// range identifier pairs are OEM-specific and follow no derivable rule (0x745 -> 0x765 is a
+/// real, observed example), so the offset must never be applied there.
+pub const c_u32Response11BitOffset: u32 = 0x08;
+
+/// Lowest legislated 11-bit UDS request identifier (ISO 15765-4).
+pub const c_u32LegislatedRequestCanIdFirst: u32 = 0x7E0;
+/// Highest legislated 11-bit UDS request identifier (ISO 15765-4).
+pub const c_u32LegislatedRequestCanIdLast: u32 = 0x7E7;
+
+/// The 11-bit functional (broadcast) request identifier every legislated ECU listens on
+/// (ISO 15765-4). It is a listen address shared by all ECUs, never one ECU's own request
+/// identifier.
+pub const c_u32Functional11BitCanId: u32 = 0x7DF;
+
+/// The 29-bit normal-fixed functional request identifier: target address 0x33 (all ECUs),
+/// source address 0xF1 (tester), N_TAtype 0xDB (functional) — ISO 15765-2.
+pub const c_u32FunctionalNormalFixed29BitCanId: u32 = 0x18DB_33F1;
+
+impl CanAddress {
+    /// Build a normal 11-bit address pair from both observed identifiers.
+    pub fn NewObserved11Bit(u32RequestCanId: u32, u32ResponseCanId: u32) -> Self {
+        CanAddress {
+            m_u32RequestCanId: u32RequestCanId,
+            m_u32ResponseCanId: u32ResponseCanId,
+            m_optU32FunctionalCanId: DefaultFunctionalCanId(
+                u32RequestCanId,
+                CanAddressingMode::Normal11Bit,
+            ),
+            m_addressingMode: CanAddressingMode::Normal11Bit,
+            m_confidence: Confidence::Observed,
+        }
+    }
+
+    /// True when the identifiers are 29-bit extended.
+    ///
+    /// Derived from the addressing mode rather than from the identifier value: a value below
+    /// 0x800 may legally be transmitted in an extended frame, so the value alone cannot decide.
+    pub fn IsExtendedId(&self) -> bool {
+        self.m_addressingMode == CanAddressingMode::NormalFixed29Bit
+    }
+
+    /// True when this ECU listens on the given functional (broadcast) identifier.
+    pub fn ListensFunctionallyOn(&self, u32CanId: u32) -> bool {
+        self.m_optU32FunctionalCanId == Some(u32CanId)
+    }
+}
+
+/// The functional identifier an ECU on this request identifier is required to listen on, or
+/// `None` when no standard mandates one.
+///
+/// ISO 15765-4 requires every ECU in the legislated 11-bit range to accept 0x7DF, and
+/// ISO 15765-2 defines 0x18DB33F1 for 29-bit normal-fixed addressing. An OEM-specific 11-bit
+/// pair (e.g. 0x745/0x765) is outside both standards, so nothing can be assumed for it.
+pub fn DefaultFunctionalCanId(u32RequestCanId: u32, mode: CanAddressingMode) -> Option<u32> {
+    match mode {
+        CanAddressingMode::NormalFixed29Bit => Some(c_u32FunctionalNormalFixed29BitCanId),
+        CanAddressingMode::Normal11Bit => {
+            let bIsLegislated = (c_u32LegislatedRequestCanIdFirst
+                ..=c_u32LegislatedRequestCanIdLast)
+                .contains(&u32RequestCanId);
+            if bIsLegislated {
+                Some(c_u32Functional11BitCanId)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// A single virtual ECU's static diagnostic configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +242,12 @@ pub struct Ecu {
     pub m_strName: String,
     /// UDS logical/diagnostic address (used for DoIP and addressing later).
     pub m_u16LogicalAddress: u16,
+    /// CAN identifiers this ECU is reached on. `None` means the ECU's CAN addressing is not
+    /// known (e.g. a hand-built model, or one imported from a source that carries no CAN
+    /// addressing); such an ECU cannot be routed to on CAN. Defaulted on deserialization so
+    /// models written before this field existed still load.
+    #[serde(default)]
+    pub m_optCanAddress: Option<CanAddress>,
     /// Service IDs (request SIDs) this ECU supports, e.g. 0x10, 0x22, 0x27.
     pub m_vecSupportedServices: Vec<u8>,
     /// Sessions this ECU can enter.
@@ -153,6 +269,7 @@ impl Ecu {
         Ecu {
             m_strName: strName.to_string(),
             m_u16LogicalAddress: u16LogicalAddress,
+            m_optCanAddress: None,
             m_vecSupportedServices: Vec::new(),
             m_vecSupportedSessions: vec![SessionType::Default],
             m_mapDids: BTreeMap::new(),
