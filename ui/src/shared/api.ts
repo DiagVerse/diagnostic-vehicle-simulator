@@ -138,6 +138,28 @@ export interface SimulationRequestResult {
   responses: SimulationResponse[]
 }
 
+/** A serial port this machine offers. */
+export interface SerialPort {
+  name: string
+  description: string
+}
+
+/** What `GET /hw/ports` answers. */
+export interface SerialPorts {
+  /** False when the build has no serial support: an empty list then means that, not "nothing plugged in". */
+  serialSupported: boolean
+  ports: SerialPort[]
+}
+
+/** Whether the simulation is on a wire, and how much has crossed it. */
+export interface HardwareStatus {
+  running: boolean
+  port: string | null
+  bitrateBps: number | null
+  framesReceived: number
+  framesSent: number
+}
+
 /** A run of request bytes copied into the response, so a wildcard override still echoes. */
 export interface EchoSpan {
   requestOffset: number
@@ -289,6 +311,11 @@ export const api = {
   simulationRequest: (canIdHex: string, requestHex: string) =>
     postJson<SimulationRequestResult>('/simulation/request', { canIdHex, requestHex }),
   simulationTopology: () => getJson<Topology>('/simulation/topology'),
+  serialPorts: () => getJson<SerialPorts>('/hw/ports'),
+  hardwareStatus: () => getJson<HardwareStatus>('/hw/status'),
+  hardwareStart: (port: string, bitrateBps: number) =>
+    postJson<HardwareStatus>('/hw/start', { port, bitrateBps }),
+  hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
   ecuOverrides: (requestCanIdHex: string) =>
     getJson<ResponseOverride[]>(`/simulation/ecus/${requestCanIdHex}/overrides`),
   setEcuOverrides: (requestCanIdHex: string, overrides: ResponseOverride[]) =>
