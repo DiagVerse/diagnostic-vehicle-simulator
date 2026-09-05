@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Composition root: boots the plugin host and serves the API."
+
+[[bin]]
+name = "dvsim"
+path = "src/main.rs"
+
+[dependencies]
+application.workspace = true
+api.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
