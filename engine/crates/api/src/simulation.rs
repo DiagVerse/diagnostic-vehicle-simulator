@@ -24,8 +24,8 @@ use axum::{
     Json,
 };
 use core_domain::model::{
-    CanAddress, CanAddressingMode, EchoSpan, Ecu, EcuTiming, OverrideAction, ResponseOverride,
-    SessionType,
+    CanAddress, CanAddressingMode, EchoSpan, Ecu, EcuTiming, Network, NetworkKind, OverrideAction,
+    ResponseOverride, SessionType,
 };
 use core_domain::Confidence;
 use ecu::VirtualEcu;
@@ -312,6 +312,31 @@ pub struct SimulationRequestResultDto {
     /// False when no ECU listens on that identifier — nothing was sent, as on a real bus.
     pub routed: bool,
     pub responses: Vec<SimulationResponseDto>,
+}
+
+/// POST /simulation/simfile — load a vehicle from a simulation file.
+pub async fn PostSimulationSimFile(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoadSimulationBody>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    if body.log_text.trim().is_empty() {
+        return Err(ApiError::BadRequest("the file is empty".to_string()));
+    }
+    if body.log_text.len() > c_uMaxLogTextChars {
+        return Err(ApiError::BadRequest(format!(
+            "the file is {} characters; the limit is {c_uMaxLogTextChars}",
+            body.log_text.len()
+        )));
+    }
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+
+    // As with a log, a rejected file leaves whatever was loaded still running.
+    simulation
+        .LoadFromSimFileText(&body.log_text)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
 }
 
 /// POST /simulation/load — reconstruct a vehicle from CAN-log text and start its ECUs.
@@ -669,63 +694,73 @@ pub async fn GetTopology(State(state): State<Arc<AppState>>) -> Json<TopologyDto
     Json(BuildTopologyDto(&simulation))
 }
 
-/// Derive the diagram from the running ECUs.
+/// Build the diagram from the running ECUs and whatever is known about how they are wired.
 ///
-/// The model has no `Network` type yet, so there is exactly one link and it is honest about
-/// being a reachability set rather than a bus.
+/// A vehicle that states its buses gets one link per bus. One that does not — reconstructed
+/// from a capture, or built by hand — gets a single link that is honest about being a
+/// reachability set rather than a wire.
 fn BuildTopologyDto(simulation: &SimulationService) -> TopologyDto {
     let vecEcus: Vec<&VirtualEcu> = simulation
         .RunningEcus()
         .map(|(_, runningEcu)| runningEcu)
         .collect();
 
+    let optVehicle = simulation.Vehicle();
     if vecEcus.is_empty() {
         return TopologyDto {
-            vehicle_name: simulation
-                .Vehicle()
-                .map(|vehicle| vehicle.m_strName.clone()),
+            vehicle_name: optVehicle.map(|vehicle| vehicle.m_strName.clone()),
             links: Vec::new(),
             nodes: Vec::new(),
             caveats: Vec::new(),
         };
     }
 
+    let vecNetworks: &[Network] = optVehicle
+        .map(|vehicle| vehicle.m_vecNetworks.as_slice())
+        .unwrap_or(&[]);
+
+    let vecLinks = if vecNetworks.is_empty() {
+        vec![BuildDerivedLink(&vecEcus)]
+    } else {
+        vecNetworks.iter().map(BuildStatedLink).collect()
+    };
+
+    TopologyDto {
+        vehicle_name: optVehicle.map(|vehicle| vehicle.m_strName.clone()),
+        nodes: BuildTopologyNodes(&vecEcus, !vecNetworks.is_empty()),
+        links: vecLinks,
+        caveats: BuildTopologyCaveats(&vecEcus, vecNetworks),
+    }
+}
+
+/// A link the vehicle actually declares.
+fn BuildStatedLink(network: &Network) -> TopologyLinkDto {
+    let strLabel = match network.m_optU32BitrateBps {
+        Some(u32BitrateBps) => format!("{} · {} kbit/s", network.m_strName, u32BitrateBps / 1000),
+        None => network.m_strName.clone(),
+    };
+
+    TopologyLinkDto {
+        id: network.m_strId.clone(),
+        label: strLabel,
+        kind: NetworkKindName(network.m_kind),
+        functional_can_ids_hex: Vec::new(),
+        membership_confidence: ConfidenceName(network.m_confidence),
+    }
+}
+
+/// The single link drawn when nothing said how the ECUs are wired.
+fn BuildDerivedLink(vecEcus: &[&VirtualEcu]) -> TopologyLinkDto {
     let mut setFunctionalIds: BTreeSet<u32> = BTreeSet::new();
-    let mut vecNodes = vec![TopologyNodeDto {
-        id: "tester".to_string(),
-        label: "Tester".to_string(),
-        kind: "tester".to_string(),
-        link_id: Some(c_strDiagnosticLinkId.to_string()),
-        request_can_id_hex: None,
-        response_can_id_hex: None,
-        addressing_mode: None,
-        address_confidence: None,
-        is_unreachable: false,
-    }];
-
-    for runningEcu in &vecEcus {
-        let config = runningEcu.Config();
-        let address = config
-            .m_optCanAddress
-            .expect("a started ECU always has a CAN address");
-        if let Some(u32FunctionalCanId) = address.m_optU32FunctionalCanId {
-            setFunctionalIds.insert(u32FunctionalCanId);
+    for runningEcu in vecEcus {
+        if let Some(address) = runningEcu.Config().m_optCanAddress {
+            if let Some(u32FunctionalCanId) = address.m_optU32FunctionalCanId {
+                setFunctionalIds.insert(u32FunctionalCanId);
+            }
         }
-
-        vecNodes.push(TopologyNodeDto {
-            id: FormatCanId(address.m_u32RequestCanId),
-            label: config.m_strName.clone(),
-            kind: "ecu".to_string(),
-            link_id: Some(c_strDiagnosticLinkId.to_string()),
-            request_can_id_hex: Some(FormatCanId(address.m_u32RequestCanId)),
-            response_can_id_hex: Some(FormatCanId(address.m_u32ResponseCanId)),
-            addressing_mode: Some(AddressingModeName(address.m_addressingMode)),
-            address_confidence: Some(ConfidenceName(address.m_confidence)),
-            is_unreachable: false,
-        });
     }
 
-    let link = TopologyLinkDto {
+    TopologyLinkDto {
         id: c_strDiagnosticLinkId.to_string(),
         label: "Diagnostic link, as captured".to_string(),
         kind: "CAN".to_string(),
@@ -733,20 +768,85 @@ fn BuildTopologyDto(simulation: &SimulationService) -> TopologyDto {
         // A capture cannot observe bus membership, and a hand-built model has not been asked
         // about it, so the strongest honest claim is that these ECUs were reached together.
         membership_confidence: ConfidenceName(Confidence::Inferred),
-    };
+    }
+}
 
-    TopologyDto {
-        vehicle_name: simulation
-            .Vehicle()
-            .map(|vehicle| vehicle.m_strName.clone()),
-        links: vec![link],
-        nodes: vecNodes,
-        caveats: BuildTopologyCaveats(&vecEcus),
+/// The tester plus one node per ECU.
+fn BuildTopologyNodes(vecEcus: &[&VirtualEcu], bHasStatedNetworks: bool) -> Vec<TopologyNodeDto> {
+    let mut vecNodes = vec![TopologyNodeDto {
+        id: "tester".to_string(),
+        label: "Tester".to_string(),
+        kind: "tester".to_string(),
+        // The tester attaches at the diagnostic connector, which is not any one declared bus.
+        link_id: (!bHasStatedNetworks).then(|| c_strDiagnosticLinkId.to_string()),
+        request_can_id_hex: None,
+        response_can_id_hex: None,
+        addressing_mode: None,
+        address_confidence: None,
+        is_unreachable: false,
+    }];
+
+    for runningEcu in vecEcus {
+        let config = runningEcu.Config();
+        let address = config
+            .m_optCanAddress
+            .expect("a started ECU always has a CAN address");
+
+        // An ECU on no declared bus is drawn unassigned rather than dropped onto a default
+        // one: "nobody said" is a different fact from "it is on this bus".
+        let optLinkId = if bHasStatedNetworks {
+            config.m_optStrNetworkId.clone()
+        } else {
+            Some(c_strDiagnosticLinkId.to_string())
+        };
+
+        vecNodes.push(TopologyNodeDto {
+            id: FormatCanId(address.m_u32RequestCanId),
+            label: config.m_strName.clone(),
+            kind: "ecu".to_string(),
+            link_id: optLinkId,
+            request_can_id_hex: Some(FormatCanId(address.m_u32RequestCanId)),
+            response_can_id_hex: Some(FormatCanId(address.m_u32ResponseCanId)),
+            addressing_mode: Some(AddressingModeName(address.m_addressingMode)),
+            address_confidence: Some(ConfidenceName(address.m_confidence)),
+            is_unreachable: false,
+        });
+    }
+    vecNodes
+}
+
+/// Name a network kind for display.
+fn NetworkKindName(kind: NetworkKind) -> String {
+    match kind {
+        NetworkKind::CanClassic => "CAN".to_string(),
+        NetworkKind::CanFd => "CAN-FD".to_string(),
+        NetworkKind::EthernetDoIp => "Ethernet".to_string(),
+        NetworkKind::Unknown => "unknown".to_string(),
     }
 }
 
 /// The things this diagram cannot know, stated plainly.
-fn BuildTopologyCaveats(vecEcus: &[&VirtualEcu]) -> Vec<String> {
+fn BuildTopologyCaveats(vecEcus: &[&VirtualEcu], vecNetworks: &[Network]) -> Vec<String> {
+    // A vehicle that declares its buses was described by someone who knows it, so the diagram
+    // is showing what they said rather than what could be inferred from traffic.
+    if !vecNetworks.is_empty() {
+        let uUnassigned = vecEcus
+            .iter()
+            .filter(|runningEcu| runningEcu.Config().m_optStrNetworkId.is_none())
+            .count();
+
+        let mut vecStated = vec![
+            "These buses come from the loaded simulation file, so they are what its author stated rather than anything observed on a wire."
+                .to_string(),
+        ];
+        if uUnassigned > 0 {
+            vecStated.push(format!(
+                "{uUnassigned} ECU(s) are on no declared bus. They are shown unassigned rather than placed on one, because 'nobody said' is not the same as 'on this bus'."
+            ));
+        }
+        return vecStated;
+    }
+
     let mut vecCaveats = vec![
         "These ECUs were reached through the same tester connection. That does not prove they share a physical bus — an ECU behind a gateway answers on the same connector."
             .to_string(),

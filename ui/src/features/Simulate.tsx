@@ -80,6 +80,21 @@ export function Simulate() {
     }
   }
 
+  async function loadSimFile(fileText: string) {
+    setBusy(true)
+    try {
+      setState(await api.simulationLoadSimFile(fileText))
+      setLog([])
+      setError(null)
+    } catch (e) {
+      // A rejected file leaves the previously loaded vehicle running, and the engine's message
+      // names the ECU and the field it could not read.
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function send(requestHex: string) {
     if (!strSelectedCanId) {
       setError('Pick a CAN identifier to address first.')
@@ -147,9 +162,9 @@ export function Simulate() {
 
       <SourcePicker source={source} onChange={setSource} />
 
-      {source === 'log' ? (
-        <LogLoader onLoad={load} busy={busy} />
-      ) : (
+      {source === 'log' && <LogLoader onLoad={load} busy={busy} />}
+      {source === 'simfile' && <SimFileLoader onLoad={loadSimFile} busy={busy} />}
+      {source === 'build' && (
         <VehicleBuilder onChanged={setState} onError={setError} busy={busy} />
       )}
 
@@ -204,7 +219,7 @@ export function Simulate() {
 // ---------------------------------------------------------------------------------------
 
 /** A vehicle is either reconstructed from a capture or stated by hand. */
-type VehicleSource = 'log' | 'build'
+type VehicleSource = 'log' | 'simfile' | 'build'
 
 function SourcePicker({
   source,
@@ -217,6 +232,9 @@ function SourcePicker({
     <div className="flex gap-1 rounded-lg border border-slate-800 bg-slate-900/50 p-1">
       <SourceTab active={source === 'log'} onClick={() => onChange('log')}>
         From a CAN log
+      </SourceTab>
+      <SourceTab active={source === 'simfile'} onClick={() => onChange('simfile')}>
+        From a simulation file
       </SourceTab>
       <SourceTab active={source === 'build'} onClick={() => onChange('build')}>
         Build from scratch
@@ -446,11 +464,91 @@ function LogLoader({ onLoad, busy }: { onLoad: (logText: string) => void; busy: 
   )
 }
 
+/**
+ * Load a vehicle described in a file.
+ *
+ * The only source that can state how the ECUs are wired: a capture cannot observe bus
+ * membership and someone clicking ECUs together has not been asked, so this is what makes the
+ * topology diagram show real buses.
+ */
+function SimFileLoader({
+  onLoad,
+  busy,
+}: {
+  onLoad: (fileText: string) => void
+  busy: boolean
+}) {
+  const [text, setText] = useState('')
+  const [fileName, setFileName] = useState<string | null>(null)
+
+  async function readFile(file: File) {
+    setText(await file.text())
+    setFileName(file.name)
+  }
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Load a simulation file
+        </h3>
+        <span className="text-xs text-slate-500">JSON</span>
+      </div>
+
+      <p className="mt-1 text-xs text-slate-600">
+        Buses, ECUs by name, their DIDs and DTCs, and the answers they give — in one file you
+        can keep under version control. It is the only source that says how the ECUs are wired,
+        so it is the one the topology diagram can draw real buses from.
+      </p>
+
+      <textarea
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value)
+          setFileName(null)
+        }}
+        rows={8}
+        spellCheck={false}
+        placeholder={'{\n  "simfileVersion": 1,\n  "vehicle": "Demo vehicle",\n  "networks": [ … ],\n  "ecus": [ … ]\n}'}
+        className="mt-3 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-300 outline-none focus:border-slate-500"
+      />
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => onLoad(text)}
+          disabled={busy || text.trim().length === 0}
+          className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Load &amp; simulate
+        </button>
+
+        <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-slate-500">
+          Choose file…
+          <input
+            type="file"
+            accept=".json,.simfile,.txt"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) readFile(file)
+            }}
+          />
+        </label>
+
+        {fileName && <span className="font-mono text-xs text-slate-500">{fileName}</span>}
+        <span className="text-xs text-slate-600">
+          There is a worked example in <code>samples/demo-vehicle.simfile.json</code>.
+        </span>
+      </div>
+    </section>
+  )
+}
+
 function EmptyState() {
   return (
     <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-10 text-center text-sm text-slate-500">
-      No vehicle loaded. Paste or choose a CAN log above — the engine reconstructs the ECUs it
-      finds and starts them.
+      No vehicle loaded. Reconstruct one from a CAN log, load a simulation file, or build one
+      ECU at a time.
     </p>
   )
 }

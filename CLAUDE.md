@@ -18,6 +18,8 @@ Phase 2 (core) delivered: `crates/can` (CAN/CAN-FD frame types), `crates/isotp` 
 
 **MVP-3 delivered** (`feat/mvp-hw-slcan`): the simulation on a wire. New crates `slcan` (ASCII line codec, streaming decoder), `serial-can` (real port, virtual port, in-memory loopback), `bridge` (frames → routed request → response plan → frames), plus ISO-TP **transmit** with flow control and a **live receiver** that generates it. `GET /hw/ports`, `GET /hw/status`, `POST /hw/start {port,bitrateBps}`, `POST /hw/stop`, and a Hardware tab. Verified against a tester at the far end of a PTY pair. See ADR 0007.
 
+**Simulation files** (`feat/simfile-import`): a third source alongside logs and the hand-builder. `crates/simfile` reads a hand-writable JSON document — buses, ECUs by name, DIDs, DTCs in `P0123-11` form, security, response overrides — into a `Vehicle`. `POST /simulation/simfile`. The model gained `Network`/`m_vecNetworks` and `Ecu.m_optStrNetworkId`, so the Topology tab draws **real buses** for a simfile and keeps the honest single-link view for the other two sources. Sample: `samples/demo-vehicle.simfile.json`. See ADR 0008.
+
 Deferred from the MVP-1 CAN/UDS review (recorded in ADR 0004, worth a `fix/*` PR): ISO-TP messages are ordered by their first frame rather than their last; consecutive-frame sequence numbers are not validated; the Vector `.asc` `x` extended-frame marker is discarded; `m_u16LogicalAddress` still stands in as an 11-bit ECU's response id; and the `~/.claude/can-analyzer/reference/` log format is not parseable yet.
 
 Known cosmetic item: the raw Vehicle model JSON uses `mStrName`-style keys (Hungarian field names + serde camelCase); UI-facing DTOs use clean camelCase. Revisit with explicit serde renames if the model JSON becomes user-facing.

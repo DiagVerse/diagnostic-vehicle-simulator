@@ -64,6 +64,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ecu/request", post(diagnostics::PostEcuRequest))
         .route("/ecu/reset", post(diagnostics::PostEcuReset))
         .route("/simulation/load", post(simulation::PostSimulationLoad))
+        .route(
+            "/simulation/simfile",
+            post(simulation::PostSimulationSimFile),
+        )
         .route("/simulation/state", get(simulation::GetSimulationState))
         .route(
             "/simulation/request",

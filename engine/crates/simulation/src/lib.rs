@@ -49,6 +49,10 @@ pub enum SimulationError {
     #[error("failed to reconstruct a vehicle from the log: {0}")]
     Reconstruct(#[from] reconstruct::ReconstructError),
 
+    /// The simulation file could not be read.
+    #[error("failed to read the simulation file: {0}")]
+    SimFile(#[from] simfile::SimFileError),
+
     /// The log parsed, but no diagnostic ECU could be identified in it.
     #[error("no diagnostic ECU found in the log (no correlated UDS request/response pairs)")]
     NoEcusFound,
@@ -299,6 +303,15 @@ impl SimulationService {
         self.m_mapEcusByRequestId.get(&u32RequestCanId)
     }
 
+    /// Load a vehicle described in a simulation file.
+    ///
+    /// The only one of the three sources that can state how the ECUs are wired, so this is the
+    /// only one that produces a vehicle with real networks.
+    pub fn LoadFromSimFileText(&mut self, strContent: &str) -> Result<&Vehicle, SimulationError> {
+        let vehicle = simfile::LoadFromText(strContent)?;
+        self.LoadVehicle(vehicle)
+    }
+
     /// Start an empty vehicle to build up by hand.
     ///
     /// Unlike a reconstruction, an empty vehicle is a legitimate starting point: the user is
@@ -309,6 +322,9 @@ impl SimulationService {
         self.m_optVehicle = Some(Vehicle {
             m_strName: strName.to_string(),
             m_vecEcus: Vec::new(),
+            // A hand-built vehicle has no buses until someone says so, the same way a
+            // reconstructed one never does.
+            m_vecNetworks: Vec::new(),
         });
 
         tracing::info!(vehicle = %strName, "empty vehicle created");
