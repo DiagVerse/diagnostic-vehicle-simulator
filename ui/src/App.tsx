@@ -2,14 +2,15 @@ import { useEffect, useState } from 'react'
 import { StatusPill, type ConnectionStatus } from './components/StatusPill'
 import { Diagnostics } from './features/Diagnostics'
 import { Overview } from './features/Overview'
+import { Simulate } from './features/Simulate'
 import { api, type Health } from './shared/api'
 
-type Tab = 'diagnostics' | 'overview'
+type Tab = 'simulate' | 'diagnostics' | 'overview'
 
 export default function App() {
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
   const [health, setHealth] = useState<Health | null>(null)
-  const [tab, setTab] = useState<Tab>('diagnostics')
+  const [tab, setTab] = useState<Tab>('simulate')
 
   useEffect(() => {
     let cancelled = false
@@ -37,14 +38,17 @@ export default function App() {
   return (
     <div className="min-h-full bg-slate-950 text-slate-100">
       <header className="border-b border-slate-800 bg-slate-900/60 px-8 py-5 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between">
+        <div className="mx-auto flex max-w-6xl items-center justify-between">
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Diagnostic Vehicle Simulator</h1>
             <p className="text-sm text-slate-400">Reconstruct · Simulate · Diagnose</p>
           </div>
           <StatusPill status={status} version={health?.engine_version} />
         </div>
-        <nav className="mx-auto mt-4 flex max-w-5xl gap-1">
+        <nav className="mx-auto mt-4 flex max-w-6xl gap-1">
+          <TabButton active={tab === 'simulate'} onClick={() => setTab('simulate')}>
+            Simulate
+          </TabButton>
           <TabButton active={tab === 'diagnostics'} onClick={() => setTab('diagnostics')}>
             Diagnostics
           </TabButton>
@@ -54,8 +58,10 @@ export default function App() {
         </nav>
       </header>
 
-      <main className="mx-auto max-w-5xl px-8 py-10">
-        {tab === 'diagnostics' ? <Diagnostics /> : <Overview />}
+      <main className="mx-auto max-w-6xl px-8 py-10">
+        {tab === 'simulate' && <Simulate />}
+        {tab === 'diagnostics' && <Diagnostics />}
+        {tab === 'overview' && <Overview />}
       </main>
     </div>
   )
