@@ -18,6 +18,9 @@ pub struct CanFrame {
     pub m_bIsFd: bool,
     /// Payload bytes (0..=8 for classic CAN, up to 64 for CAN-FD).
     pub m_vecData: Vec<u8>,
+    /// Whether this frame travelled from the tester to an ECU, when the source said so.
+    /// `None` when the format carries no direction marker and it has to be inferred.
+    pub m_optBIsRequest: Option<bool>,
 }
 
 impl CanFrame {
@@ -29,6 +32,20 @@ impl CanFrame {
             m_bIsExtended: u32CanId > 0x7FF,
             m_bIsFd: false,
             m_vecData: vecData,
+            m_optBIsRequest: None,
+        }
+    }
+
+    /// Construct a classic frame whose source recorded which way it travelled.
+    pub fn NewDirected(
+        f64TimestampSec: f64,
+        u32CanId: u32,
+        vecData: Vec<u8>,
+        bIsRequest: bool,
+    ) -> Self {
+        CanFrame {
+            m_optBIsRequest: Some(bIsRequest),
+            ..CanFrame::NewClassic(f64TimestampSec, u32CanId, vecData)
         }
     }
 

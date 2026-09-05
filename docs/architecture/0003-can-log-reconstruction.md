@@ -28,6 +28,11 @@ A four-stage pipeline, each stage a small testable unit:
    `{ timestampMs, canId, data, isFd }`. Support the two most common text formats first:
    - Vector **`.asc`** (`<time> <channel> <id> Rx/Tx d <len> <bytes...>`).
    - Linux **candump** (`(time) iface id#hexbytes`).
+   - **Timestamped diagnostic trace** (`HH:MM:SS.ffffff>>0x18dad4f1 -> 02 10 01 55 …`), the
+     format service tools produce. It is the only supported format that records each frame's
+     **direction** (`>>` tester to ECU, `<<` ECU to tester); correlation believes that marker
+     outright and falls back to the service-identifier heuristic only for formats without one.
+     Wall-clock timestamps carry no date, so they become seconds since midnight.
 
 2. **Reassemble** (`isotp`): group frames by CAN ID and run ISO-TP reassembly per ID, yielding
    complete UDS PDUs `{ canId, timestampMs, bytes }`. Single-frame (SF), first/consecutive

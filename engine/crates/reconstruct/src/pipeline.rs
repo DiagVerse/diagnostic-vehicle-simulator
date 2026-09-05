@@ -39,6 +39,9 @@ struct PduRecord {
     m_u32CanId: u32,
     m_f64TimestampSec: f64,
     m_vecBytes: Vec<u8>,
+    /// Whether the source log said this travelled from the tester to an ECU. `None` for a
+    /// format that records no direction, where it has to be inferred from the service id.
+    m_optBIsRequest: Option<bool>,
 }
 
 /// A request awaiting its response during correlation.
@@ -66,24 +69,11 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
 
         // A PDU is first tested as an answer to something outstanding; only if it answers
         // nothing is it considered as a new request.
-        if let Some(uIndex) = FindPendingRequestFor(&vecPending, pdu) {
-            // A functional request is answered by every ECU that listens on the broadcast
-            // identifier, so it stays outstanding for the ECUs still to answer; a physical
-            // request has exactly one answer and is retired once it arrives.
-            let bIsFunctional = IsFunctionalRequestCanId(vecPending[uIndex].m_u32RequestCanId);
-            let pending = if bIsFunctional {
-                ClonePendingRequest(&vecPending[uIndex])
-            } else {
-                vecPending.remove(uIndex)
-            };
-
-            let ecu = EcuFor(&mut mapEcus, pdu.m_u32CanId);
-            RecordCanAddress(ecu, pending.m_u32RequestCanId, pdu.m_u32CanId);
-            ApplyPair(ecu, &pending.m_vecBytes, &pdu.m_vecBytes);
+        if !IsRequest(pdu) && TryApplyAsResponse(pdu, &mut vecPending, &mut mapEcus) {
             continue;
         }
 
-        if IsRequestSid(pdu.m_vecBytes[0]) {
+        if IsRequest(pdu) {
             RememberRequest(&mut vecPending, pdu);
         }
         // Unmatched responses are ignored.
@@ -93,6 +83,45 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
         m_strName: "Reconstructed Vehicle".to_string(),
         m_vecEcus: mapEcus.into_values().collect(),
     }
+}
+
+/// True when this PDU is a request from the tester.
+///
+/// A log that records the direction of each frame is believed outright; otherwise the service
+/// identifier decides, which is a good heuristic but only a heuristic.
+fn IsRequest(pdu: &PduRecord) -> bool {
+    match pdu.m_optBIsRequest {
+        Some(bIsRequest) => bIsRequest,
+        None => IsRequestSid(pdu.m_vecBytes[0]),
+    }
+}
+
+/// Try to pair this PDU with an outstanding request and fold the exchange into the model.
+/// Returns false when it answers nothing, so the caller can consider it as a new request.
+fn TryApplyAsResponse(
+    pdu: &PduRecord,
+    vecPending: &mut Vec<PendingRequest>,
+    mapEcus: &mut BTreeMap<u32, Ecu>,
+) -> bool {
+    let uIndex = match FindPendingRequestFor(vecPending, pdu) {
+        Some(uIndex) => uIndex,
+        None => return false,
+    };
+
+    // A functional request is answered by every ECU that listens on the broadcast identifier,
+    // so it stays outstanding for the ECUs still to answer; a physical request has exactly one
+    // answer and is retired once it arrives.
+    let bIsFunctional = IsFunctionalRequestCanId(vecPending[uIndex].m_u32RequestCanId);
+    let pending = if bIsFunctional {
+        ClonePendingRequest(&vecPending[uIndex])
+    } else {
+        vecPending.remove(uIndex)
+    };
+
+    let ecu = EcuFor(mapEcus, pdu.m_u32CanId);
+    RecordCanAddress(ecu, pending.m_u32RequestCanId, pdu.m_u32CanId);
+    ApplyPair(ecu, &pending.m_vecBytes, &pdu.m_vecBytes);
+    true
 }
 
 /// Reassemble every CAN-ID stream and return all PDUs in global time order.
@@ -107,11 +136,17 @@ fn ReassembleAllStreams(vecFrames: &[CanFrame]) -> Vec<PduRecord> {
 
     let mut vecPdus = Vec::new();
     for (u32CanId, vecStream) in &mapById {
+        // A diagnostic CAN identifier carries one direction: a tester's requests or an ECU's
+        // responses, never both. So the direction of the stream's first frame describes every
+        // PDU reassembled from it.
+        let optBIsRequest = vecStream.first().and_then(|frame| frame.m_optBIsRequest);
+
         for msg in ReassembleStream(vecStream) {
             vecPdus.push(PduRecord {
                 m_u32CanId: *u32CanId,
                 m_f64TimestampSec: msg.m_f64TimestampSec,
                 m_vecBytes: msg.m_vecData,
+                m_optBIsRequest: optBIsRequest,
             });
         }
     }
