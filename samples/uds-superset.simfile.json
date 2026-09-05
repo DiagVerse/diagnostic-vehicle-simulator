@@ -1,0 +1,783 @@
+{
+  "simfileVersion": 2,
+  "vehicle": "UDS superset reference vehicle",
+  "networks": [
+    {
+      "id": "diag",
+      "name": "Diagnostic CAN",
+      "kind": "CAN",
+      "bitrateBps": 500000,
+      "entryPoint": true
+    }
+  ],
+  "ecus": [
+    {
+      "name": "UDS Reference ECU",
+      "network": "diag",
+      "can": {
+        "request": "0x7E0",
+        "response": "0x7E8",
+        "functional": "0x7DF"
+      },
+      "doip": {
+        "logicalAddress": "0x1000"
+      },
+      "sessions": [
+        "default",
+        "programming",
+        "extended",
+        "safety"
+      ],
+      "services": [
+        "10",
+        "11",
+        "14",
+        "19",
+        "22",
+        "23",
+        "24",
+        "27",
+        "28",
+        "29",
+        "2A",
+        "2C",
+        "2E",
+        "2F",
+        "31",
+        "34",
+        "35",
+        "36",
+        "37",
+        "38",
+        "3D",
+        "3E",
+        "83",
+        "84",
+        "85",
+        "86",
+        "87"
+      ],
+      "dids": {
+        "F186": "03",
+        "F187": {
+          "text": "SIM-SPARE-0001"
+        },
+        "F188": {
+          "text": "SIM-SW-0001"
+        },
+        "F189": {
+          "text": "SIM-SWVER-01"
+        },
+        "F18A": {
+          "text": "SIMULATOR-LTD"
+        },
+        "F18B": "26 09 06",
+        "F18C": {
+          "text": "SIM-SERIAL-00001"
+        },
+        "F190": {
+          "text": "SIMUDSREFVIN0001X"
+        },
+        "F191": {
+          "text": "SIM-HW-0001"
+        },
+        "F192": {
+          "text": "SIM-SUP-HW-001"
+        },
+        "F193": {
+          "text": "SIM-HW-VER-01"
+        },
+        "F194": {
+          "text": "SIM-SUP-SW-001"
+        },
+        "F195": {
+          "text": "SIM-SW-VER-01"
+        },
+        "F197": {
+          "text": "UDS Reference ECU"
+        },
+        "F19E": {
+          "text": "SIM-ODX-FILE-01"
+        },
+        "F1A0": "01 02 03 04"
+      },
+      "dtcs": [
+        {
+          "code": "P0805-11",
+          "status": "activeConfirmedWithLamp"
+        },
+        {
+          "code": "P0171-00",
+          "status": "historyConfirmed"
+        },
+        {
+          "code": "C0031-00",
+          "status": "neverTested"
+        }
+      ],
+      "security": [
+        {
+          "requestSeed": "01",
+          "seed": "11 22 33 44",
+          "key": "AA BB CC DD"
+        },
+        {
+          "requestSeed": "03",
+          "seed": "55 66 77 88",
+          "key": "EE FF 00 11"
+        },
+        {
+          "requestSeed": "11",
+          "seed": "DE AD BE EF",
+          "key": "CA FE BA BE"
+        }
+      ],
+      "timing": {
+        "p2Ms": 50,
+        "p2StarMs": 5000,
+        "p4Ms": 30000
+      },
+      "responses": [
+        {
+          "request": "10 04",
+          "response": "50 04 00 32 01 F4",
+          "note": "safetySystemDiagnosticSession. The plugin tracks sessions 01/02/03 itself; this adds the fourth. P2=50ms, P2*=5000ms in the standard's 1ms/10ms resolutions."
+        },
+        {
+          "request": "11 04",
+          "response": "51 04 14",
+          "note": "enableRapidPowerShutDown. The extra byte is powerDownTime in seconds (0x14 = 20)."
+        },
+        {
+          "request": "11 05",
+          "response": "51 05",
+          "note": "disableRapidPowerShutDown."
+        },
+        {
+          "request": "14 ** ** **",
+          "response": "54",
+          "note": "Clear by 3-byte groupOfDTC. FFFFFF is 'all groups'. The simulator acknowledges but does not actually clear stored DTCs \u2014 see the note in the samples README."
+        },
+        {
+          "request": "19 01 **",
+          "response": "59 01 FF 00 02",
+          "note": "reportNumberOfDTCByStatusMask: availability mask, DTCFormatIdentifier 00 (SAE J2012-DA), count."
+        },
+        {
+          "request": "19 03",
+          "response": "59 03 08 05 11 01 08 05 11 02",
+          "note": "reportDTCSnapshotIdentification: DTC + snapshot record number for each stored snapshot."
+        },
+        {
+          "request": "19 04 ** ** ** **",
+          "response": "59 04 08 05 11 2F 01 02 F1 90 01 02 03",
+          "matchTrailingBytes": true,
+          "note": "reportDTCSnapshotRecordByDTCNumber: DTC, status, record number, identifier count, then DID data."
+        },
+        {
+          "request": "19 05 **",
+          "response": "59 05 01 08 05 11 2F 01 F1 90 01 02 03",
+          "note": "reportDTCStoredDataByRecordNumber."
+        },
+        {
+          "request": "19 06 ** ** ** **",
+          "response": "59 06 08 05 11 2F 10 01 07",
+          "matchTrailingBytes": true,
+          "note": "reportDTCExtDataRecordByDTCNumber: extended record 0x10 with an occurrence counter."
+        },
+        {
+          "request": "19 07 ** **",
+          "response": "59 07 FF 00 01",
+          "note": "reportNumberOfDTCBySeverityMaskRecord."
+        },
+        {
+          "request": "19 08 ** **",
+          "response": "59 08 FF 20 08 05 11 2F",
+          "note": "reportDTCBySeverityMaskRecord: severity, then DTC and status."
+        },
+        {
+          "request": "19 09 ** ** **",
+          "response": "59 09 FF 20 01 08 05 11 2F",
+          "note": "reportSeverityInformationOfDTC: severity and functional unit for one DTC."
+        },
+        {
+          "request": "19 0A",
+          "response": "59 0A FF 08 05 11 2F 01 71 00 28 40 31 00 50",
+          "note": "reportSupportedDTC: every DTC this ECU can ever report, with its current status."
+        },
+        {
+          "request": "19 0B",
+          "response": "59 0B FF 08 05 11 2F",
+          "note": "reportFirstTestFailedDTC."
+        },
+        {
+          "request": "19 0C",
+          "response": "59 0C FF 08 05 11 2F",
+          "note": "reportFirstConfirmedDTC."
+        },
+        {
+          "request": "19 0D",
+          "response": "59 0D FF 01 71 00 28",
+          "note": "reportMostRecentTestFailedDTC."
+        },
+        {
+          "request": "19 0E",
+          "response": "59 0E FF 08 05 11 2F",
+          "note": "reportMostRecentConfirmedDTC."
+        },
+        {
+          "request": "19 0F **",
+          "response": "59 0F FF 08 05 11 28",
+          "note": "reportMirrorMemoryDTCByStatusMask."
+        },
+        {
+          "request": "19 10 ** ** ** **",
+          "response": "59 10 08 05 11 28 10 01 03",
+          "matchTrailingBytes": true,
+          "note": "reportMirrorMemoryDTCExtDataRecordByDTCNumber."
+        },
+        {
+          "request": "19 11 **",
+          "response": "59 11 FF 00 01",
+          "note": "reportNumberOfMirrorMemoryDTCByStatusMask."
+        },
+        {
+          "request": "19 12 **",
+          "response": "59 12 FF 00 01",
+          "note": "reportNumberOfEmissionsOBDDTCByStatusMask."
+        },
+        {
+          "request": "19 13 **",
+          "response": "59 13 FF 01 71 00 28",
+          "note": "reportEmissionsOBDDTCByStatusMask."
+        },
+        {
+          "request": "19 14",
+          "response": "59 14 08 05 11 7F",
+          "note": "reportDTCFaultDetectionCounter: DTC then a signed counter."
+        },
+        {
+          "request": "19 15",
+          "response": "59 15 FF 40 31 00 50",
+          "note": "reportDTCWithPermanentStatus."
+        },
+        {
+          "request": "19 16 **",
+          "response": "59 16 08 05 11 2F 10 01 07",
+          "matchTrailingBytes": true,
+          "note": "reportDTCExtDataRecordByRecordNumber."
+        },
+        {
+          "request": "19 17 ** ** ** **",
+          "response": "59 17 00 FF 08 05 11 2F",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 1,
+              "responseOffset": 2
+            }
+          ],
+          "note": "reportUserDefMemoryDTCByStatusMask; the memory selection is echoed back."
+        },
+        {
+          "request": "19 18 ** ** ** ** **",
+          "response": "59 18 00 08 05 11 2F 01 02 F1 90 01 02 03",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 1,
+              "responseOffset": 2
+            }
+          ],
+          "note": "reportUserDefMemoryDTCSnapshotRecordByDTCNumber."
+        },
+        {
+          "request": "19 19 ** ** ** ** **",
+          "response": "59 19 00 08 05 11 2F 10 01 07",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 1,
+              "responseOffset": 2
+            }
+          ],
+          "note": "reportUserDefMemoryDTCExtDataRecordByDTCNumber."
+        },
+        {
+          "request": "19 1A **",
+          "response": "59 1A FF 10 11",
+          "note": "reportSupportedDTCExtDataRecord."
+        },
+        {
+          "request": "19 42 ** ** **",
+          "response": "59 42 00 00 FF FF 08 05 11 2F 20",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 1,
+              "responseOffset": 2
+            }
+          ],
+          "note": "reportWWHOBDDTCByMaskRecord; the functional group identifier is echoed back."
+        },
+        {
+          "request": "19 55 **",
+          "response": "59 55 00 00 FF FF 40 31 00 50",
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 1,
+              "responseOffset": 2
+            }
+          ],
+          "note": "reportWWHOBDDTCWithPermanentStatus."
+        },
+        {
+          "request": "19 56 ** **",
+          "response": "59 56 00 FF 08 05 11 2F",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 1,
+              "responseOffset": 2
+            }
+          ],
+          "note": "reportDTCInformationByDTCReadinessGroupIdentifier."
+        },
+        {
+          "request": "23 14 ** ** ** ** **",
+          "response": "63 AA BB CC DD",
+          "matchTrailingBytes": true,
+          "note": "addressAndLengthFormatIdentifier 0x14: 4 address bytes, 1 length byte."
+        },
+        {
+          "request": "24 ** **",
+          "response": "64 00 00 11 01",
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 2,
+              "responseOffset": 1
+            }
+          ],
+          "note": "Scaling for any DID: one unsigned-numeric byte. The DID is echoed back."
+        },
+        {
+          "request": "28 00 **",
+          "response": "68 00",
+          "note": "enableRxAndTx."
+        },
+        {
+          "request": "28 01 **",
+          "response": "68 01",
+          "note": "enableRxAndDisableTx."
+        },
+        {
+          "request": "28 02 **",
+          "response": "68 02",
+          "note": "disableRxAndEnableTx."
+        },
+        {
+          "request": "28 03 **",
+          "response": "68 03",
+          "note": "disableRxAndTx."
+        },
+        {
+          "request": "28 04 ** ** **",
+          "response": "68 04",
+          "note": "enableRxAndDisableTxWithEnhancedAddressInformation."
+        },
+        {
+          "request": "28 05 ** ** **",
+          "response": "68 05",
+          "note": "enableRxAndTxWithEnhancedAddressInformation."
+        },
+        {
+          "request": "29 00",
+          "response": "69 00 00",
+          "note": "deAuthenticate; returnValue 00 = request accepted."
+        },
+        {
+          "request": "29 01",
+          "response": "69 01 11 00 04 CA FE BA BE 00 00",
+          "matchTrailingBytes": true,
+          "note": "verifyCertificateUnidirectional."
+        },
+        {
+          "request": "29 02",
+          "response": "69 02 11 00 04 CA FE BA BE 00 04 12 34 56 78",
+          "matchTrailingBytes": true,
+          "note": "verifyCertificateBidirectional."
+        },
+        {
+          "request": "29 03",
+          "response": "69 03 12 00 00",
+          "matchTrailingBytes": true,
+          "note": "proofOfOwnership."
+        },
+        {
+          "request": "29 04",
+          "response": "69 04 13 00 00",
+          "matchTrailingBytes": true,
+          "note": "transmitCertificate."
+        },
+        {
+          "request": "29 05",
+          "response": "69 05 14 00 04 DE AD BE EF 00 00",
+          "matchTrailingBytes": true,
+          "note": "requestChallengeForAuthentication."
+        },
+        {
+          "request": "29 06",
+          "response": "69 06 15 00 00",
+          "matchTrailingBytes": true,
+          "note": "verifyProofOfOwnershipUnidirectional."
+        },
+        {
+          "request": "29 07",
+          "response": "69 07 16 00 00",
+          "matchTrailingBytes": true,
+          "note": "verifyProofOfOwnershipBidirectional."
+        },
+        {
+          "request": "29 08",
+          "response": "69 08 17 01 02",
+          "note": "authenticationConfiguration; 02 = certificate-based (ACR)."
+        },
+        {
+          "request": "2A 01 **",
+          "response": "6A",
+          "matchTrailingBytes": true,
+          "note": "transmissionMode slowRate. A real ECU then sends periodic data on its own; the simulator only acknowledges."
+        },
+        {
+          "request": "2A 02 **",
+          "response": "6A",
+          "matchTrailingBytes": true,
+          "note": "transmissionMode mediumRate. A real ECU then sends periodic data on its own; the simulator only acknowledges."
+        },
+        {
+          "request": "2A 03 **",
+          "response": "6A",
+          "matchTrailingBytes": true,
+          "note": "transmissionMode fastRate. A real ECU then sends periodic data on its own; the simulator only acknowledges."
+        },
+        {
+          "request": "2A 04",
+          "response": "6A",
+          "matchTrailingBytes": true,
+          "note": "stopSending."
+        },
+        {
+          "request": "2C 01 ** **",
+          "response": "6C 01 00 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 2,
+              "responseOffset": 2
+            }
+          ],
+          "note": "defineByIdentifier; the dynamic DID is echoed back."
+        },
+        {
+          "request": "2C 02 ** **",
+          "response": "6C 02 00 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 2,
+              "responseOffset": 2
+            }
+          ],
+          "note": "defineByMemoryAddress."
+        },
+        {
+          "request": "2C 03 ** **",
+          "response": "6C 03 00 00",
+          "echo": [
+            {
+              "requestOffset": 2,
+              "length": 2,
+              "responseOffset": 2
+            }
+          ],
+          "note": "clearDynamicallyDefinedDataIdentifier."
+        },
+        {
+          "request": "2C 03",
+          "response": "6C 03",
+          "note": "clearDynamicallyDefinedDataIdentifier for every dynamic DID at once."
+        },
+        {
+          "request": "2E ** **",
+          "response": "6E 00 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 2,
+              "responseOffset": 1
+            }
+          ],
+          "note": "Accept a write to any DID and echo the identifier, as ISO 14229-1 requires. The simulator does not store the value \u2014 reading the DID back returns what the model already held."
+        },
+        {
+          "request": "2F ** ** 00",
+          "response": "6F 00 00 00 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 2,
+              "responseOffset": 1
+            }
+          ],
+          "note": "inputOutputControlParameter returnControlToECU."
+        },
+        {
+          "request": "2F ** ** 01",
+          "response": "6F 00 00 01 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 2,
+              "responseOffset": 1
+            }
+          ],
+          "note": "inputOutputControlParameter resetToDefault."
+        },
+        {
+          "request": "2F ** ** 02",
+          "response": "6F 00 00 02 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 2,
+              "responseOffset": 1
+            }
+          ],
+          "note": "inputOutputControlParameter freezeCurrentState."
+        },
+        {
+          "request": "2F ** ** 03",
+          "response": "6F 00 00 03 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 2,
+              "responseOffset": 1
+            }
+          ],
+          "note": "inputOutputControlParameter shortTermAdjustment."
+        },
+        {
+          "request": "34 00 44",
+          "response": "74 20 10 00",
+          "matchTrailingBytes": true,
+          "note": "dataFormatIdentifier 00 (no compression/encryption), addressAndLengthFormatIdentifier 0x44. lengthFormatIdentifier 0x20 then maxNumberOfBlockLength 0x1000."
+        },
+        {
+          "request": "35 00 44",
+          "response": "75 20 10 00",
+          "matchTrailingBytes": true,
+          "note": "RequestUpload, same shape as RequestDownload."
+        },
+        {
+          "request": "36 **",
+          "response": "76 00",
+          "matchTrailingBytes": true,
+          "echo": [
+            {
+              "requestOffset": 1,
+              "length": 1,
+              "responseOffset": 1
+            }
+          ],
+          "note": "Any block sequence counter, echoed back as ISO 14229-1 requires. A tester that checks its own counter will see it agree."
+        },
+        {
+          "request": "37",
+          "response": "77",
+          "note": "RequestTransferExit with no transferResponseParameterRecord."
+        },
+        {
+          "request": "38 01",
+          "response": "78 01 02 00 02 00 00 00",
+          "matchTrailingBytes": true,
+          "note": "modeOfOperation AddFile."
+        },
+        {
+          "request": "38 02",
+          "response": "78 02",
+          "matchTrailingBytes": true,
+          "note": "modeOfOperation DeleteFile."
+        },
+        {
+          "request": "38 03",
+          "response": "78 03 02 00 02 00 00 00",
+          "matchTrailingBytes": true,
+          "note": "modeOfOperation ReplaceFile."
+        },
+        {
+          "request": "38 04",
+          "response": "78 04 02 00 02 00 00 00 00",
+          "matchTrailingBytes": true,
+          "note": "modeOfOperation ReadFile."
+        },
+        {
+          "request": "38 05",
+          "response": "78 05 02 00 02 00 00 00",
+          "matchTrailingBytes": true,
+          "note": "modeOfOperation ReadDir."
+        },
+        {
+          "request": "3D 14",
+          "response": "7D 14",
+          "matchTrailingBytes": true,
+          "note": "addressAndLengthFormatIdentifier is echoed in the response."
+        },
+        {
+          "request": "83 01",
+          "response": "C3 01 00 32 01 F4",
+          "note": "readExtendedTimingParameterSet."
+        },
+        {
+          "request": "83 02",
+          "response": "C3 02",
+          "note": "setTimingParametersToDefaultValues."
+        },
+        {
+          "request": "83 03",
+          "response": "C3 03 00 32 01 F4",
+          "note": "readCurrentlyActiveTimingParameters."
+        },
+        {
+          "request": "83 04",
+          "response": "C3 04",
+          "matchTrailingBytes": true,
+          "note": "setTimingParametersToGivenValues."
+        },
+        {
+          "request": "84",
+          "response": "C4 00",
+          "matchTrailingBytes": true,
+          "note": "SecuredDataTransmission; the payload is an encapsulated request."
+        },
+        {
+          "request": "85 01",
+          "response": "C5 01",
+          "note": "DTCSettingType on: the ECU resumes updating DTC status."
+        },
+        {
+          "request": "85 02",
+          "response": "C5 02",
+          "note": "DTCSettingType off, used while flashing so the work does not set faults."
+        },
+        {
+          "request": "86 00",
+          "response": "C6 00 00",
+          "matchTrailingBytes": true,
+          "note": "stopResponseOnEvent."
+        },
+        {
+          "request": "86 01",
+          "response": "C6 01 01",
+          "matchTrailingBytes": true,
+          "note": "onDTCStatusChange."
+        },
+        {
+          "request": "86 02",
+          "response": "C6 02 01",
+          "matchTrailingBytes": true,
+          "note": "onTimerInterrupt."
+        },
+        {
+          "request": "86 03",
+          "response": "C6 03 01",
+          "matchTrailingBytes": true,
+          "note": "onChangeOfDataIdentifier."
+        },
+        {
+          "request": "86 04",
+          "response": "C6 04 01 01 19 02 FF",
+          "matchTrailingBytes": true,
+          "note": "reportActivatedEvents."
+        },
+        {
+          "request": "86 05",
+          "response": "C6 05 01",
+          "matchTrailingBytes": true,
+          "note": "startResponseOnEvent."
+        },
+        {
+          "request": "86 06",
+          "response": "C6 06 00",
+          "matchTrailingBytes": true,
+          "note": "clearResponseOnEvent."
+        },
+        {
+          "request": "86 07",
+          "response": "C6 07 01",
+          "matchTrailingBytes": true,
+          "note": "onComparisonOfValues."
+        },
+        {
+          "request": "86 08",
+          "response": "C6 08 01",
+          "matchTrailingBytes": true,
+          "note": "reportMostRecentDtcOnStatusChange."
+        },
+        {
+          "request": "86 09",
+          "response": "C6 09 01",
+          "matchTrailingBytes": true,
+          "note": "reportDTCRecordInformationOnDtcStatusChange."
+        },
+        {
+          "request": "87 01 **",
+          "response": "C7 01",
+          "note": "verifyModeTransitionWithFixedParameter."
+        },
+        {
+          "request": "87 02 ** ** **",
+          "response": "C7 02",
+          "note": "verifyModeTransitionWithSpecificParameter."
+        },
+        {
+          "request": "87 03",
+          "response": "C7 03",
+          "note": "transitionMode."
+        }
+      ]
+    },
+    {
+      "name": "Minimal ECU",
+      "network": "diag",
+      "can": {
+        "request": "0x7E1",
+        "response": "0x7E9",
+        "functional": "0x7DF"
+      },
+      "sessions": [
+        "default",
+        "extended"
+      ],
+      "dids": {
+        "F18C": {
+          "text": "SIM-MINIMAL-0001"
+        }
+      }
+    }
+  ]
+}

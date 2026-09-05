@@ -15,8 +15,8 @@ pub mod dto;
 pub mod encode;
 
 use core_domain::model::{
-    CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode, Ecu, EcuTiming, Network,
-    NetworkKind, OverrideAction, ResponseOverride, SecurityLevel, SessionType, Vehicle,
+    CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode, EchoSpan, Ecu, EcuTiming,
+    Network, NetworkKind, OverrideAction, ResponseOverride, SecurityLevel, SessionType, Vehicle,
 };
 use core_domain::Confidence;
 
@@ -661,7 +661,20 @@ fn BuildOverrides(
             })?;
 
         let action = match &dto.response {
-            None => OverrideAction::Suppress,
+            None => {
+                // Silence carries nothing to echo into, so asking for an echo here is a
+                // misunderstanding worth naming rather than ignoring.
+                if !dto.echo.is_empty() {
+                    return Err(SimFileError::BadField {
+                        strWhere: strWhere.to_string(),
+                        strReason: format!(
+                            "response for '{}': echo spans were given but there is no response to copy them into",
+                            dto.request
+                        ),
+                    });
+                }
+                OverrideAction::Suppress
+            }
             Some(strResponse) => OverrideAction::Substitute {
                 m_vecResponse: ParseHexBytes(strResponse).map_err(|strReason| {
                     SimFileError::BadField {
@@ -669,14 +682,22 @@ fn BuildOverrides(
                         strReason: format!("response for '{}': {strReason}", dto.request),
                     }
                 })?,
-                m_vecEchoSpans: Vec::new(),
+                m_vecEchoSpans: dto
+                    .echo
+                    .iter()
+                    .map(|span| EchoSpan {
+                        m_uRequestOffset: span.request_offset,
+                        m_uLength: span.length,
+                        m_uResponseOffset: span.response_offset,
+                    })
+                    .collect(),
             },
         };
 
         let overrideRule = ResponseOverride {
             m_vecRequestPattern: vecPattern,
             m_vecRequestMask: vecMask,
-            m_bMatchTrailingBytes: false,
+            m_bMatchTrailingBytes: dto.match_trailing_bytes,
             m_action: action,
             m_bIsEnabled: true,
             m_bRespondEvenIfSuppressed: false,

@@ -146,3 +146,74 @@ which sits on the link the tester is plugged into, keeps answering. The request 
 
 The same switch is on the ECU cards in the Simulate tab and in the Topology tab's list view; all
 three make the same call.
+
+
+## `uds-superset.simfile.json` — every UDS service, answering
+
+The other samples describe plausible vehicles. This one is a **reference**: one ECU that answers
+every service ISO 14229-1 defines, so a tester, a script or a CI suite has something complete to
+work against.
+
+All 27 services answer:
+
+| | | | |
+|---|---|---|---|
+| `10` DiagnosticSessionControl | `11` ECUReset | `14` ClearDiagnosticInformation | `19` ReadDTCInformation |
+| `22` ReadDataByIdentifier | `23` ReadMemoryByAddress | `24` ReadScalingDataByIdentifier | `27` SecurityAccess |
+| `28` CommunicationControl | `29` Authentication | `2A` ReadDataByPeriodicIdentifier | `2C` DynamicallyDefineDataIdentifier |
+| `2E` WriteDataByIdentifier | `2F` InputOutputControlByIdentifier | `31` RoutineControl | `34` RequestDownload |
+| `35` RequestUpload | `36` TransferData | `37` RequestTransferExit | `38` RequestFileTransfer |
+| `3D` WriteMemoryByAddress | `3E` TesterPresent | `83` AccessTimingParameter | `84` SecuredDataTransmission |
+| `85` ControlDTCSetting | `86` ResponseOnEvent | `87` LinkControl | |
+
+…and every sub-function they define — including all 29 sub-functions of `0x19`
+ReadDTCInformation, of which the engine's UDS plugin implements exactly one.
+
+### What the plugin does, and what the file does
+
+Worth being precise about, because it decides which parts are *stateful*:
+
+- **`10`, `11`, `22`, `27`, `31`, `3E` and `19 02` are the plugin's.** They are deliberately
+  **not** overridden, because they hold real state: `10` actually changes session, `27` actually
+  hands out the configured seed and checks the key, `22` reads this ECU's real DID map, `19 02`
+  reports its real DTC list. Overriding those would replace a working ECU with a tape recording.
+- **Everything else is an override in this file.** Those services are not implemented by the
+  engine, so the answer is canned — correct in shape, and fixed in content.
+
+So `27 01` is refused in the default session and grants a seed in the extended one, exactly as a
+real ECU does. That is not a gap in the sample; a sample that handed out seeds in the default
+session would teach a tester the wrong lesson.
+
+### Two things this needed from the format
+
+Both existed in the engine already and were simply not reachable from a simfile:
+
+- **`matchTrailingBytes`** — treat the pattern as a prefix and accept anything longer. Without
+  it an override matches one exact length, so `2E` could be simulated for a three-byte value and
+  nothing else. `36` TransferData, `23`, `31`, `34` and `84` all need it.
+- **`echo`** — copy runs of request bytes into the response. Real positive responses echo part
+  of the request: the DID in a `6E`, the block sequence counter in a `76`, the memory selection
+  in a `59 17`. A wildcard override without echo answers every request with one hard-coded
+  value, which a tester checking its own echo catches immediately.
+
+```json
+{
+  "request": "2E ** **",
+  "response": "6E 00 00",
+  "matchTrailingBytes": true,
+  "echo": [{ "requestOffset": 1, "length": 2, "responseOffset": 1 }],
+  "note": "Accept a write to any DID and echo the identifier back."
+}
+```
+
+The `00 00` in the response is a placeholder the echo overwrites — a response is literal bytes,
+and only the *request* pattern may carry `**`.
+
+### What it does not do
+
+The canned services acknowledge without acting. `14` ClearDiagnosticInformation answers `54` but
+does not clear the DTC list; `2E` answers `6E` with the right DID but does not store the value,
+so reading it back returns what the model already held; `2A` acknowledges a periodic request but
+nothing is then transmitted periodically. Each is an answer of the right shape, which is what
+makes it useful for exercising a tester's parsing, timing and error handling — and not a
+substitute for the service being implemented.

@@ -228,7 +228,39 @@ pub struct ResponseDto {
     /// The bytes to answer with. Left out means answer with silence.
     #[serde(default)]
     pub response: Option<String>,
+    /// Treat `request` as a prefix and accept anything longer.
+    ///
+    /// Off by default, so a pattern matches only a request of exactly its length — which is
+    /// what you want for a fixed-shape request like `3E 00`. Turn it on for the services whose
+    /// length is not fixed: `2E` carries a value of any size, `36` a block of any size, `31`
+    /// may carry routine parameters. Without it those can only ever be answered for one
+    /// particular length, which is not a simulation of the service at all.
+    #[serde(default)]
+    pub match_trailing_bytes: bool,
+    /// Runs of request bytes copied into the response after it is built.
+    ///
+    /// Real positive responses echo parts of the request — the DID in a `0x6E`, the block
+    /// sequence counter in a `0x76`, the routine identifier in a `0x71`. With a wildcard
+    /// pattern the response would otherwise have to hard-code one value and answer every
+    /// request with it, which a tester checking its own echo will catch immediately.
+    #[serde(default)]
+    pub echo: Vec<EchoSpanDto>,
     /// Why this answer exists, for whoever reads the file next.
     #[serde(default)]
     pub note: String,
+}
+
+/// One run of request bytes copied into the response.
+///
+/// Named to match the same concept on the HTTP boundary and in the UI, so the three describe
+/// one thing in one vocabulary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EchoSpanDto {
+    /// Where the run starts in the request, counting the service identifier as byte 0.
+    pub request_offset: usize,
+    /// How many bytes to copy.
+    pub length: usize,
+    /// Where the run lands in the response, counting its service identifier as byte 0.
+    pub response_offset: usize,
 }
