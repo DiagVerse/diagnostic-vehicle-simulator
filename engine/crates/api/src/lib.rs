@@ -65,6 +65,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(simulation::PostSimulationRequest),
         )
         .route("/simulation/reset", post(simulation::PostSimulationReset))
+        .route("/simulation/topology", get(simulation::GetTopology))
         .route("/simulation/vehicle", post(simulation::PostCreateVehicle))
         .route("/simulation/ecus", post(simulation::PostAddEcu))
         .route(
@@ -77,6 +78,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // axum 0.7 path parameters are `:name`; `{name}` would be matched as a literal
         // segment, so the route would silently never match.
+        .route(
+            "/simulation/ecus/:requestCanIdHex/overrides",
+            get(simulation::GetEcuOverrides).put(simulation::PutEcuOverrides),
+        )
         .route(
             "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),

@@ -12,6 +12,7 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ::simulation::{RoutedResponse, RoutingOutcome, SimulationService};
@@ -21,7 +22,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use core_domain::model::{CanAddress, CanAddressingMode, Ecu, EcuTiming, SessionType};
+use core_domain::model::{
+    CanAddress, CanAddressingMode, EchoSpan, Ecu, EcuTiming, OverrideAction, ResponseOverride,
+    SessionType,
+};
 use core_domain::Confidence;
 use ecu::schedule::ScheduledResponse;
 use ecu::VirtualEcu;
@@ -34,6 +38,10 @@ use crate::AppState;
 /// Longest CAN log accepted in one upload (characters). A log is pasted or uploaded by a
 /// human; anything larger is a mistake or an attempt to exhaust the engine's memory.
 const c_uMaxLogTextChars: usize = 8 * 1024 * 1024;
+
+/// The single link the topology view can honestly draw today: everything reachable through one
+/// tester connection. A real `Network` type in the model is what would let there be more.
+const c_strDiagnosticLinkId: &str = "diagnostic-link";
 
 /// An error returned to the caller as a JSON body with a non-2xx status.
 pub struct ApiError {
@@ -207,6 +215,58 @@ pub struct SimulationResponseDto {
     /// still sent, but the engine does not present them as conformant.
     pub iso_conformant: bool,
     pub conformance_warnings: Vec<String>,
+}
+
+/// One user-defined answer, as the UI reads and writes it. Bytes travel as hex strings, the
+/// same way every other request and response in this API does.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseOverrideDto {
+    /// The request bytes to match, e.g. "22 F1 90".
+    pub request_hex: String,
+    /// One mask byte per pattern byte; "FF" means the byte must match, "00" means any value.
+    /// Omitted means "match every byte exactly".
+    #[serde(default)]
+    pub mask_hex: Option<String>,
+    /// Treat the pattern as a prefix, for requests with a variable tail.
+    #[serde(default)]
+    pub match_trailing_bytes: bool,
+    /// "substitute" or "suppress".
+    pub action: String,
+    /// The response bytes, for a substituting override.
+    #[serde(default)]
+    pub response_hex: Option<String>,
+    /// Runs of the request to copy into the response, so a wildcard override still echoes the
+    /// identifier it was asked for.
+    #[serde(default)]
+    pub echo_spans: Vec<EchoSpanDto>,
+    #[serde(default = "TrueByDefault")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub respond_even_if_suppressed: bool,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// A run of request bytes copied into the response.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct EchoSpanDto {
+    pub request_offset: usize,
+    pub length: usize,
+    pub response_offset: usize,
+}
+
+/// An override with no `enabled` field is on: the caller just created it.
+fn TrueByDefault() -> bool {
+    true
+}
+
+/// Request body for replacing an ECU's overrides.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOverridesBody {
+    pub overrides: Vec<ResponseOverrideDto>,
 }
 
 /// An ECU's timing parameters, as the UI reads and writes them.
@@ -535,6 +595,300 @@ pub async fn PutEcuName(
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// A link in the topology view.
+///
+/// Deliberately **not** called a bus. A tester-side capture has one vantage point — the
+/// diagnostic connector — and frames from an ECU behind a gateway arrive there with nothing to
+/// distinguish them from local traffic. Appearing in one capture proves the ECUs are reachable
+/// through the same tester connection, not that they share a wire.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyLinkDto {
+    pub id: String,
+    pub label: String,
+    /// "CAN", "CAN-FD" or "Ethernet". Only what the model can support.
+    pub kind: String,
+    /// Broadcast identifiers a tester can address on this link.
+    pub functional_can_ids_hex: Vec<String>,
+    /// How confidently the membership of this link is known. Never `Observed` for a link
+    /// derived from a capture, because a capture cannot observe bus membership.
+    pub membership_confidence: String,
+}
+
+/// One node hanging off a link.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyNodeDto {
+    pub id: String,
+    pub label: String,
+    /// "ecu" or "tester".
+    pub kind: String,
+    pub link_id: Option<String>,
+    pub request_can_id_hex: Option<String>,
+    pub response_can_id_hex: Option<String>,
+    pub addressing_mode: Option<String>,
+    /// How the identifier pair was established — rendered so an inferred pair is visibly
+    /// weaker than an observed one.
+    pub address_confidence: Option<String>,
+    /// True when the ECU is in the model but cannot be reached on CAN.
+    pub is_unreachable: bool,
+}
+
+/// The diagram, plus the caveats that belong next to it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyDto {
+    pub vehicle_name: Option<String>,
+    pub links: Vec<TopologyLinkDto>,
+    pub nodes: Vec<TopologyNodeDto>,
+    /// What this diagram does not know, in the user's words rather than a footnote nobody
+    /// reads. A picture that looks authoritative and is not is worse than no picture.
+    pub caveats: Vec<String>,
+}
+
+/// GET /simulation/topology — how the loaded vehicle is wired, as far as anything knows.
+pub async fn GetTopology(State(state): State<Arc<AppState>>) -> Json<TopologyDto> {
+    let simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    Json(BuildTopologyDto(&simulation))
+}
+
+/// Derive the diagram from the running ECUs.
+///
+/// The model has no `Network` type yet, so there is exactly one link and it is honest about
+/// being a reachability set rather than a bus.
+fn BuildTopologyDto(simulation: &SimulationService) -> TopologyDto {
+    let vecEcus: Vec<&VirtualEcu> = simulation
+        .RunningEcus()
+        .map(|(_, runningEcu)| runningEcu)
+        .collect();
+
+    if vecEcus.is_empty() {
+        return TopologyDto {
+            vehicle_name: simulation
+                .Vehicle()
+                .map(|vehicle| vehicle.m_strName.clone()),
+            links: Vec::new(),
+            nodes: Vec::new(),
+            caveats: Vec::new(),
+        };
+    }
+
+    let mut setFunctionalIds: BTreeSet<u32> = BTreeSet::new();
+    let mut vecNodes = vec![TopologyNodeDto {
+        id: "tester".to_string(),
+        label: "Tester".to_string(),
+        kind: "tester".to_string(),
+        link_id: Some(c_strDiagnosticLinkId.to_string()),
+        request_can_id_hex: None,
+        response_can_id_hex: None,
+        addressing_mode: None,
+        address_confidence: None,
+        is_unreachable: false,
+    }];
+
+    for runningEcu in &vecEcus {
+        let config = runningEcu.Config();
+        let address = config
+            .m_optCanAddress
+            .expect("a started ECU always has a CAN address");
+        if let Some(u32FunctionalCanId) = address.m_optU32FunctionalCanId {
+            setFunctionalIds.insert(u32FunctionalCanId);
+        }
+
+        vecNodes.push(TopologyNodeDto {
+            id: FormatCanId(address.m_u32RequestCanId),
+            label: config.m_strName.clone(),
+            kind: "ecu".to_string(),
+            link_id: Some(c_strDiagnosticLinkId.to_string()),
+            request_can_id_hex: Some(FormatCanId(address.m_u32RequestCanId)),
+            response_can_id_hex: Some(FormatCanId(address.m_u32ResponseCanId)),
+            addressing_mode: Some(AddressingModeName(address.m_addressingMode)),
+            address_confidence: Some(ConfidenceName(address.m_confidence)),
+            is_unreachable: false,
+        });
+    }
+
+    let link = TopologyLinkDto {
+        id: c_strDiagnosticLinkId.to_string(),
+        label: "Diagnostic link, as captured".to_string(),
+        kind: "CAN".to_string(),
+        functional_can_ids_hex: setFunctionalIds.iter().copied().map(FormatCanId).collect(),
+        // A capture cannot observe bus membership, and a hand-built model has not been asked
+        // about it, so the strongest honest claim is that these ECUs were reached together.
+        membership_confidence: ConfidenceName(Confidence::Inferred),
+    };
+
+    TopologyDto {
+        vehicle_name: simulation
+            .Vehicle()
+            .map(|vehicle| vehicle.m_strName.clone()),
+        links: vec![link],
+        nodes: vecNodes,
+        caveats: BuildTopologyCaveats(&vecEcus),
+    }
+}
+
+/// The things this diagram cannot know, stated plainly.
+fn BuildTopologyCaveats(vecEcus: &[&VirtualEcu]) -> Vec<String> {
+    let mut vecCaveats = vec![
+        "These ECUs were reached through the same tester connection. That does not prove they share a physical bus — an ECU behind a gateway answers on the same connector."
+            .to_string(),
+    ];
+
+    let bHasMixedAddressing = vecEcus.iter().any(|runningEcu| IsExtended(runningEcu))
+        && vecEcus.iter().any(|runningEcu| !IsExtended(runningEcu));
+    if bHasMixedAddressing {
+        vecCaveats.push(
+            "11-bit and 29-bit ECUs are shown together. Identifier width says nothing about bus membership: one CAN segment carries both, and a gateway can present several segments on one connector."
+                .to_string(),
+        );
+    }
+
+    vecCaveats.push(
+        "Only ECUs that answered are here. Bus load, termination, error state and silent nodes are not visible from a tester-side capture."
+            .to_string(),
+    );
+    vecCaveats
+}
+
+/// True when this ECU uses 29-bit addressing.
+fn IsExtended(runningEcu: &VirtualEcu) -> bool {
+    runningEcu
+        .Config()
+        .m_optCanAddress
+        .map(|address| address.IsExtendedId())
+        .unwrap_or(false)
+}
+
+/// GET /simulation/ecus/{requestCanIdHex}/overrides — one ECU's user-defined answers.
+pub async fn GetEcuOverrides(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+) -> Result<Json<Vec<ResponseOverrideDto>>, ApiError> {
+    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    let vecOverrides = simulation
+        .EcuOverridesOf(u32RequestCanId)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(vecOverrides.iter().map(BuildOverrideDto).collect()))
+}
+
+/// PUT /simulation/ecus/{requestCanIdHex}/overrides — replace them.
+///
+/// The whole list is replaced rather than patched, so what the caller sends is exactly what the
+/// ECU ends up with — no reconciling against a list the UI may have a stale copy of.
+pub async fn PutEcuOverrides(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+    Json(body): Json<SetOverridesBody>,
+) -> Result<Json<Vec<ResponseOverrideDto>>, ApiError> {
+    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let mut vecOverrides = Vec::with_capacity(body.overrides.len());
+    for (uIndex, dto) in body.overrides.iter().enumerate() {
+        let overrideRule = BuildOverride(dto)
+            .map_err(|strError| ApiError::BadRequest(format!("override {uIndex}: {strError}")))?;
+        overrideRule
+            .Validate()
+            .map_err(|error| ApiError::BadRequest(format!("override {uIndex}: {error}")))?;
+        vecOverrides.push(overrideRule);
+    }
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .SetEcuOverrides(u32RequestCanId, vecOverrides)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    let vecStored = simulation
+        .EcuOverridesOf(u32RequestCanId)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+    Ok(Json(vecStored.iter().map(BuildOverrideDto).collect()))
+}
+
+/// Serialize one override for the UI.
+fn BuildOverrideDto(overrideRule: &ResponseOverride) -> ResponseOverrideDto {
+    let (strAction, optResponseHex, vecEchoSpans) = match &overrideRule.m_action {
+        OverrideAction::Suppress => ("suppress".to_string(), None, Vec::new()),
+        OverrideAction::Substitute {
+            m_vecResponse,
+            m_vecEchoSpans,
+        } => (
+            "substitute".to_string(),
+            Some(FormatHex(m_vecResponse)),
+            m_vecEchoSpans
+                .iter()
+                .map(|span| EchoSpanDto {
+                    request_offset: span.m_uRequestOffset,
+                    length: span.m_uLength,
+                    response_offset: span.m_uResponseOffset,
+                })
+                .collect(),
+        ),
+    };
+
+    ResponseOverrideDto {
+        request_hex: FormatHex(&overrideRule.m_vecRequestPattern),
+        mask_hex: Some(FormatHex(&overrideRule.m_vecRequestMask)),
+        match_trailing_bytes: overrideRule.m_bMatchTrailingBytes,
+        action: strAction,
+        response_hex: optResponseHex,
+        echo_spans: vecEchoSpans,
+        enabled: overrideRule.m_bIsEnabled,
+        respond_even_if_suppressed: overrideRule.m_bRespondEvenIfSuppressed,
+        note: overrideRule.m_strNote.clone(),
+    }
+}
+
+/// Read one override from a request body. Shape errors are reported here; whether the override
+/// could be a real exchange is decided by the domain type's own validation.
+fn BuildOverride(dto: &ResponseOverrideDto) -> Result<ResponseOverride, String> {
+    let vecPattern = ParseHex(&dto.request_hex)?;
+
+    let vecMask = match &dto.mask_hex {
+        Some(strMask) => ParseHex(strMask)?,
+        None => vec![0xFF; vecPattern.len()],
+    };
+
+    let action = match dto.action.as_str() {
+        "suppress" => OverrideAction::Suppress,
+        "substitute" => {
+            let strResponse = dto
+                .response_hex
+                .as_deref()
+                .ok_or("a substituting override needs responseHex")?;
+            OverrideAction::Substitute {
+                m_vecResponse: ParseHex(strResponse)?,
+                m_vecEchoSpans: dto
+                    .echo_spans
+                    .iter()
+                    .map(|span| EchoSpan {
+                        m_uRequestOffset: span.request_offset,
+                        m_uLength: span.length,
+                        m_uResponseOffset: span.response_offset,
+                    })
+                    .collect(),
+            }
+        }
+        strOther => {
+            return Err(format!(
+                "unknown action '{strOther}'; use substitute or suppress"
+            ))
+        }
+    };
+
+    Ok(ResponseOverride {
+        m_vecRequestPattern: vecPattern,
+        m_vecRequestMask: vecMask,
+        m_bMatchTrailingBytes: dto.match_trailing_bytes,
+        m_action: action,
+        m_bIsEnabled: dto.enabled,
+        m_bRespondEvenIfSuppressed: dto.respond_even_if_suppressed,
+        m_strNote: dto.note.clone(),
+    })
 }
 
 /// Turn a create-ECU request into a domain ECU, rejecting anything that could not be routed.

@@ -118,6 +118,19 @@ impl VirtualEcu {
         self.m_config.m_strName = strName.to_string();
     }
 
+    /// Replace the ECU's response overrides. Configuration only — no diagnostic state changes.
+    pub fn SetResponseOverrides(
+        &mut self,
+        vecOverrides: Vec<core_domain::model::ResponseOverride>,
+    ) {
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            overrides = vecOverrides.len(),
+            "ECU response overrides updated"
+        );
+        self.m_config.m_vecResponseOverrides = vecOverrides;
+    }
+
     /// The ECU's timing parameters.
     pub fn Timing(&self) -> EcuTiming {
         self.m_config.m_timing

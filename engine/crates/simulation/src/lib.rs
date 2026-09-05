@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
-use core_domain::model::{CanAddress, Ecu, EcuTiming, Vehicle};
+use core_domain::model::{CanAddress, Ecu, EcuTiming, ResponseOverride, Vehicle};
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
 
@@ -356,6 +356,44 @@ impl SimulationService {
         }
 
         Ok(())
+    }
+
+    /// Replace one ECU's response overrides.
+    ///
+    /// Written to both the running ECU and the loaded model, so what is simulated and what
+    /// gets serialized cannot drift. The caller validates each override first.
+    pub fn SetEcuOverrides(
+        &mut self,
+        u32RequestCanId: u32,
+        vecOverrides: Vec<ResponseOverride>,
+    ) -> Result<(), SimulationError> {
+        let runningEcu = self
+            .m_mapEcusByRequestId
+            .get_mut(&u32RequestCanId)
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+        runningEcu.SetResponseOverrides(vecOverrides.clone());
+
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            for config in &mut vehicle.m_vecEcus {
+                if IsAddressedOn(config, u32RequestCanId) {
+                    config.m_vecResponseOverrides = vecOverrides;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// One ECU's response overrides.
+    pub fn EcuOverridesOf(
+        &self,
+        u32RequestCanId: u32,
+    ) -> Result<&[ResponseOverride], SimulationError> {
+        self.m_mapEcusByRequestId
+            .get(&u32RequestCanId)
+            .map(|runningEcu| runningEcu.Config().m_vecResponseOverrides.as_slice())
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })
     }
 
     /// Recompute which ECUs listen on each broadcast identifier, after the set of running ECUs
