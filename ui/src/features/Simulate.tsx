@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Badge, DetailRow, PowerSwitch, type BadgeTone } from '../components/primitives'
 import { NEGATIVE_RESPONSES, UDS_CATALOGUE } from './udsCatalogue'
+import { TrafficMonitor } from './TrafficMonitor'
 import {
   api,
   type EcuTiming,
@@ -22,15 +23,6 @@ const QUICK_ACTIONS: { label: string; hex: string }[] = [
   { label: 'Tester Present', hex: '3E 00' },
 ]
 
-/** One sent request and everything it produced, newest first in the exchange log. */
-interface ExchangeEntry {
-  id: number
-  result: SimulationRequestResult
-}
-
-/** How many exchanges to keep on screen before dropping the oldest. */
-const MAX_LOG_ENTRIES = 50
-
 /**
  * Load a CAN log into the engine and drive the reconstructed vehicle: pick the CAN identifier
  * to address, send a UDS request, watch each ECU answer and change state.
@@ -38,12 +30,11 @@ const MAX_LOG_ENTRIES = 50
 export function Simulate() {
   const [state, setState] = useState<SimulationState | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [log, setLog] = useState<ExchangeEntry[]>([])
+  const [lastResult, setLastResult] = useState<SimulationRequestResult | null>(null)
   const [canIdHex, setCanIdHex] = useState('')
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
   const [source, setSource] = useState<VehicleSource>('log')
-  const nextEntryId = useRef(1)
 
   useEffect(() => {
     refreshState()
@@ -71,7 +62,7 @@ export function Simulate() {
     setBusy(true)
     try {
       setState(await api.simulationLoad(logText))
-      setLog([])
+      setLastResult(null)
       setError(null)
     } catch (e) {
       // A rejected log leaves the previously loaded vehicle running, so the view stays usable.
@@ -85,7 +76,7 @@ export function Simulate() {
     setBusy(true)
     try {
       setState(await api.simulationLoadSimFile(fileText))
-      setLog([])
+      setLastResult(null)
       setError(null)
     } catch (e) {
       // A rejected file leaves the previously loaded vehicle running, and the engine's message
@@ -104,7 +95,7 @@ export function Simulate() {
     setBusy(true)
     try {
       const result = await api.simulationRequest(strSelectedCanId, requestHex)
-      setLog((prev) => [{ id: nextEntryId.current++, result }, ...prev].slice(0, MAX_LOG_ENTRIES))
+      setLastResult(result)
       setError(null)
       await refreshState()
     } catch (e) {
@@ -130,7 +121,7 @@ export function Simulate() {
     setBusy(true)
     try {
       setState(await api.simulationReset())
-      setLog([])
+      setLastResult(null)
       setError(null)
     } catch (e) {
       setError(DescribeError(e))
@@ -207,7 +198,8 @@ export function Simulate() {
               onError={setError}
               busy={busy}
             />
-            <ExchangeLog log={log} />
+            {lastResult && <LastExchangeDetail result={lastResult} />}
+            <TrafficMonitor />
           </section>
         </div>
       )}
@@ -974,6 +966,15 @@ function RequestPanel({
  * Both byte fields stay editable before the override is added, so anything the catalogue does
  * not cover can simply be typed.
  */
+/**
+ * Set what one ECU answers to one request.
+ *
+ * Deliberately not a list. A loaded simulation file can carry ninety-odd responses, and
+ * rendering them all pushed the communication log so far down the page that the thing you
+ * actually watch was unreachable. The pickers *are* the way in: choose a service and a
+ * sub-function and you are editing that response, whether or not one was already set. Applying
+ * folds the editor away again, because by then the interesting thing is the traffic.
+ */
 function OverridePanel({
   ecu,
   onError,
@@ -985,10 +986,12 @@ function OverridePanel({
 }) {
   const [overrides, setOverrides] = useState<ResponseOverride[] | null>(null)
   const [working, setWorking] = useState(false)
+  const [isEditing, setEditing] = useState(false)
   const [serviceSid, setServiceSid] = useState(UDS_CATALOGUE[0].sid)
   const [variantIndex, setVariantIndex] = useState(0)
   const [requestHex, setRequestHex] = useState(UDS_CATALOGUE[0].variants[0].requestHex)
   const [responseHex, setResponseHex] = useState(UDS_CATALOGUE[0].variants[0].responseHex)
+  const [lastApplied, setLastApplied] = useState<string | null>(null)
 
   const requestCanIdHex = ecu?.requestCanIdHex
 
@@ -1020,56 +1023,81 @@ function OverridePanel({
   const service = UDS_CATALOGUE.find((entry) => entry.sid === serviceSid) ?? UDS_CATALOGUE[0]
   const variant = service.variants[variantIndex] ?? service.variants[0]
 
+  // Which existing response, if any, this request pattern is. Matching on the pattern is what
+  // lets the pickers double as the way to find something already set: choose 0x19 then 0x04 and
+  // you are looking at the response for `19 04`, not adding a second one beside it.
+  const existingIndex = FindOverrideIndex(vecOverrides, requestHex)
+  const existing = existingIndex >= 0 ? vecOverrides[existingIndex] : null
+
+  /** Load whatever is already set for a request pattern, falling back to the catalogue. */
+  function fillFor(strRequestHex: string, strCatalogueResponse: string) {
+    const iFound = FindOverrideIndex(vecOverrides, strRequestHex)
+    const found = iFound >= 0 ? vecOverrides[iFound] : null
+    setRequestHex(strRequestHex)
+    setResponseHex(found?.responseHex ?? strCatalogueResponse)
+  }
+
   function selectService(sid: string) {
     const next = UDS_CATALOGUE.find((entry) => entry.sid === sid)
     if (!next) return
     setServiceSid(sid)
     setVariantIndex(0)
-    setRequestHex(next.variants[0].requestHex)
-    setResponseHex(next.variants[0].responseHex)
+    fillFor(next.variants[0].requestHex, next.variants[0].responseHex)
   }
 
   function selectVariant(index: number) {
     const next = service.variants[index]
     if (!next) return
     setVariantIndex(index)
-    setRequestHex(next.requestHex)
-    setResponseHex(next.responseHex)
+    fillFor(next.requestHex, next.responseHex)
   }
 
-  async function save(vecNext: ResponseOverride[]) {
+  async function save(vecNext: ResponseOverride[], strAppliedLabel: string | null) {
     if (!ecu) return
     setWorking(true)
     try {
       setOverrides(await api.setEcuOverrides(ecu.requestCanIdHex, vecNext))
       onError(null)
+      if (strAppliedLabel) {
+        // Applied: fold away and leave the log the room. The summary bar is the way back.
+        setLastApplied(strAppliedLabel)
+        setEditing(false)
+      }
     } catch (e) {
-      // The engine explains exactly which override it refused and why.
+      // The engine explains exactly which override it refused and why — and the editor stays
+      // open, because a rejected response is precisely when you need it.
       onError(DescribeError(e))
     } finally {
       setWorking(false)
     }
   }
 
-  function addCurrent(action: 'substitute' | 'suppress') {
-    save([
-      ...vecOverrides,
-      {
-        requestHex,
-        matchTrailingBytes: false,
-        action,
-        responseHex: action === 'substitute' ? responseHex : null,
-        // Echo spans come from the catalogue entry, but only while its request template is
-        // untouched: an edited template moves the bytes the span points at.
-        echoSpans:
-          action === 'substitute' && requestHex === variant.requestHex
-            ? (variant.echoSpans ?? [])
-            : [],
-        enabled: true,
-        respondEvenIfSuppressed: false,
-        note: `${service.name} — ${variant.label}`,
-      },
-    ])
+  function apply(action: 'substitute' | 'suppress') {
+    const rule: ResponseOverride = {
+      requestHex,
+      matchTrailingBytes: existing?.matchTrailingBytes ?? false,
+      action,
+      responseHex: action === 'substitute' ? responseHex : null,
+      // Echo spans come from the catalogue entry, but only while its request template is
+      // untouched: an edited template moves the bytes the span points at.
+      echoSpans:
+        action === 'substitute' && requestHex === variant.requestHex
+          ? (variant.echoSpans ?? [])
+          : [],
+      enabled: true,
+      respondEvenIfSuppressed: existing?.respondEvenIfSuppressed ?? false,
+      note: `${service.name} — ${variant.label}`,
+    }
+
+    // Replacing rather than appending is what keeps the pickers honest: choosing a
+    // sub-function that is already set must edit it, not quietly create a second rule that
+    // shadows the first.
+    const vecNext =
+      existingIndex >= 0
+        ? vecOverrides.map((rule_, i) => (i === existingIndex ? rule : rule_))
+        : [...vecOverrides, rule]
+
+    save(vecNext, `${requestHex} → ${action === 'suppress' ? 'silence' : responseHex}`)
   }
 
   function refuseWith(nrc: string) {
@@ -1077,13 +1105,33 @@ function OverridePanel({
     setResponseHex(`7F ${bySid} ${nrc}`)
   }
 
+  if (!isEditing) {
+    return (
+      <SummaryBar
+        ecuName={ecu.name}
+        count={vecOverrides.length}
+        lastApplied={lastApplied}
+        onEdit={() => setEditing(true)}
+        disabled={busy || working}
+      />
+    )
+  }
+
   return (
-    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+    <section className="rounded-lg border border-slate-700 bg-slate-900/50 p-4">
       <div className="flex items-baseline justify-between">
         <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
           Responses — {ecu.name}
         </h3>
-        <span className="text-xs text-slate-500">{vecOverrides.length} override(s)</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-500">{vecOverrides.length} set</span>
+          <button
+            onClick={() => setEditing(false)}
+            className="text-xs text-slate-400 transition hover:text-slate-200"
+          >
+            Done
+          </button>
+        </div>
       </div>
 
       <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -1147,14 +1195,14 @@ function OverridePanel({
 
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <button
-          onClick={() => addCurrent('substitute')}
+          onClick={() => apply('substitute')}
           disabled={busy || working}
           className="rounded-md bg-emerald-700 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
         >
-          Apply response
+          {existing ? 'Update response' : 'Apply response'}
         </button>
         <button
-          onClick={() => addCurrent('suppress')}
+          onClick={() => apply('suppress')}
           disabled={busy || working}
           title="Handle the request but transmit nothing"
           className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
@@ -1176,23 +1224,86 @@ function OverridePanel({
         </select>
       </div>
 
-      {vecOverrides.length > 0 && (
-        <ul className="mt-3 space-y-2">
-          {vecOverrides.map((rule, iIndex) => (
-            <OverrideRow
-              key={`${rule.requestHex}-${iIndex}`}
-              rule={rule}
-              disabled={busy || working}
-              onChange={(next) =>
-                save(vecOverrides.map((existing, i) => (i === iIndex ? next : existing)))
-              }
-              onRemove={() => save(vecOverrides.filter((_, i) => i !== iIndex))}
-            />
-          ))}
-        </ul>
+      {existing && (
+        <div className="mt-3">
+          <p className="mb-1.5 text-[11px] text-sky-400/90">
+            This request already has a response — applying replaces it rather than adding a
+            second rule beside it.
+          </p>
+          <OverrideRow
+            rule={existing}
+            disabled={busy || working}
+            onChange={(next) =>
+              save(
+                vecOverrides.map((rule_, i) => (i === existingIndex ? next : rule_)),
+                null,
+              )
+            }
+            onRemove={() =>
+              save(
+                vecOverrides.filter((_, i) => i !== existingIndex),
+                null,
+              )
+            }
+          />
+        </div>
       )}
     </section>
   )
+}
+
+/**
+ * The folded-away editor.
+ *
+ * Deliberately still visible rather than gone: hiding it completely would leave no way back
+ * except somewhere a user has to be told about.
+ */
+function SummaryBar({
+  ecuName,
+  count,
+  lastApplied,
+  onEdit,
+  disabled,
+}: {
+  ecuName: string
+  count: number
+  lastApplied: string | null
+  onEdit: () => void
+  disabled: boolean
+}) {
+  return (
+    <section className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-2.5">
+      <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">Responses</h3>
+      <span className="text-xs text-slate-500">
+        {count} set on {ecuName}
+      </span>
+      {lastApplied && (
+        <span className="font-mono text-[11px] text-emerald-400/80">applied {lastApplied}</span>
+      )}
+      <button
+        onClick={onEdit}
+        disabled={disabled}
+        className="ml-auto rounded-md border border-slate-700 bg-slate-800 px-3 py-1 text-xs text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+      >
+        Set a response
+      </button>
+    </section>
+  )
+}
+
+/**
+ * Find the response already set for a request pattern.
+ *
+ * Compared on normalised hex so `19 04` and `1904` are the same rule — otherwise the pickers
+ * would appear to add a duplicate the engine would then have to arbitrate between.
+ */
+function FindOverrideIndex(vecOverrides: ResponseOverride[], requestHex: string): number {
+  const strNeedle = NormaliseHex(requestHex)
+  return vecOverrides.findIndex((rule) => NormaliseHex(rule.requestHex) === strNeedle)
+}
+
+function NormaliseHex(strHex: string): string {
+  return strHex.replace(/\s+/g, '').toUpperCase()
 }
 
 function OverrideRow({
@@ -1480,23 +1591,23 @@ function CheckboxField({
 // The exchange log
 // ---------------------------------------------------------------------------------------
 
-function ExchangeLog({ log }: { log: ExchangeEntry[] }) {
+/**
+ * What the last request you sent actually did, in detail.
+ *
+ * The communication log below shows every exchange, but only a request sent from here carries
+ * the per-message timings, the ResponsePending count and the ISO 14229-2 conformance warnings —
+ * the engine computes those while executing the response plan. Keeping the most recent one is
+ * how that detail survives the log becoming a live stream.
+ */
+function LastExchangeDetail({ result }: { result: SimulationRequestResult }) {
   return (
     <div>
       <h3 className="mb-2 text-sm font-medium uppercase tracking-wider text-slate-400">
-        Exchange log
+        Last request you sent
       </h3>
-      {log.length === 0 ? (
-        <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-6 text-center text-sm text-slate-500">
-          No requests yet. Pick an address and use a quick action.
-        </p>
-      ) : (
-        <ul className="space-y-2">
-          {log.map((entry) => (
-            <ExchangeEntryView key={entry.id} result={entry.result} />
-          ))}
-        </ul>
-      )}
+      <ul className="space-y-2">
+        <ExchangeEntryView result={result} />
+      </ul>
     </div>
   )
 }
