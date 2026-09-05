@@ -181,3 +181,100 @@ fn silence_on_the_wire_is_reported_with_its_reason() {
         }
     }
 }
+
+// ==========================================================================================
+// History. A monitor is opened because something looked wrong, which is necessarily after it
+// happened — so a feed that starts blank always omits the thing the person came to look at.
+// ==========================================================================================
+
+#[test]
+fn a_monitor_attaching_later_is_given_what_it_missed() {
+    let channel = TrafficChannel::New();
+
+    for u32CanId in [0x7E0u32, 0x7E1, 0x7E2] {
+        channel.OnFrame(
+            FrameDirection::Received,
+            &CanFrame::NewClassic(0.0, u32CanId, vec![0x02, 0x10, 0x03]),
+        );
+    }
+
+    // Nobody was listening for any of that.
+    let (vecHistory, u64Dropped, _receiver) = channel.SubscribeWithHistory();
+
+    assert_eq!(vecHistory.len(), 3);
+    assert_eq!(u64Dropped, 0);
+    match &vecHistory[0] {
+        TrafficEvent::Frame { can_id_hex, .. } => assert_eq!(can_id_hex, "7E0"),
+        other => panic!("history should be in order, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_replay_and_the_live_feed_neither_overlap_nor_leave_a_gap() {
+    // The reason `Publish` holds the history lock across the broadcast send. Snapshotting and
+    // subscribing separately leaves a window where an event is either seen twice or not at
+    // all, and a monitor that quietly drops or duplicates around its own attach point is worse
+    // than one that shows nothing.
+    let channel = TrafficChannel::New();
+
+    channel.OnFrame(
+        FrameDirection::Received,
+        &CanFrame::NewClassic(0.0, 0x111, vec![0x01]),
+    );
+
+    let (vecHistory, _dropped, mut receiver) = channel.SubscribeWithHistory();
+
+    channel.OnFrame(
+        FrameDirection::Received,
+        &CanFrame::NewClassic(0.0, 0x222, vec![0x02]),
+    );
+
+    assert_eq!(vecHistory.len(), 1, "only what happened before attaching");
+    match &vecHistory[0] {
+        TrafficEvent::Frame { can_id_hex, .. } => assert_eq!(can_id_hex, "111"),
+        other => panic!("expected a frame, got {other:?}"),
+    }
+
+    match receiver.try_recv().expect("the later event should be live") {
+        TrafficEvent::Frame { can_id_hex, .. } => assert_eq!(can_id_hex, "222"),
+        other => panic!("expected a frame, got {other:?}"),
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "the replayed event must not also arrive live"
+    );
+}
+
+#[test]
+fn the_history_is_a_ring_that_reports_what_it_dropped() {
+    // Bounded on purpose. What matters is that the boundedness is *visible*: a monitor shown a
+    // partial replay with no indication would read it as the whole session.
+    let channel = TrafficChannel::New();
+
+    // One more than the ring holds, so exactly one falls out of the front.
+    for uIndex in 0..20_001u32 {
+        channel.OnFrame(
+            FrameDirection::Received,
+            &CanFrame::NewClassic(0.0, uIndex % 0x7FF, vec![0x01]),
+        );
+    }
+
+    let (vecHistory, u64Dropped, _receiver) = channel.SubscribeWithHistory();
+    assert_eq!(vecHistory.len(), 20_000, "the ring holds its capacity");
+    assert_eq!(u64Dropped, 1, "and says what it pushed out");
+    assert_eq!(channel.HistoryLength(), 20_000);
+}
+
+#[test]
+fn a_replay_summary_says_how_much_was_lost_before_the_monitor_attached() {
+    let event = TrafficEvent::Replayed {
+        at_ms: 1_700_000_000_000,
+        count: 20_000,
+        dropped_before: 412,
+    };
+    let strJson = serde_json::to_string(&event).expect("an event serializes");
+
+    assert!(strJson.contains(r#""kind":"replayed""#), "got {strJson}");
+    assert!(strJson.contains(r#""count":20000"#), "got {strJson}");
+    assert!(strJson.contains(r#""droppedBefore":412"#), "got {strJson}");
+}
