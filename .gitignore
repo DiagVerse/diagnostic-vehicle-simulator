@@ -1,0 +1,23 @@
+# Rust
+/engine/target
+**/target
+Cargo.lock.orig
+
+# Node / UI
+/ui/node_modules
+/ui/dist
+/ui/.vite
+npm-debug.log*
+yarn-error.log*
+
+# Runtime plugin drop-in (compiled artifacts are built, not committed)
+/plugins.d/*.so
+/plugins.d/*.dll
+/plugins.d/*.dylib
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
