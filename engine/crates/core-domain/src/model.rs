@@ -436,6 +436,25 @@ impl CanAddress {
         }
     }
 
+    /// Build an address pair a user stated rather than one observed on a bus.
+    ///
+    /// `Confirmed` rather than `Observed`: nothing was seen on a bus, but nothing was guessed
+    /// either — the identifiers came from someone who knows the vehicle, which is the same
+    /// standing a specification has (README §7).
+    pub fn NewSpecified(
+        u32RequestCanId: u32,
+        u32ResponseCanId: u32,
+        mode: CanAddressingMode,
+    ) -> Self {
+        CanAddress {
+            m_u32RequestCanId: u32RequestCanId,
+            m_u32ResponseCanId: u32ResponseCanId,
+            m_optU32FunctionalCanId: DefaultFunctionalCanId(u32RequestCanId, mode),
+            m_addressingMode: mode,
+            m_confidence: Confidence::Confirmed,
+        }
+    }
+
     /// True when the identifiers are 29-bit extended.
     ///
     /// Derived from the addressing mode rather than from the identifier value: a value below

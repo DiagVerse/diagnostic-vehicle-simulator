@@ -94,6 +94,12 @@ impl VirtualEcu {
         self.m_bySecurityUnlockedLevel != 0
     }
 
+    /// Rename the ECU. Configuration only — no diagnostic state changes.
+    pub fn SetName(&mut self, strName: &str) {
+        tracing::info!(from = %self.m_config.m_strName, to = %strName, "ECU renamed");
+        self.m_config.m_strName = strName.to_string();
+    }
+
     /// The ECU's timing parameters.
     pub fn Timing(&self) -> EcuTiming {
         self.m_config.m_timing

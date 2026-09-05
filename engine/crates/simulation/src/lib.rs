@@ -82,6 +82,17 @@ pub enum SimulationError {
         strSecondEcu: String,
     },
 
+    /// The caller tried to change a vehicle before there was one.
+    #[error("no vehicle is loaded; create one or load a CAN log first")]
+    NoVehicleLoaded,
+
+    /// An ECU was submitted without the CAN addressing it needs to be reachable.
+    #[error("ECU '{strEcuName}' has no CAN address, so nothing could reach it")]
+    MissingCanAddress {
+        /// Name of the offending ECU.
+        strEcuName: String,
+    },
+
     /// No running ECU is addressed by the given identifier.
     #[error("no ECU is addressed on CAN id 0x{u32RequestCanId:03X}")]
     EcuNotFound {
@@ -249,6 +260,109 @@ impl SimulationService {
     /// Look up one running ECU by the identifier it is addressed on.
     pub fn FindEcuByRequestCanId(&self, u32RequestCanId: u32) -> Option<&VirtualEcu> {
         self.m_mapEcusByRequestId.get(&u32RequestCanId)
+    }
+
+    /// Start an empty vehicle to build up by hand.
+    ///
+    /// Unlike a reconstruction, an empty vehicle is a legitimate starting point: the user is
+    /// about to add ECUs one at a time. Any previously loaded vehicle is replaced.
+    pub fn CreateEmptyVehicle(&mut self, strName: &str) -> &Vehicle {
+        self.m_mapEcusByRequestId.clear();
+        self.m_mapFunctionalTargets.clear();
+        self.m_optVehicle = Some(Vehicle {
+            m_strName: strName.to_string(),
+            m_vecEcus: Vec::new(),
+        });
+
+        tracing::info!(vehicle = %strName, "empty vehicle created");
+        self.m_optVehicle
+            .as_ref()
+            .expect("vehicle was just assigned")
+    }
+
+    /// Add one ECU to the loaded vehicle and start it.
+    ///
+    /// Rejected if its identifiers collide with an ECU already running, because routing would
+    /// then be ambiguous — the same check a reconstructed model gets at load time.
+    pub fn AddEcu(&mut self, config: Ecu) -> Result<(), SimulationError> {
+        if self.m_optVehicle.is_none() {
+            return Err(SimulationError::NoVehicleLoaded);
+        }
+
+        let address = config
+            .m_optCanAddress
+            .ok_or_else(|| SimulationError::MissingCanAddress {
+                strEcuName: config.m_strName.clone(),
+            })?;
+
+        RejectDuplicateIdentifiers(&self.m_mapEcusByRequestId, &config, &address)?;
+
+        tracing::info!(
+            ecu = %config.m_strName,
+            requestCanId = format!("{:03X}", address.m_u32RequestCanId),
+            responseCanId = format!("{:03X}", address.m_u32ResponseCanId),
+            "ECU added"
+        );
+
+        self.m_mapEcusByRequestId
+            .insert(address.m_u32RequestCanId, VirtualEcu::New(config.clone()));
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            vehicle.m_vecEcus.push(config);
+        }
+
+        self.RebuildFunctionalTargets()
+    }
+
+    /// Remove one ECU and stop it.
+    pub fn RemoveEcu(&mut self, u32RequestCanId: u32) -> Result<(), SimulationError> {
+        let removed = self
+            .m_mapEcusByRequestId
+            .remove(&u32RequestCanId)
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+
+        tracing::info!(ecu = %removed.Config().m_strName, "ECU removed");
+
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            vehicle
+                .m_vecEcus
+                .retain(|config| !IsAddressedOn(config, u32RequestCanId));
+        }
+
+        self.RebuildFunctionalTargets()
+    }
+
+    /// Rename one ECU.
+    ///
+    /// A reconstructed ECU is named after the identifier it answers on (`ECU_7E8`), which is
+    /// accurate but tells a reader nothing. Naming it "Engine" is the single most useful thing
+    /// a user can add to a reconstructed model.
+    pub fn RenameEcu(
+        &mut self,
+        u32RequestCanId: u32,
+        strName: &str,
+    ) -> Result<(), SimulationError> {
+        let runningEcu = self
+            .m_mapEcusByRequestId
+            .get_mut(&u32RequestCanId)
+            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+        runningEcu.SetName(strName);
+
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            for config in &mut vehicle.m_vecEcus {
+                if IsAddressedOn(config, u32RequestCanId) {
+                    config.m_strName = strName.to_string();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recompute which ECUs listen on each broadcast identifier, after the set of running ECUs
+    /// has changed.
+    fn RebuildFunctionalTargets(&mut self) -> Result<(), SimulationError> {
+        self.m_mapFunctionalTargets = BuildFunctionalTargetMap(&self.m_mapEcusByRequestId)?;
+        Ok(())
     }
 
     /// Replace one ECU's timing parameters.
@@ -589,6 +703,14 @@ fn BuildFunctionalTargetMap(
     }
 
     Ok(mapOrdered)
+}
+
+/// True when this ECU configuration is addressed on the given request identifier.
+fn IsAddressedOn(config: &Ecu, u32RequestCanId: u32) -> bool {
+    matches!(
+        config.m_optCanAddress,
+        Some(address) if address.m_u32RequestCanId == u32RequestCanId
+    )
 }
 
 /// Mirror a timing change into the loaded model, so the model JSON matches what is running.
