@@ -34,8 +34,15 @@ Everything except `simfileVersion`, `vehicle`, `ecus`, and each ECU's `name`,
 - **`dids`** — a bare string is **hex**; for characters write `{ "text": "…" }`. `"0110"` is a
   valid pair of bytes *and* a valid piece of text, so guessing would silently produce the wrong
   answer.
-- **`dtcs`** — `"P0123-11"`, or a raw `"0x012311"`. `status` takes hex or bit names joined with
-  `|`: `testFailed`, `pendingDTC`, `confirmedDTC`, `warningIndicatorRequested` and the rest.
+- **`dtcs`** — `"P0123-11"`, or a raw `"0x012311"`. `status` takes a preset name, hex, or bit
+  names joined with `|`.
+
+  The presets are `neverTested`, `pendingOnly`, `failingThisCycle`, `activeConfirmed`,
+  `activeConfirmedWithLamp` and `historyConfirmed` — use one unless you specifically need
+  otherwise. **Do not reach for `0x00`**: two of the eight bits mean "has *not* run", so zero
+  says "the test ran and never failed", and a tester picks faults by masking — nothing matches
+  zero, so a DTC stored that way is invisible to every read. `neverTested` is what "nothing has
+  happened yet" actually looks like.
 - **`responses`** — an answer to a particular request. A byte written `**` matches anything.
   Leave `response` out to make the ECU stay silent for that request. This is the only way to get
   a positive answer out of a service the engine's UDS plugin does not implement.

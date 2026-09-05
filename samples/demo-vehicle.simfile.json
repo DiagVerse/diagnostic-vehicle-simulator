@@ -32,8 +32,8 @@
         "0100": "11"
       },
       "dtcs": [
-        { "code": "P0123-11", "status": "confirmedDTC | testFailed" },
-        { "code": "P0301-00", "status": "pendingDTC" }
+        { "code": "P2522-1F", "status": "activeConfirmed" },
+        { "code": "P0805-11", "status": "pendingOnly" }
       ],
       "security": [
         { "requestSeed": "01", "seed": "11 22 33 44", "key": "AA BB CC DD" }

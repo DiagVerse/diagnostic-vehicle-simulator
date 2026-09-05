@@ -45,10 +45,12 @@ fn the_shipped_sample_describes_the_vehicle_it_claims_to() {
         vec![0x11]
     );
 
-    // P0123-11: P is 00 in the top two bits, then 0123, then the failure type.
-    assert_eq!(engine.m_vecDtcs[0].m_u32Code, 0x01_2311);
-    assert_eq!(engine.m_vecDtcs[0].m_byStatus, 0x08 | 0x01);
-    assert_eq!(engine.m_vecDtcs[1].m_byStatus, 0x04, "pendingDTC");
+    // Both codes are ones ISO 14229-1 spells out with their hex, so the sample's encoding can
+    // be checked against the standard rather than against our own reasoning.
+    assert_eq!(engine.m_vecDtcs[0].m_u32Code, 0x25_221F, "P2522-1F");
+    assert_eq!(engine.m_vecDtcs[0].m_byStatus, 0x2F, "activeConfirmed");
+    assert_eq!(engine.m_vecDtcs[1].m_u32Code, 0x08_0511, "P0805-11");
+    assert_eq!(engine.m_vecDtcs[1].m_byStatus, 0x24, "pendingOnly");
 
     assert!(engine.IsSessionSupported(SessionType::Programming));
     assert_eq!(
