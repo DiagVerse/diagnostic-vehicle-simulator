@@ -214,3 +214,95 @@ fn an_explicit_entry_point_choice_is_left_alone() {
     assert!(!vehicle.m_vecNetworks[0].m_bIsDiagnosticEntryPoint);
     assert!(vehicle.m_vecNetworks[1].m_bIsDiagnosticEntryPoint);
 }
+
+// ==========================================================================================
+// Switching ECUs off. Wiring and power are different questions: the path still exists, but
+// nothing is forwarding along it.
+// ==========================================================================================
+
+#[test]
+fn a_disabled_gateway_names_itself_on_the_path_of_everything_behind_it() {
+    let mut vehicle = BuildGatewayedVehicle();
+    vehicle.m_vecEcus[0].m_bIsEnabled = false;
+
+    let path = vehicle.DiagnosticPathTo(&vehicle.m_vecEcus[1]);
+
+    // The route is unchanged — it is wired exactly as it was. What changed is that nothing is
+    // forwarding along it, and those are different facts to report.
+    assert!(path.m_bIsReachable);
+    assert_eq!(path.m_uHopCount, 1);
+    assert_eq!(
+        path.m_optStrDisabledGatewayName,
+        Some("Gateway".to_string())
+    );
+}
+
+#[test]
+fn an_enabled_path_names_no_blocking_gateway() {
+    let vehicle = BuildGatewayedVehicle();
+    let path = vehicle.DiagnosticPathTo(&vehicle.m_vecEcus[1]);
+    assert_eq!(path.m_optStrDisabledGatewayName, None);
+}
+
+#[test]
+fn the_gateway_nearest_the_tester_is_the_one_that_blocks() {
+    // Two gateways off at once: the request never gets past the first, so that is the one to
+    // name. Reporting the deeper one would send someone to fix the wrong ECU.
+    let mut vehicle = BuildGatewayedVehicle();
+
+    let mut subGateway = BuildEcu("Sub-gateway", 0x7E2, "powertrain");
+    subGateway.m_vecGatewayForNetworkIds = vec!["chassis".to_string()];
+    subGateway.m_bIsEnabled = false;
+    vehicle.m_vecEcus.push(subGateway);
+    vehicle.m_vecEcus.push(BuildEcu("ABS", 0x7E3, "chassis"));
+    vehicle.m_vecNetworks.push(BuildNetwork("chassis", false));
+    vehicle.m_vecEcus[0].m_bIsEnabled = false;
+
+    let abs = vehicle
+        .m_vecEcus
+        .iter()
+        .find(|ecu| ecu.m_strName == "ABS")
+        .expect("just added");
+
+    assert_eq!(
+        vehicle.DiagnosticPathTo(abs).m_optStrDisabledGatewayName,
+        Some("Gateway".to_string())
+    );
+}
+
+#[test]
+fn switching_off_an_ecu_does_not_block_its_neighbours() {
+    // Only a *gateway* takes anything else off the air. An ordinary ECU going quiet is its
+    // own business.
+    let mut vehicle = BuildGatewayedVehicle();
+    vehicle
+        .m_vecEcus
+        .push(BuildEcu("Transmission", 0x7E2, "powertrain"));
+    vehicle.m_vecEcus[1].m_bIsEnabled = false;
+
+    let transmission = &vehicle.m_vecEcus[2];
+    assert_eq!(
+        vehicle
+            .DiagnosticPathTo(transmission)
+            .m_optStrDisabledGatewayName,
+        None
+    );
+}
+
+#[test]
+fn an_ecu_is_switched_on_when_nothing_says_otherwise() {
+    // The serde default matters: `#[serde(default)]` on a bool is `false`, which would load
+    // every model written before this field existed with every ECU switched off.
+    let ecu = Ecu::New("Fresh", 0);
+    assert!(ecu.m_bIsEnabled);
+
+    let strJson = serde_json::to_string(&ecu).expect("an ECU serializes");
+    let strWithoutField = strJson.replace(r#""mBIsEnabled":true,"#, "");
+    assert_ne!(
+        strJson, strWithoutField,
+        "the field name must match the model"
+    );
+
+    let restored: Ecu = serde_json::from_str(&strWithoutField).expect("an older model loads");
+    assert!(restored.m_bIsEnabled, "an absent field must mean 'on'");
+}

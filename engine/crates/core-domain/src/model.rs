@@ -181,6 +181,11 @@ pub struct EcuTiming {
 }
 
 /// Named serde default for P4Server_max — see the field's doc comment.
+/// An ECU is switched on unless somebody switched it off.
+fn DefaultIsEnabled() -> bool {
+    true
+}
+
 fn DefaultP4ServerMaxMs() -> u32 {
     c_u32DefaultP4ServerMaxMs
 }
@@ -922,6 +927,18 @@ pub struct Ecu {
     /// observe bus membership.
     #[serde(default)]
     pub m_optStrNetworkId: Option<String>,
+    /// Whether this ECU is switched on.
+    ///
+    /// A disabled ECU stays in the model — its configuration, overrides and timing are all
+    /// preserved — but it answers nothing at all. That is what an ECU which is unpowered, not
+    /// fitted to this trim level, or removed for bench work actually does: it is silent, not
+    /// negative. A tester must see the same thing here.
+    ///
+    /// A named default is required. `#[serde(default)]` would give `false`, which would load
+    /// every model written before this field existed with every ECU switched off.
+    #[serde(default = "DefaultIsEnabled")]
+    pub m_bIsEnabled: bool,
+
     /// True when `m_u16LogicalAddress` is a real DoIP logical address a tester can route to,
     /// rather than the placeholder a CAN-only ECU carries.
     ///
@@ -954,6 +971,7 @@ impl Ecu {
             m_timing: EcuTiming::default(),
             m_mapSessionServices: BTreeMap::new(),
             m_vecGatewayForNetworkIds: Vec::new(),
+            m_bIsEnabled: true,
             m_bHasDoIpAddress: false,
             m_optStrNetworkId: None,
             m_vecResponseOverrides: Vec::new(),
@@ -1362,6 +1380,12 @@ pub struct DiagnosticPath {
     /// ECU is in the model but nothing could talk to it, which is worth showing rather than
     /// hiding.
     pub m_bIsReachable: bool,
+    /// The gateway nearest the tester that is switched off, when one is.
+    ///
+    /// Wiring and power are different questions: the path exists, but nothing is forwarding
+    /// along it right now. An unpowered gateway takes everything behind it off the air on a
+    /// real vehicle, and the simulator has to do the same or the switch would be decorative.
+    pub m_optStrDisabledGatewayName: Option<String>,
 }
 
 impl Vehicle {
@@ -1538,11 +1562,13 @@ impl Vehicle {
                     m_vecGatewayEcuNames: Vec::new(),
                     m_uHopCount: 0,
                     m_bIsReachable: true,
+                    m_optStrDisabledGatewayName: None,
                 }
             }
         };
 
         let mut vecGatewayNames: Vec<String> = Vec::new();
+        let mut vecDisabledGatewayNames: Vec<String> = Vec::new();
         let mut strCurrentId = strNetworkId;
 
         // Walk from the ECU's own network up towards a tester, collecting the gateways
@@ -1555,12 +1581,15 @@ impl Vehicle {
                 .map(|network| network.m_bIsDiagnosticEntryPoint)
                 .unwrap_or(false);
             if bIsEntryPoint {
-                // Collected nearest-the-ECU first; a reader wants tester-first.
+                // Both lists were collected nearest-the-ECU first; a reader wants tester-first,
+                // and the gateway that blocks is the first one the request would reach.
                 vecGatewayNames.reverse();
+                vecDisabledGatewayNames.reverse();
                 return DiagnosticPath {
                     m_uHopCount: vecGatewayNames.len(),
                     m_vecGatewayEcuNames: vecGatewayNames,
                     m_bIsReachable: true,
+                    m_optStrDisabledGatewayName: vecDisabledGatewayNames.first().cloned(),
                 };
             }
 
@@ -1568,6 +1597,9 @@ impl Vehicle {
                 Some(gateway) => gateway,
                 None => break,
             };
+            if !gateway.m_bIsEnabled {
+                vecDisabledGatewayNames.push(gateway.m_strName.clone());
+            }
             vecGatewayNames.push(gateway.m_strName.clone());
             strCurrentId = match &gateway.m_optStrNetworkId {
                 Some(strUpstreamId) => strUpstreamId.clone(),
@@ -1579,6 +1611,7 @@ impl Vehicle {
             m_uHopCount: vecGatewayNames.len(),
             m_vecGatewayEcuNames: Vec::new(),
             m_bIsReachable: false,
+            m_optStrDisabledGatewayName: None,
         }
     }
 }

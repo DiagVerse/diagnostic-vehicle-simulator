@@ -90,6 +90,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/ecus/:requestCanIdHex/placement",
             put(simulation::PutEcuPlacement),
         )
+        .route(
+            "/simulation/ecus/:requestCanIdHex/enabled",
+            put(simulation::PutEcuEnabled),
+        )
         .route("/simulation/vehicle", post(simulation::PostCreateVehicle))
         .route("/simulation/ecus", post(simulation::PostAddEcu))
         .route(

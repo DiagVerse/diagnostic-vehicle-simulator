@@ -150,6 +150,16 @@ async fn the_architecture_routes_match_their_path_parameters() {
         StatusCode::BAD_REQUEST
     );
 
+    assert_eq!(
+        StatusOf(
+            "PUT",
+            "/simulation/ecus/ZZZ/enabled",
+            r#"{"enabled":false}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+
     let status = StatusOf("DELETE", "/simulation/networks/powertrain", "").await;
     assert_ne!(
         status,

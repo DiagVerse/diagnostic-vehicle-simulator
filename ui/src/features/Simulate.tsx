@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
+import { Badge, DetailRow, PowerSwitch, type BadgeTone } from '../components/primitives'
 import { NEGATIVE_RESPONSES, UDS_CATALOGUE } from './udsCatalogue'
 import {
   api,
@@ -789,7 +789,20 @@ function EcuCard({
           </form>
         ) : (
           <>
-            <h4 className="font-semibold">{ecu.name}</h4>
+            <div className="flex items-center gap-2">
+              <PowerSwitch
+                isOn={ecu.isEnabled}
+                disabled={busy || working}
+                label={`Switch ${ecu.name} ${ecu.isEnabled ? 'off' : 'on'}`}
+                onToggle={() =>
+                  run(() => api.simulationSetEcuEnabled(ecu.requestCanIdHex, !ecu.isEnabled))
+                }
+              />
+              <h4 className={`font-semibold ${ecu.isEnabled ? '' : 'text-slate-500'}`}>
+                {ecu.name}
+              </h4>
+              {!ecu.isEnabled && <Badge tone="slate">off</Badge>}
+            </div>
             <div className="flex items-center gap-2">
               <span className="font-mono text-xs text-slate-400">
                 {ecu.requestCanIdHex} → {ecu.responseCanIdHex}
@@ -1502,6 +1515,10 @@ function ExchangeEntryView({ result }: { result: SimulationRequestResult }) {
         <div className="mt-1 text-amber-500/80">
           <span className="text-slate-600">←</span> the simulation is stopped — the ECUs are off
           the bus
+        </div>
+      ) : result.addressing === 'silenced' ? (
+        <div className="mt-1 text-amber-500/80">
+          <span className="text-slate-600">←</span> silence — {result.silencedReason}
         </div>
       ) : !result.routed ? (
         <div className="mt-1 text-slate-500">

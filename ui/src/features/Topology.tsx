@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Badge, type BadgeTone } from '../components/primitives'
+import { Badge, PowerSwitch, type BadgeTone } from '../components/primitives'
+import { TopologyDiagram } from './TopologyDiagram'
 import {
   api,
   type NewNetwork,
@@ -26,6 +27,32 @@ export function Topology() {
   const [topology, setTopology] = useState<TopologyModel | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isEditing, setEditing] = useState(false)
+  const [isBusy, setBusy] = useState(false)
+  // The diagram answers "how is this wired"; the list answers "what exactly is this ECU". Both
+  // are worth having, and neither is a good substitute for the other.
+  const [view, setView] = useState<'diagram' | 'list'>('diagram')
+
+  /**
+   * Switch one ECU on or off.
+   *
+   * The engine answers with the simulation state, so the topology is re-read afterwards: a
+   * gateway going off changes what is reachable behind it, which is a fact about other nodes.
+   */
+  async function toggleEcu(node: TopologyNode) {
+    if (node.requestCanIdHex === null) {
+      return
+    }
+    setBusy(true)
+    try {
+      await api.simulationSetEcuEnabled(node.requestCanIdHex, !node.isEnabled)
+      setTopology(await api.simulationTopology())
+      setError(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   useEffect(() => {
     api
@@ -52,6 +79,7 @@ export function Topology() {
   const vecUnreachableLinks = vecLinks.filter((link) => link.depth === null)
   const vecUnassigned = vecEcus.filter((node) => !node.linkId)
   const nGateways = vecEcus.filter((node) => node.gatewayForLinkIds.length > 0).length
+  const nOff = vecEcus.filter((node) => !node.isEnabled).length
 
   return (
     <div className="space-y-4">
@@ -67,6 +95,21 @@ export function Topology() {
             {vecEcus.length === 1 ? '' : 's'}
             {nGateways > 0 && ` · ${nGateways} gateway${nGateways === 1 ? '' : 's'}`}
           </span>
+          <div className="flex rounded-md border border-slate-700">
+            {(['diagram', 'list'] as const).map((candidate) => (
+              <button
+                key={candidate}
+                onClick={() => setView(candidate)}
+                className={`px-2.5 py-1 text-xs capitalize transition first:rounded-l-md last:rounded-r-md ${
+                  view === candidate
+                    ? 'bg-slate-700 text-slate-100'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {candidate}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => setEditing((wasEditing) => !wasEditing)}
             className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1 text-xs text-slate-200 transition hover:border-slate-500"
@@ -76,11 +119,35 @@ export function Topology() {
         </div>
       </div>
 
-      <div className="space-y-4 overflow-x-auto">
+      {nOff > 0 && (
+        <p className="rounded-lg border border-slate-700 bg-slate-900/60 px-4 py-2 text-xs text-slate-400">
+          {nOff} ECU{nOff === 1 ? ' is' : 's are'} switched off. A switched-off ECU keeps its
+          configuration and answers nothing at all — the same silence an unpowered or unfitted
+          ECU gives a tester, not a negative response.
+        </p>
+      )}
+
+      {view === 'diagram' && (
+        <TopologyDiagram
+          links={vecLinks}
+          nodes={vecEcus}
+          onToggleEcu={toggleEcu}
+          busy={isBusy}
+        />
+      )}
+
+      <div className={`space-y-4 overflow-x-auto ${view === 'diagram' ? 'hidden' : ''}`}>
         {vecEntryPoints.map((link) => (
           <div key={link.id} className="space-y-2">
             <TesterAttachment link={link} />
-            <BusBranch link={link} links={vecLinks} nodes={vecEcus} depth={0} />
+            <BusBranch
+              link={link}
+              links={vecLinks}
+              nodes={vecEcus}
+              depth={0}
+              onToggleEcu={toggleEcu}
+              busy={isBusy}
+            />
           </div>
         ))}
 
@@ -98,6 +165,8 @@ export function Topology() {
                   links={vecLinks}
                   nodes={vecEcus}
                   depth={0}
+                  onToggleEcu={toggleEcu}
+                  busy={isBusy}
                 />
               ))}
             </div>
@@ -112,7 +181,7 @@ export function Topology() {
             </p>
             <div className="flex flex-wrap gap-3">
               {vecUnassigned.map((node) => (
-                <EcuCardNode key={node.id} node={node} />
+                <EcuCardNode key={node.id} node={node} onToggle={toggleEcu} busy={isBusy} />
               ))}
             </div>
           </section>
@@ -174,11 +243,15 @@ function BusBranch({
   links,
   nodes,
   depth,
+  onToggleEcu,
+  busy,
 }: {
   link: TopologyLink
   links: TopologyLink[]
   nodes: TopologyNode[]
   depth: number
+  onToggleEcu: (node: TopologyNode) => void
+  busy: boolean
 }) {
   const vecOnThisBus = nodes.filter((node) => node.linkId === link.id)
 
@@ -215,7 +288,7 @@ function BusBranch({
       ) : (
         <div className="mt-3 flex flex-wrap gap-3">
           {vecOnThisBus.map((node) => (
-            <EcuCardNode key={node.id} node={node} />
+            <EcuCardNode key={node.id} node={node} onToggle={onToggleEcu} busy={busy} />
           ))}
         </div>
       )}
@@ -237,7 +310,14 @@ function BusBranch({
                   {GatewayNameFor(behind, vecOnThisBus)}
                 </span>
               </p>
-              <BusBranch link={behind} links={links} nodes={nodes} depth={depth + 1} />
+              <BusBranch
+                link={behind}
+                links={links}
+                nodes={nodes}
+                depth={depth + 1}
+                onToggleEcu={onToggleEcu}
+                busy={busy}
+              />
             </div>
           ))}
         </div>
@@ -256,14 +336,23 @@ function GatewayNameFor(behind: TopologyLink, vecOnThisBus: TopologyNode[]): str
  * One ECU. An inferred identifier pair is drawn dashed: a diagram that renders a derived fact
  * the same as an observed one turns an inference into a claim.
  */
-function EcuCardNode({ node }: { node: TopologyNode }) {
+function EcuCardNode({
+  node,
+  onToggle,
+  busy,
+}: {
+  node: TopologyNode
+  onToggle: (node: TopologyNode) => void
+  busy: boolean
+}) {
   const bIsInferred = node.addressConfidence === 'Inferred'
   const bIsGateway = node.gatewayForLinkIds.length > 0
+  const bIsBlocked = node.blockedByEcuName !== null
 
   let strBorder = 'border-slate-600'
-  if (node.isUnreachable) {
-    strBorder = 'border-dashed border-amber-700'
-  } else if (bIsInferred) {
+  if (!node.isEnabled) {
+    strBorder = 'border-slate-700'
+  } else if (node.isUnreachable || bIsInferred || bIsBlocked) {
     strBorder = 'border-dashed border-amber-700'
   } else if (bIsGateway) {
     strBorder = 'border-sky-700'
@@ -271,11 +360,23 @@ function EcuCardNode({ node }: { node: TopologyNode }) {
 
   return (
     <div
-      className={`min-w-44 max-w-64 rounded-lg border bg-slate-800/60 px-3 py-2 ${strBorder}`}
+      className={`min-w-44 max-w-64 rounded-lg border bg-slate-800/60 px-3 py-2 ${strBorder} ${
+        node.isEnabled ? '' : 'opacity-60'
+      }`}
       title={node.unreachableReason ?? undefined}
     >
       <div className="flex items-start justify-between gap-2">
-        <span className="text-sm font-medium text-slate-100">{node.label}</span>
+        <span className="flex items-center gap-2">
+          {node.requestCanIdHex !== null && (
+            <PowerSwitch
+              isOn={node.isEnabled}
+              disabled={busy}
+              label={`Switch ${node.label} ${node.isEnabled ? 'off' : 'on'}`}
+              onToggle={() => onToggle(node)}
+            />
+          )}
+          <span className="text-sm font-medium text-slate-100">{node.label}</span>
+        </span>
         {bIsGateway && <Badge tone="sky">gateway</Badge>}
       </div>
 
@@ -299,6 +400,12 @@ function EcuCardNode({ node }: { node: TopologyNode }) {
         <div className="mt-1 text-[10px] text-slate-500">
           via {node.reachedViaEcuNames.join(' → ')}
         </div>
+      )}
+
+      {!node.isEnabled && (
+        <p className="mt-1.5 text-[10px] leading-snug text-slate-500">
+          Switched off — it answers nothing at all.
+        </p>
       )}
 
       {node.isUnreachable && (

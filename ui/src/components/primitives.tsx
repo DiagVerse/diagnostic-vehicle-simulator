@@ -32,3 +32,43 @@ export function DetailRow({ label, children }: { label: string; children: React.
     </div>
   )
 }
+
+/**
+ * An on/off switch, drawn as a slider.
+ *
+ * Used wherever an ECU can be taken off the air. It is deliberately a switch rather than a
+ * checkbox: switching an ECU off is not selecting an option, it is unplugging something, and
+ * the control should feel like it.
+ */
+export function PowerSwitch({
+  isOn,
+  disabled,
+  label,
+  onToggle,
+}: {
+  isOn: boolean
+  disabled?: boolean
+  label: string
+  onToggle: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={isOn}
+      aria-label={label}
+      title={label}
+      disabled={disabled}
+      onClick={onToggle}
+      className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition disabled:opacity-40 ${
+        isOn ? 'bg-emerald-600' : 'bg-slate-700'
+      }`}
+    >
+      <span
+        className={`inline-block h-3 w-3 transform rounded-full bg-white transition ${
+          isOn ? 'translate-x-3.5' : 'translate-x-0.5'
+        }`}
+      />
+    </button>
+  )
+}

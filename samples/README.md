@@ -130,3 +130,19 @@ buses at all, because a capture taken at one connector cannot observe which bus 
 The **Topology** tab's *Edit architecture* panel declares buses and places ECUs on them for any
 loaded vehicle, whatever it came from, and the from-scratch builder can declare a bus and place
 each ECU as it is added.
+
+
+### Switching ECUs off
+
+Every ECU in the diagram has a switch. Off is not a diagnostic state — the ECU answers
+*nothing*, which is what an unpowered or unfitted ECU does. It is not a negative response, and
+it is not a reset: the session and security state are still there when you switch it back on.
+
+Switching off a **gateway** takes everything behind it off the air, which is the first thing the
+declared architecture actually enforces. In this sample, switching off the Central Gateway
+silences the Engine, Transmission, both body ECUs and the ABS two hops back — while the Airbag,
+which sits on the link the tester is plugged into, keeps answering. The request comes back as
+`silenced`, naming the gateway that is off, rather than as a negative response.
+
+The same switch is on the ECU cards in the Simulate tab and in the Topology tab's list view; all
+three make the same call.

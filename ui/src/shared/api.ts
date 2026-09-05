@@ -86,6 +86,8 @@ export interface SimulationEcu {
   dids: number[]
   dtcCount: number
   timing: EcuTiming
+  /** Whether the ECU is switched on. Off keeps its configuration and answers nothing. */
+  isEnabled: boolean
 }
 
 /** What the engine currently has loaded. */
@@ -136,6 +138,10 @@ export interface SimulationRequestResult {
   addressing: string
   routed: boolean
   responses: SimulationResponse[]
+  /** The ECU that would have answered had it been switched on. Only for 'silenced'. */
+  silencedEcuName: string | null
+  /** Why nothing answered. Only for 'silenced'. */
+  silencedReason: string | null
 }
 
 /** A serial port this machine offers. */
@@ -226,6 +232,10 @@ export interface TopologyNode {
   hopCount: number
   /** False when the ECU is declared but the engine cannot drive it on the wire yet. */
   isSimulated: boolean
+  /** Whether the ECU is switched on. A switched-off ECU answers nothing at all. */
+  isEnabled: boolean
+  /** The gateway between it and the tester that is switched off, when one is. */
+  blockedByEcuName: string | null
 }
 
 /** The diagram, plus what it cannot know. */
@@ -360,6 +370,8 @@ export const api = {
     deleteJson<Topology>(`/simulation/networks/${encodeURIComponent(networkId)}`),
   simulationSetEcuPlacement: (requestCanIdHex: string, placement: EcuPlacement) =>
     putJson<Topology>(`/simulation/ecus/${requestCanIdHex}/placement`, placement),
+  simulationSetEcuEnabled: (requestCanIdHex: string, enabled: boolean) =>
+    putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/enabled`, { enabled }),
   serialPorts: () => getJson<SerialPorts>('/hw/ports'),
   hardwareStatus: () => getJson<HardwareStatus>('/hw/status'),
   hardwareStart: (port: string, bitrateBps: number) =>

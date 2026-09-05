@@ -121,6 +121,29 @@ impl VirtualEcu {
         self.m_config.m_strName = strName.to_string();
     }
 
+    /// Switch this ECU on or off.
+    ///
+    /// Off is not a diagnostic state — it is the ECU not being there. Its session, security
+    /// and stored configuration are all left exactly as they are, so switching it back on
+    /// resumes rather than restarts; a tester simply gets silence in the meantime.
+    pub fn SetEnabled(&mut self, bIsEnabled: bool) {
+        if self.m_config.m_bIsEnabled == bIsEnabled {
+            return;
+        }
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            enabled = bIsEnabled,
+            "ECU switched {}",
+            if bIsEnabled { "on" } else { "off" }
+        );
+        self.m_config.m_bIsEnabled = bIsEnabled;
+    }
+
+    /// True when this ECU is switched on and will answer.
+    pub fn IsEnabled(&self) -> bool {
+        self.m_config.m_bIsEnabled
+    }
+
     /// Record where this ECU sits in the vehicle and what it gateways onto.
     ///
     /// Configuration only: placement describes how a tester reaches the ECU, not how it
