@@ -3,6 +3,7 @@
 //! exposes it over HTTP. It contains no business logic.
 
 pub mod diagnostics;
+pub mod hardware;
 pub mod simulation;
 
 use std::{
@@ -67,6 +68,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/simulation/reset", post(simulation::PostSimulationReset))
         .route("/simulation/start", post(simulation::PostSimulationStart))
         .route("/simulation/stop", post(simulation::PostSimulationStop))
+        .route("/hw/ports", get(hardware::GetSerialPorts))
         .route("/simulation/topology", get(simulation::GetTopology))
         .route("/simulation/vehicle", post(simulation::PostCreateVehicle))
         .route("/simulation/ecus", post(simulation::PostAddEcu))

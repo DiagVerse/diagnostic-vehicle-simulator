@@ -49,6 +49,8 @@ async fn every_simulation_route_is_reachable() {
         ("GET", "/health", ""),
         ("GET", "/plugins", ""),
         ("GET", "/simulation/state", ""),
+        ("GET", "/hw/ports", ""),
+        ("GET", "/simulation/topology", ""),
         ("POST", "/simulation/reset", "{}"),
         (
             "POST",
