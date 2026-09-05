@@ -12,6 +12,8 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+pub mod sample;
+
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
 use core_domain::model::Ecu;
