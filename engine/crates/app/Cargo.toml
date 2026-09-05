@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 application.workspace = true
 api.workspace = true
+core-domain.workspace = true
+ecu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

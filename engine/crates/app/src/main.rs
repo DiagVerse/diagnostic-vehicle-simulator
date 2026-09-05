@@ -6,8 +6,11 @@
 //!
 //! Usage:
 //!   dvsim serve [--addr 127.0.0.1:8080] [--plugins <dir>]
+//!   dvsim demo  [--plugins <dir>]
 //!
 //! With no arguments it defaults to `serve` on 127.0.0.1:8080 reading `plugins.d/`.
+
+mod demo;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -22,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     let cmd = Cli::parse(std::env::args().skip(1));
     match cmd {
         Cli::Serve { addr, plugins } => serve(addr, plugins).await,
+        Cli::Demo { plugins } => demo::Run(&plugins),
         Cli::Help => {
             print_help();
             Ok(())
@@ -53,6 +57,7 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
 /// Minimal hand-rolled argument parsing — no external CLI dependency needed yet.
 enum Cli {
     Serve { addr: SocketAddr, plugins: PathBuf },
+    Demo { plugins: PathBuf },
     Help,
 }
 
@@ -85,6 +90,7 @@ impl Cli {
 
         match subcommand.as_deref() {
             None | Some("serve") => Cli::Serve { addr, plugins },
+            Some("demo") => Cli::Demo { plugins },
             _ => Cli::Help,
         }
     }
@@ -93,7 +99,9 @@ impl Cli {
 fn print_help() {
     println!(
         "dvsim — Diagnostic Vehicle Simulator engine\n\n\
-         USAGE:\n    dvsim serve [--addr <ip:port>] [--plugins <dir>]\n\n\
+         USAGE:\n\
+         \x20   dvsim serve [--addr <ip:port>] [--plugins <dir>]\n\
+         \x20   dvsim demo  [--plugins <dir>]\n\n\
          OPTIONS:\n\
          \x20   --addr <ip:port>   Address to listen on (default 127.0.0.1:8080)\n\
          \x20   --plugins <dir>    Plugin drop-in directory (default plugins.d)\n\
