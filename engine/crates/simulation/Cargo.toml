@@ -11,6 +11,7 @@ core-domain.workspace = true
 application.workspace = true
 ecu.workspace = true
 reconstruct.workspace = true
+simfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # Only the plan executor needs a clock; everything else in this crate is pure.

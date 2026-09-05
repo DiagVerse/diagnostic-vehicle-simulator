@@ -1,0 +1,96 @@
+{
+  "simfileVersion": 1,
+  "vehicle": "Demo vehicle",
+
+  "networks": [
+    {
+      "id": "powertrain",
+      "name": "Powertrain CAN",
+      "kind": "CAN",
+      "bitrateBps": 500000
+    },
+    {
+      "id": "body",
+      "name": "Body CAN",
+      "kind": "CAN",
+      "bitrateBps": 125000
+    }
+  ],
+
+  "ecus": [
+    {
+      "name": "Engine",
+      "network": "powertrain",
+      "requestCanId": "7E0",
+      "responseCanId": "7E8",
+      "sessions": ["default", "extended", "programming"],
+      "services": ["10", "11", "19", "22", "27", "3E"],
+      "dids": {
+        "F190": { "text": "SIMULATORVIN00001" },
+        "F18C": { "text": "SIM-ENGINE-0001" },
+        "F186": "01",
+        "0100": "11"
+      },
+      "dtcs": [
+        { "code": "P0123-11", "status": "confirmedDTC | testFailed" },
+        { "code": "P0301-00", "status": "pendingDTC" }
+      ],
+      "security": [
+        { "requestSeed": "01", "seed": "11 22 33 44", "key": "AA BB CC DD" }
+      ],
+      "responses": [
+        {
+          "request": "2E F1 90 **",
+          "response": "6E F1 90",
+          "note": "accepts a VIN write; 0x2E is not implemented by the engine's UDS plugin"
+        }
+      ]
+    },
+
+    {
+      "name": "Transmission",
+      "network": "powertrain",
+      "requestCanId": "7E1",
+      "responseCanId": "7E9",
+      "sessions": ["default", "extended"],
+      "services": ["10", "19", "22", "3E"],
+      "dids": {
+        "F18C": { "text": "SIM-TCM-0001" },
+        "F190": { "text": "SIMULATORVIN00001" }
+      },
+      "dtcs": [{ "code": "P0700-00" }]
+    },
+
+    {
+      "name": "BCM",
+      "network": "body",
+      "requestCanId": "745",
+      "responseCanId": "765",
+      "sessions": ["default", "extended"],
+      "services": ["10", "19", "22", "3E"],
+      "dids": {
+        "F18C": { "text": "SIM-BCM-0001" },
+        "FD00": "00 01 02 03"
+      },
+      "dtcs": [{ "code": "B1234-00" }],
+      "timing": { "p2Ms": 50, "p2StarMs": 5000 }
+    },
+
+    {
+      "name": "Gateway",
+      "network": "powertrain",
+      "requestCanId": "18DAD4F1",
+      "responseCanId": "18DAF1D4",
+      "logicalAddress": 212,
+      "sessions": ["default", "extended"],
+      "services": ["10", "22", "27", "3E"],
+      "dids": {
+        "F190": { "text": "SIMULATORVIN00001" },
+        "F18C": { "text": "SIM-GATEWAY-001" }
+      },
+      "security": [
+        { "requestSeed": "01", "seed": "DE AD BE EF", "key": "CA FE F0 0D" }
+      ]
+    }
+  ]
+}

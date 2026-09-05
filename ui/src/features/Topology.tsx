@@ -1,15 +1,12 @@
 import { useEffect, useState } from 'react'
 import { Badge, type BadgeTone } from '../components/primitives'
-import { api, type Topology as TopologyModel, type TopologyNode } from '../shared/api'
+import {
+  api,
+  type Topology as TopologyModel,
+  type TopologyLink,
+  type TopologyNode,
+} from '../shared/api'
 
-/** Layout constants for the diagram, in SVG user units. */
-const c_nodeWidth = 168
-const c_nodeHeight = 62
-const c_nodeGap = 24
-const c_busY = 150
-const c_ecuY = 210
-const c_testerY = 40
-const c_margin = 24
 
 /**
  * A picture of how the loaded vehicle is wired — and, just as importantly, of what nobody
@@ -45,11 +42,8 @@ export function Topology() {
     )
   }
 
-  const link = topology?.links[0]
-  const width = Math.max(
-    vecEcus.length * (c_nodeWidth + c_nodeGap) + c_margin,
-    520,
-  )
+  const vecLinks = topology?.links ?? []
+  const unassigned = vecEcus.filter((node) => !node.linkId)
 
   return (
     <div className="space-y-4">
@@ -57,39 +51,35 @@ export function Topology() {
         <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
           {topology?.vehicleName ?? 'Vehicle'}
         </h3>
-        {link && (
-          <span className="flex items-center gap-2 text-xs text-slate-500">
-            {link.kind}
-            <Badge tone={ConfidenceTone(link.membershipConfidence)}>
-              membership {link.membershipConfidence.toLowerCase()}
-            </Badge>
-          </span>
+        <span className="text-xs text-slate-500">
+          {vecLinks.length} bus{vecLinks.length === 1 ? '' : 'es'} · {vecEcus.length} ECU
+          {vecEcus.length === 1 ? '' : 's'}
+        </span>
+      </div>
+
+      <div className="space-y-3 overflow-x-auto">
+        {vecLinks.map((link) => (
+          <BusDiagram
+            key={link.id}
+            link={link}
+            nodes={vecEcus.filter((node) => node.linkId === link.id)}
+          />
+        ))}
+
+        {unassigned.length > 0 && (
+          <div className="rounded-lg border border-dashed border-slate-700 bg-slate-900/30 p-4">
+            <p className="mb-3 text-xs text-slate-500">
+              On no declared bus — nobody has said where these sit, which is not the same as
+              saying they share one.
+            </p>
+            <div className="flex flex-wrap gap-3">
+              {unassigned.map((node) => (
+                <EcuCardNode key={node.id} node={node} />
+              ))}
+            </div>
+          </div>
         )}
       </div>
-
-      <div className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-900/50 p-4">
-        <svg
-          width={width}
-          height={c_ecuY + c_nodeHeight + c_margin}
-          role="img"
-          aria-label="Vehicle topology"
-        >
-          <BusLine width={width} label={link?.label ?? 'Diagnostic link'} />
-          <TesterNode width={width} />
-          {vecEcus.map((node, iIndex) => (
-            <EcuNode key={node.id} node={node} index={iIndex} />
-          ))}
-        </svg>
-      </div>
-
-      {link && link.functionalCanIdsHex.length > 0 && (
-        <p className="text-xs text-slate-500">
-          Broadcast identifiers on this link:{' '}
-          <span className="font-mono text-slate-400">
-            {link.functionalCanIdsHex.join(', ')}
-          </span>
-        </p>
-      )}
 
       {topology && topology.caveats.length > 0 && (
         <ul className="space-y-1.5 rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-3">
@@ -104,97 +94,65 @@ export function Topology() {
   )
 }
 
-function BusLine({ width, label }: { width: number; label: string }) {
+/** One bus, with the ECUs on it hanging below the line. */
+function BusDiagram({ link, nodes }: { link: TopologyLink; nodes: TopologyNode[] }) {
   return (
-    <g>
-      <line
-        x1={c_margin}
-        y1={c_busY}
-        x2={width - c_margin}
-        y2={c_busY}
-        stroke="#475569"
-        strokeWidth={3}
-      />
-      <text x={c_margin} y={c_busY - 10} className="fill-slate-500 text-[11px]">
-        {label}
-      </text>
-    </g>
+    <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-sm text-slate-300">{link.label}</span>
+        <span className="flex items-center gap-2 text-xs text-slate-500">
+          {link.kind}
+          <Badge tone={ConfidenceTone(link.membershipConfidence)}>
+            membership {link.membershipConfidence.toLowerCase()}
+          </Badge>
+        </span>
+      </div>
+
+      <div className="mt-2 h-px w-full bg-slate-600" />
+
+      {nodes.length === 0 ? (
+        <p className="mt-3 text-xs text-slate-600">No ECUs on this bus.</p>
+      ) : (
+        <div className="mt-3 flex flex-wrap gap-3">
+          {nodes.map((node) => (
+            <EcuCardNode key={node.id} node={node} />
+          ))}
+        </div>
+      )}
+
+      {link.functionalCanIdsHex.length > 0 && (
+        <p className="mt-3 text-xs text-slate-500">
+          Broadcast:{' '}
+          <span className="font-mono text-slate-400">
+            {link.functionalCanIdsHex.join(', ')}
+          </span>
+        </p>
+      )}
+    </div>
   )
 }
 
-function TesterNode({ width }: { width: number }) {
-  const x = width / 2 - c_nodeWidth / 2
-  return (
-    <g>
-      <rect
-        x={x}
-        y={c_testerY}
-        width={c_nodeWidth}
-        height={40}
-        rx={8}
-        className="fill-slate-800 stroke-slate-600"
-        strokeDasharray="4 3"
-      />
-      <text
-        x={x + c_nodeWidth / 2}
-        y={c_testerY + 25}
-        textAnchor="middle"
-        className="fill-slate-300 text-[12px]"
-      >
-        Tester
-      </text>
-      <line
-        x1={width / 2}
-        y1={c_testerY + 40}
-        x2={width / 2}
-        y2={c_busY}
-        stroke="#475569"
-        strokeWidth={2}
-      />
-    </g>
-  )
-}
-
-function EcuNode({ node, index }: { node: TopologyNode; index: number }) {
-  const x = c_margin + index * (c_nodeWidth + c_nodeGap)
-  const centreX = x + c_nodeWidth / 2
-
-  // An inferred identifier pair is drawn dashed: a diagram that renders a derived fact the
-  // same as an observed one turns an inference into a claim.
+/**
+ * One ECU. An inferred identifier pair is drawn dashed: a diagram that renders a derived fact
+ * the same as an observed one turns an inference into a claim.
+ */
+function EcuCardNode({ node }: { node: TopologyNode }) {
   const bIsInferred = node.addressConfidence === 'Inferred'
 
   return (
-    <g>
-      <line x1={centreX} y1={c_busY} x2={centreX} y2={c_ecuY} stroke="#475569" strokeWidth={2} />
-      <rect
-        x={x}
-        y={c_ecuY}
-        width={c_nodeWidth}
-        height={c_nodeHeight}
-        rx={8}
-        className={`fill-slate-800 ${bIsInferred ? 'stroke-amber-700' : 'stroke-slate-600'}`}
-        strokeDasharray={bIsInferred ? '5 4' : undefined}
-      />
-      <text
-        x={centreX}
-        y={c_ecuY + 24}
-        textAnchor="middle"
-        className="fill-slate-100 text-[13px] font-medium"
-      >
-        {node.label}
-      </text>
-      <text
-        x={centreX}
-        y={c_ecuY + 41}
-        textAnchor="middle"
-        className="fill-slate-400 font-mono text-[11px]"
-      >
+    <div
+      className={`min-w-44 rounded-lg border bg-slate-800/60 px-3 py-2 ${
+        bIsInferred ? 'border-dashed border-amber-700' : 'border-slate-600'
+      }`}
+    >
+      <div className="text-sm font-medium text-slate-100">{node.label}</div>
+      <div className="font-mono text-[11px] text-slate-400">
         {node.requestCanIdHex} → {node.responseCanIdHex}
-      </text>
-      <text x={centreX} y={c_ecuY + 55} textAnchor="middle" className="fill-slate-600 text-[10px]">
+      </div>
+      <div className="text-[10px] text-slate-500">
         {node.addressingMode} · {node.addressConfidence?.toLowerCase()}
-      </text>
-    </g>
+      </div>
+    </div>
   )
 }
 

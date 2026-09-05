@@ -17,6 +17,7 @@ members = [
     "crates/serial-can",
     "crates/slcan",
     "crates/bridge",
+    "crates/simfile",
     "plugins/sample",
     "plugins/protocols/l7-application/uds",
 ]
@@ -58,6 +59,7 @@ simulation = { path = "crates/simulation" }
 serial-can = { path = "crates/serial-can" }
 slcan = { path = "crates/slcan" }
 bridge = { path = "crates/bridge" }
+simfile = { path = "crates/simfile" }
 uds-plugin = { path = "plugins/protocols/l7-application/uds" }
 
 [profile.release]

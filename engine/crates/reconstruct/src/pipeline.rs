@@ -82,6 +82,10 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
     Vehicle {
         m_strName: "Reconstructed Vehicle".to_string(),
         m_vecEcus: mapEcus.into_values().collect(),
+        // No networks: a tester-side capture sees one connector and cannot tell whether these
+        // ECUs share a wire or sit behind a gateway. Inventing a bus here would turn "we do
+        // not know" into a claim.
+        m_vecNetworks: Vec::new(),
     }
 }
 

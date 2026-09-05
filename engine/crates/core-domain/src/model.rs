@@ -899,6 +899,11 @@ pub struct Ecu {
     pub m_vecSecurityLevels: Vec<SecurityLevel>,
     /// Timing parameters.
     pub m_timing: EcuTiming,
+    /// Which network this ECU sits on, by id. `None` means nobody has said — not "the default
+    /// bus". An ECU reconstructed from a log is always `None`, because a capture cannot
+    /// observe bus membership.
+    #[serde(default)]
+    pub m_optStrNetworkId: Option<String>,
     /// User-defined answers to particular requests, tried most-specific-first before the
     /// protocol's own response is used. Defaulted on deserialization so models written before
     /// this field existed still load.
@@ -920,6 +925,7 @@ impl Ecu {
             m_vecDtcs: Vec::new(),
             m_vecSecurityLevels: Vec::new(),
             m_timing: EcuTiming::default(),
+            m_optStrNetworkId: None,
             m_vecResponseOverrides: Vec::new(),
         }
     }
@@ -964,8 +970,48 @@ impl Ecu {
     }
 }
 
-/// The whole reconstructed/simulated vehicle: a collection of ECUs. Networks, gateways and
-/// routing join this in later phases.
+/// What kind of link a network is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NetworkKind {
+    /// Classic CAN, up to 8 bytes per frame.
+    CanClassic,
+    /// CAN-FD, which carries longer frames and a second bit rate for the data phase.
+    CanFd,
+    /// Ethernet carrying DoIP.
+    EthernetDoIp,
+    /// The link exists but nothing said what it is.
+    #[default]
+    Unknown,
+}
+
+/// One bus in the vehicle.
+///
+/// A network only exists when something actually stated it. Reconstruction cannot invent one:
+/// a tester-side capture sees a single connector and cannot tell whether two ECUs share a wire
+/// or sit behind a gateway (ADR 0006 §4), so a vehicle built from a log has no networks at all
+/// and its topology is drawn as one reachability set. A simulation file, by contrast, is
+/// written by someone who knows the vehicle, so what it says about buses is `Confirmed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Network {
+    /// Stable key ECUs refer to, e.g. "powertrain".
+    pub m_strId: String,
+    /// What to call it on screen, e.g. "Powertrain CAN".
+    pub m_strName: String,
+    /// What kind of link it is.
+    pub m_kind: NetworkKind,
+    /// Arbitration bit rate, when known. Never defaulted to a plausible-looking 500 kbit/s:
+    /// a capture cannot observe it, so guessing would turn "unknown" into a claim.
+    #[serde(default)]
+    pub m_optU32BitrateBps: Option<u32>,
+    /// The CAN-FD data-phase bit rate, when the link has one.
+    #[serde(default)]
+    pub m_optU32DataBitrateBps: Option<u32>,
+    /// How the existence of this network was established.
+    pub m_confidence: Confidence,
+}
+
+/// The whole reconstructed/simulated vehicle: its buses and the ECUs on them.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Vehicle {
@@ -973,6 +1019,20 @@ pub struct Vehicle {
     pub m_strName: String,
     /// All ECUs in the vehicle.
     pub m_vecEcus: Vec<Ecu>,
+    /// The buses, when something stated them. Empty means nobody has said how these ECUs are
+    /// connected — which is the honest state after reconstructing from a log, and must be
+    /// rendered as "unknown" rather than filled in with a default bus.
+    #[serde(default)]
+    pub m_vecNetworks: Vec<Network>,
+}
+
+impl Vehicle {
+    /// Find a network by the id ECUs refer to it with.
+    pub fn FindNetwork(&self, strNetworkId: &str) -> Option<&Network> {
+        self.m_vecNetworks
+            .iter()
+            .find(|network| network.m_strId == strNetworkId)
+    }
 }
 
 impl Vehicle {
@@ -1157,6 +1217,7 @@ mod tests {
         let mut vehicle = Vehicle {
             m_strName: "TestVehicle".to_string(),
             m_vecEcus: Vec::new(),
+            m_vecNetworks: Vec::new(),
         };
         vehicle.m_vecEcus.push(Ecu::New("Engine_ECU", 0x1001));
 

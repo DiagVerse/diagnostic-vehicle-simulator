@@ -892,6 +892,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "simfile"
+version = "0.1.0"
+dependencies = [
+ "core-domain",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "simulation"
 version = "0.1.0"
 dependencies = [
@@ -901,6 +912,7 @@ dependencies = [
  "ecu",
  "plugin-contract",
  "reconstruct",
+ "simfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

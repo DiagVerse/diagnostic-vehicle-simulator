@@ -305,6 +305,8 @@ export const api = {
   simulationRenameEcu: (requestCanIdHex: string, name: string) =>
     putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/name`, { name }),
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
+  simulationLoadSimFile: (logText: string) =>
+    postJson<SimulationState>('/simulation/simfile', { logText }),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationStart: () => postJson<SimulationState>('/simulation/start', {}),
   simulationStop: () => postJson<SimulationState>('/simulation/stop', {}),
