@@ -1,0 +1,10 @@
+[package]
+name = "plugin-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stable-ABI contract (abi_stable) that every dynamically-loaded plugin implements."
+
+[dependencies]
+abi_stable.workspace = true

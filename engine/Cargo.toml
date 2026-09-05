@@ -1,0 +1,46 @@
+# Virtual workspace for the Diagnostic Vehicle Simulator engine.
+# Dependencies point inward (hexagonal): core-domain depends on nothing engine-specific;
+# plugins depend on plugin-contract; api/app wire everything together.
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-domain",
+    "crates/plugin-contract",
+    "crates/application",
+    "crates/api",
+    "crates/app",
+    "plugins/sample",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.98"
+
+# Shared dependency versions so every crate stays in lockstep.
+[workspace.dependencies]
+# Stable-ABI plugin boundary.
+abi_stable = "0.11"
+# Async runtime + web.
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Logging / diagnostics.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Errors.
+thiserror = "1"
+anyhow = "1"
+
+# Internal crates.
+core-domain = { path = "crates/core-domain" }
+plugin-contract = { path = "crates/plugin-contract" }
+application = { path = "crates/application" }
+api = { path = "crates/api" }
+
+[profile.release]
+lto = "thin"
