@@ -65,8 +65,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(simulation::PostSimulationRequest),
         )
         .route("/simulation/reset", post(simulation::PostSimulationReset))
+        // axum 0.7 path parameters are `:name`; `{name}` would be matched as a literal
+        // segment, so the route would silently never match.
         .route(
-            "/simulation/ecus/{requestCanIdHex}/timing",
+            "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
         )
         .layer(CorsLayer::permissive())

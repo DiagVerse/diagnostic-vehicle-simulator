@@ -23,3 +23,7 @@ tracing.workspace = true
 # asserts real millisecond behaviour without actually waiting. It lives behind `test-util`,
 # which the workspace's "full" feature set does not include.
 tokio = { workspace = true, features = ["test-util"] }
+# Drive the router directly in-process, so a route that is declared but unreachable (a wrong
+# path-parameter syntax, say) fails a test rather than only showing up against a running engine.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

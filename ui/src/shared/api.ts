@@ -44,6 +44,29 @@ export interface RequestResult {
 // Simulation: a vehicle reconstructed from a CAN log, driven by CAN address.
 // ---------------------------------------------------------------------------------------
 
+/**
+ * An ECU's UDS server timing (ISO 14229-2 clause 7), in milliseconds.
+ *
+ * `p2ServerMaxMs` / `p2StarServerMaxMs` / `p4ServerMaxMs` are the parameters the ECU
+ * advertises and is judged against; the rest are fault-injection knobs that make the ECU
+ * actually slow, actually send NRC 0x78 ResponsePending, or actually never finish.
+ */
+export interface EcuTiming {
+  p2ServerMaxMs: number
+  p2StarServerMaxMs: number
+  p4ServerMaxMs: number
+  responseDelayMs: number
+  forceResponsePending: boolean
+  forcedResponsePendingCount: number
+  dropFinalResponse: boolean
+}
+
+/** The result of changing an ECU's timing. */
+export interface EcuTimingUpdate extends EcuTiming {
+  /** ISO 14229-1 carries P2/P2* only in the DiagnosticSessionControl response. */
+  advertisedAtNextSessionControl: boolean
+}
+
 /** One ECU running inside the loaded simulation. */
 export interface SimulationEcu {
   name: string
@@ -62,6 +85,7 @@ export interface SimulationEcu {
   supportedServices: number[]
   dids: number[]
   dtcCount: number
+  timing: EcuTiming
 }
 
 /** What the engine currently has loaded. */
@@ -72,15 +96,31 @@ export interface SimulationState {
   ecus: SimulationEcu[]
 }
 
-/** One ECU's answer to a routed request. */
+/** One message an ECU put on the wire, with both its scheduled and its measured offset. */
+export interface SimulationFrame {
+  atMs: number
+  actualMs: number
+  hex: string
+  /** 'responsePending' for a NRC 0x78, 'final' for the final response. */
+  kind: string
+}
+
+/** One ECU's answer to a routed request, which may be several messages over time. */
 export interface SimulationResponse {
   ecuName: string
+  requestCanIdHex: string
   responseCanIdHex: string
   responseHex: string
   suppressed: boolean
   session: number
   sessionName: string
   securityUnlocked: boolean
+  frames: SimulationFrame[]
+  finalAtMs: number | null
+  responsePendingCount: number
+  finalResponseDropped: boolean
+  isoConformant: boolean
+  conformanceWarnings: string[]
 }
 
 /**
@@ -110,8 +150,16 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
+  return sendJson<T>('POST', path, body)
+}
+
+async function putJson<T>(path: string, body: unknown): Promise<T> {
+  return sendJson<T>('PUT', path, body)
+}
+
+async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
   const res = await fetch(path, {
-    method: 'POST',
+    method,
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
@@ -150,4 +198,8 @@ export const api = {
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationRequest: (canIdHex: string, requestHex: string) =>
     postJson<SimulationRequestResult>('/simulation/request', { canIdHex, requestHex }),
+  ecuTiming: (requestCanIdHex: string) =>
+    getJson<EcuTiming>(`/simulation/ecus/${requestCanIdHex}/timing`),
+  setEcuTiming: (requestCanIdHex: string, timing: EcuTiming) =>
+    putJson<EcuTimingUpdate>(`/simulation/ecus/${requestCanIdHex}/timing`, timing),
 }

@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
 import {
   api,
+  type EcuTiming,
   type SimulationEcu,
   type SimulationRequestResult,
+  type SimulationResponse,
   type SimulationState,
 } from '../shared/api'
 
@@ -136,6 +138,15 @@ export function Simulate() {
               hexInput={hexInput}
               onHexInputChange={setHexInput}
               onSend={send}
+              busy={busy}
+            />
+            {/* Keyed by the ECU so switching address remounts the form: an unsaved draft for
+                one ECU must never be applied to another. */}
+            <TimingPanel
+              key={strSelectedCanId}
+              ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onSaved={refreshState}
+              onError={setError}
               busy={busy}
             />
             <ExchangeLog log={log} />
@@ -402,6 +413,206 @@ function RequestPanel({
 }
 
 // ---------------------------------------------------------------------------------------
+// Timing controls
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Edit one ECU's UDS server timing and make it real: a delay past P2Server_max makes the ECU
+ * send NRC 0x78 ResponsePending before it answers, exactly as ISO 14229-1 requires.
+ *
+ * The form holds a draft so a half-typed number never reaches the engine, and the engine —
+ * not the browser — validates: values it refuses come back with the reason.
+ */
+function TimingPanel({
+  ecu,
+  onSaved,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu | null
+  onSaved: () => Promise<void>
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [draft, setDraft] = useState<EcuTiming | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  // A broadcast identifier addresses several ECUs, so there is no single timing to edit.
+  if (!ecu) {
+    return (
+      <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs text-slate-500">
+        Timing is set per ECU — pick one ECU's own identifier rather than a broadcast to edit
+        it.
+      </p>
+    )
+  }
+
+  const timing = draft ?? ecu.timing
+
+  function update(patch: Partial<EcuTiming>) {
+    setDraft({ ...timing, ...patch })
+  }
+
+  async function save() {
+    if (!ecu) return
+    setSaving(true)
+    try {
+      const result = await api.setEcuTiming(ecu.requestCanIdHex, timing)
+      setDraft(null)
+      onError(null)
+      setNote(
+        result.advertisedAtNextSessionControl
+          ? 'Saved. The tester sees the new P2/P2* at its next DiagnosticSessionControl (0x10) — ISO 14229-1 carries them nowhere else.'
+          : 'Saved.',
+      )
+      await onSaved()
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const bIsDirty = draft !== null
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Timing — {ecu.name}
+        </h3>
+        <span className="text-xs text-slate-500">ISO 14229-2</span>
+      </div>
+
+      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+        <NumberField
+          label="P2 (ms)"
+          hint="Deadline to start answering"
+          value={timing.p2ServerMaxMs}
+          onChange={(v) => update({ p2ServerMaxMs: v })}
+        />
+        <NumberField
+          label="P2* (ms)"
+          hint="Deadline after a 0x78"
+          step={10}
+          value={timing.p2StarServerMaxMs}
+          onChange={(v) => update({ p2StarServerMaxMs: v })}
+        />
+        <NumberField
+          label="Delay (ms)"
+          hint="Injected think-time"
+          value={timing.responseDelayMs}
+          onChange={(v) => update({ responseDelayMs: v })}
+        />
+      </div>
+
+      <div className="mt-3 space-y-2">
+        <CheckboxField
+          label="Force ResponsePending"
+          hint="Send NRC 0x78 even when the delay would not require it"
+          checked={timing.forceResponsePending}
+          onChange={(v) => update({ forceResponsePending: v })}
+        />
+        {timing.forceResponsePending && (
+          <div className="pl-6">
+            <NumberField
+              label="Repetitions"
+              hint="How many 0x78 messages"
+              value={timing.forcedResponsePendingCount}
+              onChange={(v) => update({ forcedResponsePendingCount: v })}
+            />
+          </div>
+        )}
+        <CheckboxField
+          label="Drop the final response"
+          hint="A hung server: pendings go out, the answer never does"
+          checked={timing.dropFinalResponse}
+          onChange={(v) => update({ dropFinalResponse: v })}
+        />
+      </div>
+
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          onClick={save}
+          disabled={busy || saving || !bIsDirty}
+          className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-600 disabled:opacity-40"
+        >
+          Apply timing
+        </button>
+        {bIsDirty && (
+          <button
+            onClick={() => setDraft(null)}
+            disabled={saving}
+            className="text-xs text-slate-400 underline-offset-2 hover:underline"
+          >
+            Discard changes
+          </button>
+        )}
+      </div>
+
+      {note && !bIsDirty && <p className="mt-2 text-xs text-slate-500">{note}</p>}
+    </section>
+  )
+}
+
+function NumberField({
+  label,
+  hint,
+  value,
+  onChange,
+  step,
+}: {
+  label: string
+  hint: string
+  value: number
+  onChange: (value: number) => void
+  step?: number
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs text-slate-400">{label}</span>
+      <input
+        type="number"
+        min={0}
+        step={step ?? 1}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 font-mono text-sm text-slate-200 outline-none focus:border-slate-500"
+      />
+      <span className="mt-0.5 block text-[11px] text-slate-600">{hint}</span>
+    </label>
+  )
+}
+
+function CheckboxField({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string
+  hint: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-2">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+      />
+      <span>
+        <span className="text-sm text-slate-200">{label}</span>
+        <span className="block text-[11px] text-slate-600">{hint}</span>
+      </span>
+    </label>
+  )
+}
+
+// ---------------------------------------------------------------------------------------
 // The exchange log
 // ---------------------------------------------------------------------------------------
 
@@ -447,23 +658,67 @@ function ExchangeEntryView({ result }: { result: SimulationRequestResult }) {
         </div>
       ) : (
         result.responses.map((response) => (
-          <div key={response.responseCanIdHex} className="mt-1 flex items-start gap-2">
-            <span className="text-slate-600">←</span>
-            <span className="text-slate-500">{response.responseCanIdHex}</span>
-            {response.suppressed ? (
-              <span className="text-slate-500">
-                (response suppressed; now in {response.sessionName})
-              </span>
-            ) : (
-              <span className={IsNegative(response.responseHex) ? 'text-amber-400' : 'text-emerald-400'}>
-                {response.responseHex}
-              </span>
-            )}
-          </div>
+          <ResponseView key={response.responseCanIdHex} response={response} />
         ))
       )}
     </li>
   )
+}
+
+/**
+ * One ECU's answer. An answer can be several messages over time — any NRC 0x78
+ * ResponsePending, then the final response — so each is shown with the millisecond at which
+ * it actually went out.
+ */
+function ResponseView({ response }: { response: SimulationResponse }) {
+  const bHasFrames = response.frames.length > 0
+
+  return (
+    <div className="mt-1.5">
+      {bHasFrames ? (
+        response.frames.map((frame, iIndex) => (
+          <div key={`${frame.kind}-${iIndex}`} className="flex items-start gap-2">
+            <span className="text-slate-600">←</span>
+            <span className="w-14 shrink-0 text-right text-slate-600">+{frame.actualMs}ms</span>
+            <span className="text-slate-500">{response.responseCanIdHex}</span>
+            <span className={FrameTone(frame.kind, frame.hex)}>{frame.hex}</span>
+            {frame.kind === 'responsePending' && <Badge tone="amber">pending</Badge>}
+          </div>
+        ))
+      ) : (
+        <div className="flex items-start gap-2 text-slate-500">
+          <span className="text-slate-600">←</span>
+          <span className="text-slate-500">{response.responseCanIdHex}</span>
+          <span>
+            {response.finalResponseDropped
+              ? 'final response withheld — the tester will time out'
+              : `response suppressed; now in ${response.sessionName}`}
+          </span>
+        </div>
+      )}
+
+      {response.finalResponseDropped && bHasFrames && (
+        <div className="mt-1 pl-[4.5rem] text-rose-400">
+          final response withheld — the tester will time out after P2*
+        </div>
+      )}
+
+      {!response.isoConformant &&
+        response.conformanceWarnings.map((warning) => (
+          <div key={warning} className="mt-1 pl-[4.5rem] text-amber-500/80">
+            ⚠ {warning}
+          </div>
+        ))}
+    </div>
+  )
+}
+
+/** Colour a frame: a pending is provisional, a negative response is a refusal. */
+function FrameTone(kind: string, hex: string): string {
+  if (kind === 'responsePending') {
+    return 'text-amber-400/80'
+  }
+  return IsNegative(hex) ? 'text-amber-400' : 'text-emerald-400'
 }
 
 // ---------------------------------------------------------------------------------------
@@ -502,6 +757,20 @@ function AddressOptions(state: SimulationState | null): AddressOption[] {
   }
 
   return vecOptions
+}
+
+/**
+ * The ECU addressed by an identifier, or `null` when the identifier is a broadcast — those
+ * reach several ECUs, so there is no single one whose timing could be edited.
+ */
+function FindEcuByRequestCanId(
+  state: SimulationState | null,
+  canIdHex: string,
+): SimulationEcu | null {
+  if (!state?.loaded) {
+    return null
+  }
+  return state.ecus.find((ecu) => ecu.requestCanIdHex === canIdHex) ?? null
 }
 
 /** Colour a confidence state: an observed fact is stronger than a derived one. */

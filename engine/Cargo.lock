@@ -73,10 +73,12 @@ dependencies = [
  "axum",
  "core-domain",
  "ecu",
+ "http-body-util",
  "serde",
  "serde_json",
  "simulation",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]
