@@ -9,6 +9,7 @@ members = [
     "crates/application",
     "crates/api",
     "crates/app",
+    "crates/ecu",
     "plugins/sample",
     "plugins/protocols/l7-application/uds",
 ]
@@ -42,6 +43,8 @@ core-domain = { path = "crates/core-domain" }
 plugin-contract = { path = "crates/plugin-contract" }
 application = { path = "crates/application" }
 api = { path = "crates/api" }
+ecu = { path = "crates/ecu" }
+uds-plugin = { path = "plugins/protocols/l7-application/uds" }
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,19 @@
+[package]
+name = "ecu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Virtual ECU runtime: owns live diagnostic state and drives protocol plugins."
+
+[dependencies]
+core-domain.workspace = true
+plugin-contract.workspace = true
+application.workspace = true
+abi_stable.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The UDS plugin is linked as an rlib for the end-to-end test, exercising the real protocol
+# logic together with the ECU state machine without needing to load a dynamic library.
+uds-plugin.workspace = true
