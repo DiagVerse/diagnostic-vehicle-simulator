@@ -31,8 +31,10 @@ pub struct PluginInfo {
 /// The loaded module references are `'static` (abi_stable leaks them for the process
 /// lifetime), so `PluginHost` can be cloned cheaply where needed via its `infos`.
 pub struct PluginHost {
-    modules: Vec<PluginModRef>,
-    infos: Vec<PluginInfo>,
+    // Visible to the `protocol` module in this crate, which resolves protocol handlers from
+    // the loaded modules. Kept crate-private otherwise.
+    pub(crate) modules: Vec<PluginModRef>,
+    pub(crate) infos: Vec<PluginInfo>,
 }
 
 impl PluginHost {

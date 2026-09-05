@@ -5,5 +5,7 @@
 //! no protocol or transport work itself — those arrive as plugins.
 
 pub mod plugin_host;
+pub mod protocol;
 
 pub use plugin_host::{PluginHost, PluginInfo};
+pub use protocol::{ProtocolHandler, ProtocolPlugin};
