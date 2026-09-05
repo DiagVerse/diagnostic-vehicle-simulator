@@ -17,7 +17,7 @@ pub mod schedule;
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
-use core_domain::model::{c_u32P2StarResolutionMs, Ecu, EcuTiming};
+use core_domain::model::{c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming};
 use plugin_contract::protocol::{
     c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
     c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, RDataIdentifier, RDtc, REcuSnapshot,
@@ -34,6 +34,15 @@ const c_bySessionControlPositiveResponse: u8 = 0x50;
 /// Length of a conformant DiagnosticSessionControl positive response: SID, echoed
 /// sub-function, and the four-byte sessionParameterRecord (ISO 14229-1 Table 28).
 const c_uSessionControlResponseLength: usize = 6;
+/// Services whose response reports a state change the ECU just made, so an override that
+/// refuses the request has to roll that change back to stay coherent.
+const c_arrStateChangingServices: [u8; 3] = [0x10, 0x11, 0x27];
+
+/// The UDS services the bundled protocol plugin actually answers. Listing a service outside
+/// this set makes an ECU *claim* it, but every such request still ends in NRC 0x11
+/// serviceNotSupported unless the user supplies a response override.
+const c_arrImplementedServices: [u8; 7] = [0x10, 0x11, 0x19, 0x22, 0x27, 0x31, 0x3E];
+
 /// UDS services whose sub-function byte carries the suppressPosRspMsgIndicationBit
 /// (ISO 14229-1 Table 11): DiagnosticSessionControl, ECUReset, CommunicationControl,
 /// RoutineControl, TesterPresent, AccessTimingParameter, ControlDTCSetting, ResponseOnEvent
@@ -60,6 +69,12 @@ pub struct VirtualEcu {
     m_bySecurityUnlockedLevel: u8,
     /// Security level for which a seed was most recently issued (0 = none outstanding).
     m_byActiveSeedLevel: u8,
+    /// The state as it was when the current request arrived, so a response override that turns
+    /// a positive answer into a refusal can roll the change back and keep the ECU's words and
+    /// its state consistent.
+    m_bySessionBeforeRequest: u8,
+    m_bySecurityLevelBeforeRequest: u8,
+    m_bySeedLevelBeforeRequest: u8,
 }
 
 impl VirtualEcu {
@@ -71,6 +86,9 @@ impl VirtualEcu {
             m_byCurrentSession: c_bySessionDefault,
             m_bySecurityUnlockedLevel: 0,
             m_byActiveSeedLevel: 0,
+            m_bySessionBeforeRequest: c_bySessionDefault,
+            m_bySecurityLevelBeforeRequest: 0,
+            m_bySeedLevelBeforeRequest: 0,
         }
     }
 
@@ -161,6 +179,10 @@ impl VirtualEcu {
         // recover a response it was never told to produce.
         let vecEffectiveRequest = self.ClearSuppressBitIfPending(vecRequest, u8PendingCount);
 
+        self.m_bySessionBeforeRequest = self.m_byCurrentSession;
+        self.m_bySecurityLevelBeforeRequest = self.m_bySecurityUnlockedLevel;
+        self.m_bySeedLevelBeforeRequest = self.m_byActiveSeedLevel;
+
         let snapshot = self.BuildSnapshot();
         let outcome = protocol.Handle(RVec::from(vecEffectiveRequest), snapshot);
 
@@ -171,12 +193,90 @@ impl VirtualEcu {
         let mut vecResponse = outcome.m_vecResponse.into_vec();
         self.ApplySessionTimingRecord(&mut vecResponse);
 
+        // Overrides match the bytes the **tester actually sent**, not the copy with the
+        // suppress bit cleared: a rule written for `3E 80` must not fire on a `3E 00` this
+        // engine manufactured, and vice versa.
+        let bWasSuppressedByProtocol = vecResponse.is_empty();
+        let optOverridden = self.ApplyResponseOverride(vecRequest, bWasSuppressedByProtocol);
+        if let Some(vecOverridden) = optOverridden {
+            self.DiscardStateChangesOnRefusal(byRequestSid, &vecResponse, &vecOverridden);
+            vecResponse = vecOverridden;
+        }
+
         BuildResponsePlan(
             &self.m_config.m_timing,
             byRequestSid,
             &vecResponse,
             u8PendingCount,
         )
+    }
+
+    /// Apply the user's answer for this request, if one matches.
+    ///
+    /// Returns the replacement bytes (empty for a suppressing override), or `None` when no
+    /// override applies and the protocol's own response stands.
+    fn ApplyResponseOverride(
+        &self,
+        vecRequest: &[u8],
+        bWasSuppressedByProtocol: bool,
+    ) -> Option<Vec<u8>> {
+        let overrideRule = self.m_config.FindMatchingOverride(vecRequest)?;
+
+        // The tester set the suppressPosRspMsgIndicationBit and is not listening for an
+        // answer, so putting one on the wire is fault injection rather than a fix. It stays
+        // possible, but only when asked for explicitly.
+        if bWasSuppressedByProtocol && !overrideRule.m_bRespondEvenIfSuppressed {
+            tracing::debug!(
+                ecu = %self.m_config.m_strName,
+                "override skipped: the tester suppressed the positive response for this request"
+            );
+            return None;
+        }
+
+        let vecOverridden = overrideRule.BuildResponse(vecRequest).unwrap_or_default();
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            sid = format!("{:02X}", vecRequest[0]),
+            responseBytes = vecOverridden.len(),
+            note = %overrideRule.m_strNote,
+            "response override applied"
+        );
+        Some(vecOverridden)
+    }
+
+    /// Undo the state changes the protocol just applied when an override turned its positive
+    /// response into a refusal.
+    ///
+    /// Without this the ECU says "I refused" while sitting in the session it just entered —
+    /// its words and its state disagree in a way no real ECU does, and the next request
+    /// behaves inexplicably. Only the services whose response reports a state change are
+    /// affected; for everything else an override really is words only.
+    fn DiscardStateChangesOnRefusal(
+        &mut self,
+        byRequestSid: u8,
+        vecProtocolResponse: &[u8],
+        vecOverridden: &[u8],
+    ) {
+        if !c_arrStateChangingServices.contains(&byRequestSid) {
+            return;
+        }
+
+        let bWasPositive = vecProtocolResponse
+            .first()
+            .is_some_and(|byFirst| *byFirst != c_byNegativeResponseSid);
+        let bIsNowNegative = vecOverridden.first() == Some(&c_byNegativeResponseSid);
+        if !bWasPositive || !bIsNowNegative {
+            return;
+        }
+
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            sid = format!("{byRequestSid:02X}"),
+            "override turned a positive response into a refusal; rolling the state change back so the ECU's state matches what it said"
+        );
+        self.m_byCurrentSession = self.m_bySessionBeforeRequest;
+        self.m_bySecurityUnlockedLevel = self.m_bySecurityLevelBeforeRequest;
+        self.m_byActiveSeedLevel = self.m_bySeedLevelBeforeRequest;
     }
 
     /// How many ResponsePending messages this request may carry.
@@ -186,7 +286,12 @@ impl VirtualEcu {
     /// `P4 == P2`. Both are decidable before the handler runs, which is what lets the
     /// suppress-bit decision above be made in time.
     fn ResolvePendingCountFor(&self, byRequestSid: u8) -> u8 {
-        let bIsServiceSupported = self.m_config.IsServiceSupported(byRequestSid);
+        // "Declared supported" is not the same as "will actually answer": a service the user
+        // listed but no protocol handler implements still ends in NRC 0x11, and prefixing that
+        // with ResponsePending would be nonsense — 0x78 means "this is mine and I am working
+        // on it". So a service only earns a pending sequence if something can answer it.
+        let bIsServiceSupported = self.m_config.IsServiceSupported(byRequestSid)
+            && c_arrImplementedServices.contains(&byRequestSid);
         let bHasEnhancedBudget =
             self.m_config.m_timing.m_u32P4ServerMaxMs > self.m_config.m_timing.m_u32P2ServerMaxMs;
 

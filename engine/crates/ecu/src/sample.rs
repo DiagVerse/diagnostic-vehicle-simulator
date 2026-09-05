@@ -8,6 +8,11 @@ use core_domain::Confidence;
 
 /// Build a representative engine ECU: the Phase 1 service set, one DID (VIN), one DTC, and
 /// one security level with a fixed seed/key pair.
+///
+/// Every value here is **invented** for the demo, so each carries `Confidence::Unknown`.
+/// Nothing observed this VIN or this DTC, and labelling them `Observed` would be exactly the
+/// fabricated certainty README §7 forbids — a UI that renders confidence would then present
+/// demo data as evidence.
 pub fn BuildEngineEcu() -> Ecu {
     let mut ecu = Ecu::New("Engine_ECU", 0x1001);
 
@@ -22,15 +27,17 @@ pub fn BuildEngineEcu() -> Ecu {
         0xF190,
         DataIdentifier {
             m_u16Id: 0xF190,
-            m_vecValue: b"VIN0123456789XYZ".to_vec(),
-            m_confidence: Confidence::Observed,
+            // A VIN is 17 characters (ISO 3779). This one contains "I" and "O", which
+            // ISO 3779 excludes, so it cannot be mistaken for a real vehicle's.
+            m_vecValue: b"SIMULATORVIN00001".to_vec(),
+            m_confidence: Confidence::Unknown,
         },
     );
 
     ecu.m_vecDtcs.push(DiagnosticTroubleCode {
         m_u32Code: 0x123456,
         m_byStatus: 0x2F,
-        m_confidence: Confidence::Observed,
+        m_confidence: Confidence::Unknown,
     });
 
     ecu.m_vecSecurityLevels.push(SecurityLevel {

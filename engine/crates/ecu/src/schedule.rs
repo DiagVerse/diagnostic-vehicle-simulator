@@ -154,11 +154,17 @@ pub fn BuildResponsePlan(
 
     let bIsFinalResponseDropped = timing.m_bDropFinalResponse && !vecFinalResponse.is_empty();
 
+    // A ResponsePending is a promise to answer (ISO 14229-1 Annex A.1), so *any* plan that
+    // sends one without a final response breaks it — whether the answer was withheld by fault
+    // injection, suppressed by the tester, or replaced by a suppressing override. Keying the
+    // check on the schedule rather than on the reason catches all three.
+    let bIsMissingFinalAfterPending = !vecPendingOffsets.is_empty() && !bHasFinalResponse;
+
     let vecWarnings = CollectConformanceWarnings(
         timing,
         &vecPendingOffsets,
         u32FinalAtMs,
-        bIsFinalResponseDropped,
+        bIsMissingFinalAfterPending,
     );
 
     ResponsePlan {
@@ -212,13 +218,13 @@ fn CollectConformanceWarnings(
     timing: &EcuTiming,
     vecPendingOffsets: &[u32],
     u32FinalAtMs: u32,
-    bIsFinalResponseDropped: bool,
+    bIsMissingFinalAfterPending: bool,
 ) -> Vec<String> {
     let mut vecWarnings = Vec::new();
 
-    if bIsFinalResponseDropped {
+    if bIsMissingFinalAfterPending {
         vecWarnings.push(
-            "no final response is sent; ISO 14229-1 Annex A.1 requires one after a ResponsePending, and P4Server_max would be missed in any case"
+            "a ResponsePending was sent but no final response follows it; ISO 14229-1 Annex A.1 requires one, so the tester will wait out P2*Server_max and time out"
                 .to_string(),
         );
     }
@@ -234,7 +240,7 @@ fn CollectConformanceWarnings(
         CheckPendingGaps(timing, vecPendingOffsets, u32FinalAtMs, &mut vecWarnings);
     }
 
-    if !bIsFinalResponseDropped && u32FinalAtMs > timing.m_u32P4ServerMaxMs {
+    if !bIsMissingFinalAfterPending && u32FinalAtMs > timing.m_u32P4ServerMaxMs {
         vecWarnings.push(format!(
             "the final response starts at {u32FinalAtMs} ms, exceeding P4Server_max of {} ms",
             timing.m_u32P4ServerMaxMs
