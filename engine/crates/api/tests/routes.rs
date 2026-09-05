@@ -71,6 +71,11 @@ async fn every_simulation_route_is_reachable() {
             "/simulation/ecus",
             r#"{"name":"Engine","requestCanIdHex":"7E0","responseCanIdHex":"7E8"}"#,
         ),
+        (
+            "POST",
+            "/simulation/networks",
+            r#"{"id":"powertrain","name":"Powertrain CAN","kind":"CAN"}"#,
+        ),
     ];
 
     for (strMethod, strPath, strBody) in vecRoutes {
@@ -126,5 +131,29 @@ async fn the_per_ecu_builder_routes_match_a_can_identifier() {
     assert_eq!(
         StatusOf("PUT", "/simulation/ecus/ZZZ/name", r#"{"name":"Engine"}"#).await,
         StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn the_architecture_routes_match_their_path_parameters() {
+    // Same trap as every other parameterised route: `{networkId}` would be matched as a
+    // literal segment and the handler never reached. A malformed CAN identifier proves the
+    // placement handler ran; the network route is proved by a conflict rather than a 404,
+    // since with nothing loaded there is no vehicle to remove a network from.
+    assert_eq!(
+        StatusOf(
+            "PUT",
+            "/simulation/ecus/ZZZ/placement",
+            r#"{"networkId":"powertrain","gatewayForNetworkIds":[]}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+
+    let status = StatusOf("DELETE", "/simulation/networks/powertrain", "").await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "DELETE /simulation/networks/:networkId is not reachable"
     );
 }

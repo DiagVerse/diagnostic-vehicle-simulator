@@ -21,7 +21,8 @@ use core_domain::model::{
 use core_domain::Confidence;
 
 use crate::dto::{
-    c_uCurrentVersion, EcuDto, NetworkDto, ResponseDto, SimFileDto, TimingDto, ValueDto,
+    c_uCurrentVersion, c_uMinSupportedVersion, CanAddressDto, EcuDto, NetworkDto, ResponseDto,
+    SimFileDto, TimingDto, ValueDto,
 };
 use crate::encode::{ParseDtcCode, ParseHexByte, ParseHexBytes, ParseHexPattern, ParseStatusByte};
 
@@ -33,8 +34,20 @@ pub enum SimFileError {
     Malformed { strReason: String },
 
     /// Written for a version of the format this engine does not know.
-    #[error("the file says it is version {uFileVersion}; this engine understands version {c_uCurrentVersion}")]
+    #[error("the file says it is version {uFileVersion}; this engine understands versions {c_uMinSupportedVersion} to {c_uCurrentVersion}")]
     UnsupportedVersion { uFileVersion: u32 },
+
+    /// The declared wiring does not describe a vehicle that could exist.
+    #[error("{0}")]
+    Topology(#[from] core_domain::model::TopologyError),
+
+    /// An ECU says nothing about how anything reaches it.
+    #[error("ECU '{strEcuName}' has neither CAN identifiers nor a DoIP logical address, so nothing could address it")]
+    NoAddressing { strEcuName: String },
+
+    /// An ECU gives its CAN identifiers twice, in both spellings.
+    #[error("ECU '{strEcuName}' sets both 'can' and the older 'requestCanId'/'responseCanId'; use one or the other")]
+    DuplicateCanAddressing { strEcuName: String },
 
     /// A field could not be read.
     #[error("{strWhere}: {strReason}")]
@@ -71,7 +84,9 @@ pub fn LoadFromText(strContent: &str) -> Result<Vehicle, SimFileError> {
             strReason: error.to_string(),
         })?;
 
-    if file.simfile_version != c_uCurrentVersion {
+    let bIsSupported =
+        file.simfile_version >= c_uMinSupportedVersion && file.simfile_version <= c_uCurrentVersion;
+    if !bIsSupported {
         return Err(SimFileError::UnsupportedVersion {
             uFileVersion: file.simfile_version,
         });
@@ -83,18 +98,31 @@ pub fn LoadFromText(strContent: &str) -> Result<Vehicle, SimFileError> {
     let vecNetworks = BuildNetworks(&file.networks)?;
     let vecEcus = BuildEcus(&file.ecus, &vecNetworks)?;
 
-    tracing::info!(
-        vehicle = %file.vehicle,
-        networks = vecNetworks.len(),
-        ecus = vecEcus.len(),
-        "loaded a simulation file"
-    );
-
-    Ok(Vehicle {
+    let mut vehicle = Vehicle {
         m_strName: file.vehicle,
         m_vecEcus: vecEcus,
         m_vecNetworks: vecNetworks,
-    })
+    };
+
+    // Order matters: entry points are decided first, because whether the wiring makes sense
+    // and how deep each ECU sits are both answers relative to where a tester attaches.
+    vehicle.NormalizeEntryPoints();
+    vehicle.ValidateTopology()?;
+
+    let uGatewayCount = vehicle
+        .m_vecEcus
+        .iter()
+        .filter(|ecu| !ecu.m_vecGatewayForNetworkIds.is_empty())
+        .count();
+    tracing::info!(
+        vehicle = %vehicle.m_strName,
+        networks = vehicle.m_vecNetworks.len(),
+        ecus = vehicle.m_vecEcus.len(),
+        gateways = uGatewayCount,
+        "loaded a simulation file"
+    );
+
+    Ok(vehicle)
 }
 
 /// Turn the file's buses into model networks, refusing two that share an id.
@@ -117,6 +145,7 @@ fn BuildNetworks(vecDtos: &[NetworkDto]) -> Result<Vec<Network>, SimFileError> {
             m_kind: ParseNetworkKind(&dto.kind, &dto.id)?,
             m_optU32BitrateBps: dto.bitrate_bps,
             m_optU32DataBitrateBps: dto.data_bitrate_bps,
+            m_bIsDiagnosticEntryPoint: dto.entry_point,
             // Stated by the file's author, who knows the vehicle. Nothing was observed, but
             // nothing was guessed.
             m_confidence: Confidence::Confirmed,
@@ -167,24 +196,22 @@ fn BuildEcu(dto: &EcuDto, vecNetworks: &[Network]) -> Result<Ecu, SimFileError> 
         }
     }
 
-    let u32RequestCanId = ParseCanId(&dto.request_can_id, &strWhere)?;
-    let u32ResponseCanId = ParseCanId(&dto.response_can_id, &strWhere)?;
-    if u32RequestCanId == u32ResponseCanId {
-        return Err(SimFileError::BadField {
-            strWhere,
-            strReason: "an ECU cannot request and respond on the same CAN id".to_string(),
+    let optCanAddress = BuildCanAddress(dto, &strWhere)?;
+    let optU16DoIpAddress = BuildDoIpAddress(dto, &strWhere)?;
+
+    // An ECU nothing can address is a description of nothing. Either transport will do — this
+    // is where the file's CAN-or-DoIP-or-both freedom stops being free.
+    if optCanAddress.is_none() && optU16DoIpAddress.is_none() {
+        return Err(SimFileError::NoAddressing {
+            strEcuName: dto.name.clone(),
         });
     }
 
-    let mode = ParseAddressing(dto, u32RequestCanId, u32ResponseCanId, &strWhere)?;
-
-    let mut ecu = Ecu::New(&dto.name, dto.logical_address.unwrap_or(0));
-    ecu.m_optCanAddress = Some(CanAddress::NewSpecified(
-        u32RequestCanId,
-        u32ResponseCanId,
-        mode,
-    ));
+    let mut ecu = Ecu::New(&dto.name, optU16DoIpAddress.unwrap_or(0));
+    ecu.m_bHasDoIpAddress = optU16DoIpAddress.is_some();
+    ecu.m_optCanAddress = optCanAddress;
     ecu.m_optStrNetworkId = dto.network.clone();
+    ecu.m_vecGatewayForNetworkIds = dto.gateway_for.clone();
     ecu.m_vecSupportedSessions = ParseSessions(&dto.sessions, &strWhere)?;
     ecu.m_vecSupportedServices = ParseServices(dto, &strWhere)?;
     ecu.m_mapSessionServices = ParseSessionServices(dto, &strWhere)?;
@@ -230,6 +257,104 @@ fn RejectDuplicateIdentifiers(vecEcus: &[Ecu], candidate: &Ecu) -> Result<(), Si
     Ok(())
 }
 
+/// Read an ECU's CAN addressing, in either the version 2 or the version 1 spelling.
+///
+/// Returns `None` for an ECU that declares none, which is legitimate: a DoIP-only ECU behind a
+/// gateway has no CAN identifiers to give.
+fn BuildCanAddress(dto: &EcuDto, strWhere: &str) -> Result<Option<CanAddress>, SimFileError> {
+    let bHasLegacyPair = dto.request_can_id.is_some() || dto.response_can_id.is_some();
+    if dto.can.is_some() && bHasLegacyPair {
+        return Err(SimFileError::DuplicateCanAddressing {
+            strEcuName: dto.name.clone(),
+        });
+    }
+
+    let can = match ResolveCanBlock(dto, strWhere)? {
+        Some(can) => can,
+        None => return Ok(None),
+    };
+
+    let u32RequestCanId = ParseCanId(&can.request, strWhere)?;
+    let u32ResponseCanId = ParseCanId(&can.response, strWhere)?;
+    if u32RequestCanId == u32ResponseCanId {
+        return Err(SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: "an ECU cannot request and respond on the same CAN id".to_string(),
+        });
+    }
+
+    let mode = ParseAddressing(
+        can.addressing.as_deref(),
+        u32RequestCanId,
+        u32ResponseCanId,
+        strWhere,
+    )?;
+
+    let mut address = CanAddress::NewSpecified(u32RequestCanId, u32ResponseCanId, mode);
+    if let Some(strFunctional) = &can.functional {
+        let u32FunctionalCanId = ParseCanId(strFunctional, strWhere)?;
+        if u32FunctionalCanId == u32RequestCanId {
+            return Err(SimFileError::BadField {
+                strWhere: strWhere.to_string(),
+                strReason: format!(
+                    "0x{u32FunctionalCanId:X} is given as the functional id and as this ECU's own request id; routing could not tell the two apart"
+                ),
+            });
+        }
+        address.m_optU32FunctionalCanId = Some(u32FunctionalCanId);
+    }
+    Ok(Some(address))
+}
+
+/// Gather the CAN block from whichever spelling the file used.
+///
+/// Version 1 wrote the identifiers flat on the ECU and had no functional id; version 2 groups
+/// them, so the loader normalises to the version 2 shape and everything downstream sees one.
+fn ResolveCanBlock(dto: &EcuDto, strWhere: &str) -> Result<Option<CanAddressDto>, SimFileError> {
+    if let Some(can) = &dto.can {
+        return Ok(Some(can.clone()));
+    }
+
+    match (&dto.request_can_id, &dto.response_can_id) {
+        (None, None) => Ok(None),
+        (Some(strRequest), Some(strResponse)) => Ok(Some(CanAddressDto {
+            request: strRequest.clone(),
+            response: strResponse.clone(),
+            addressing: dto.addressing.clone(),
+            functional: None,
+        })),
+        // Half a pair cannot be routed and is far more likely a typo than an intention.
+        _ => Err(SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason:
+                "requestCanId and responseCanId come as a pair; give both, or use the 'can' block"
+                    .to_string(),
+        }),
+    }
+}
+
+/// Read an ECU's DoIP logical address, in either spelling.
+fn BuildDoIpAddress(dto: &EcuDto, strWhere: &str) -> Result<Option<u16>, SimFileError> {
+    if let Some(doip) = &dto.doip {
+        let strTrimmed = doip.logical_address.trim();
+        let strDigits = strTrimmed
+            .strip_prefix("0x")
+            .or_else(|| strTrimmed.strip_prefix("0X"))
+            .unwrap_or(strTrimmed);
+
+        let u16LogicalAddress =
+            u16::from_str_radix(strDigits, 16).map_err(|_| SimFileError::BadField {
+                strWhere: strWhere.to_string(),
+                strReason: format!(
+                    "'{}' is not a hex DoIP logical address",
+                    doip.logical_address
+                ),
+            })?;
+        return Ok(Some(u16LogicalAddress));
+    }
+    Ok(dto.logical_address)
+}
+
 /// Read a CAN identifier written in hex, with or without an `0x`.
 fn ParseCanId(strValue: &str, strWhere: &str) -> Result<u32, SimFileError> {
     let strTrimmed = strValue.trim();
@@ -254,12 +379,12 @@ fn ParseCanId(strValue: &str, strWhere: &str) -> Result<u32, SimFileError> {
 
 /// Read the addressing mode, or work it out from the identifier width.
 fn ParseAddressing(
-    dto: &EcuDto,
+    optStrAddressing: Option<&str>,
     u32RequestCanId: u32,
     u32ResponseCanId: u32,
     strWhere: &str,
 ) -> Result<CanAddressingMode, SimFileError> {
-    match dto.addressing.as_deref() {
+    match optStrAddressing {
         None => {
             let bIsExtended = u32RequestCanId > 0x7FF || u32ResponseCanId > 0x7FF;
             Ok(if bIsExtended {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, DetailRow, type BadgeTone } from '../components/primitives'
 import { NEGATIVE_RESPONSES, UDS_CATALOGUE } from './udsCatalogue'
 import {
@@ -10,6 +10,7 @@ import {
   type SimulationRequestResult,
   type SimulationResponse,
   type SimulationState,
+  type TopologyLink,
 } from '../shared/api'
 
 /** A quick action maps a human label to a fixed UDS request (hex). */
@@ -278,18 +279,42 @@ function VehicleBuilder({
   busy: boolean
 }) {
   const [vehicleName, setVehicleName] = useState('Bench vehicle')
+  const [newBusId, setNewBusId] = useState('')
+  const [newBusName, setNewBusName] = useState('')
+  const [newBusKind, setNewBusKind] = useState('CAN')
   const [draft, setDraft] = useState<NewEcu>({
     name: '',
     requestCanIdHex: '',
     responseCanIdHex: '',
   })
   const [working, setWorking] = useState(false)
+  const [links, setLinks] = useState<TopologyLink[]>([])
+
+  // The buses this vehicle has, so an ECU can be placed as it is added rather than only
+  // afterwards. Refreshed whenever the vehicle changes, since starting a new one clears them.
+  // A failure leaves the list empty: a vehicle may simply not be loaded yet, and an empty
+  // dropdown says "no buses declared", which is the truth in both cases.
+  const refreshLinks = useCallback(
+    () =>
+      api
+        .simulationTopology()
+        .then((topology) =>
+          setLinks(topology.links.filter((link) => link.id !== 'diagnostic-link')),
+        )
+        .catch(() => setLinks([])),
+    [],
+  )
+
+  useEffect(() => {
+    refreshLinks()
+  }, [refreshLinks])
 
   async function run(action: () => Promise<SimulationState>) {
     setWorking(true)
     try {
       onChanged(await action())
       onError(null)
+      await refreshLinks()
       return true
     } catch (e) {
       onError(DescribeError(e))
@@ -302,7 +327,26 @@ function VehicleBuilder({
   async function addEcu() {
     const ok = await run(() => api.simulationAddEcu(draft))
     if (ok) {
-      setDraft({ name: '', requestCanIdHex: '', responseCanIdHex: '' })
+      // The bus is deliberately kept: adding several ECUs to one bus is the common case.
+      setDraft({
+        name: '',
+        requestCanIdHex: '',
+        responseCanIdHex: '',
+        networkId: draft.networkId,
+      })
+    }
+  }
+
+  async function declareBus() {
+    const strId = newBusId.trim()
+    if (!strId) return
+    const ok = await run(async () => {
+      await api.simulationDeclareNetwork({ id: strId, name: newBusName.trim() || strId, kind: newBusKind })
+      return api.simulationState()
+    })
+    if (ok) {
+      setNewBusId('')
+      setNewBusName('')
     }
   }
 
@@ -340,6 +384,46 @@ function VehicleBuilder({
         every service the engine&rsquo;s UDS plugin implements, so it answers straight away.
       </p>
 
+      <div className="mt-4 flex flex-wrap items-end gap-2 border-t border-slate-800 pt-4">
+        <TextField
+          label="Bus id"
+          placeholder="powertrain"
+          value={newBusId}
+          onChange={setNewBusId}
+        />
+        <TextField
+          label="Bus name"
+          placeholder="Powertrain CAN"
+          value={newBusName}
+          onChange={setNewBusName}
+        />
+        <label className="flex flex-col gap-1">
+          <span className="text-xs text-slate-400">Kind</span>
+          <select
+            value={newBusKind}
+            onChange={(e) => setNewBusKind(e.target.value)}
+            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+          >
+            <option value="CAN">CAN</option>
+            <option value="CAN-FD">CAN-FD</option>
+            <option value="Ethernet">Ethernet / DoIP</option>
+          </select>
+        </label>
+        <button
+          onClick={declareBus}
+          disabled={busy || working || newBusId.trim().length === 0}
+          className="rounded-md border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:opacity-40"
+        >
+          Declare bus
+        </button>
+      </div>
+
+      <p className="mt-2 text-xs text-slate-600">
+        Declare the buses first and each ECU can be placed as it is added. Which ECU gateways
+        onto which bus is set in the Topology tab, where the whole architecture is visible at
+        once.
+      </p>
+
       <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_7rem_7rem_auto] sm:items-end">
         <TextField
           label="ECU name"
@@ -361,6 +445,21 @@ function VehicleBuilder({
           value={draft.responseCanIdHex}
           onChange={(v) => setDraft({ ...draft, responseCanIdHex: v })}
         />
+        <label className="flex flex-col gap-1">
+          <span className="text-xs text-slate-400">On bus</span>
+          <select
+            value={draft.networkId ?? ''}
+            onChange={(e) => setDraft({ ...draft, networkId: e.target.value || null })}
+            className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+          >
+            <option value="">nobody has said</option>
+            {links.map((link) => (
+              <option key={link.id} value={link.id}>
+                {link.label}
+              </option>
+            ))}
+          </select>
+        </label>
         <button
           onClick={addEcu}
           disabled={busy || working || !bCanAdd}

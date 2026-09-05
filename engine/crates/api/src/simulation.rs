@@ -12,7 +12,7 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ::simulation::execute::{EmittedFrame, ExecutePlans};
@@ -25,7 +25,7 @@ use axum::{
 };
 use core_domain::model::{
     CanAddress, CanAddressingMode, EchoSpan, Ecu, EcuTiming, Network, NetworkKind, OverrideAction,
-    ResponseOverride, SessionType,
+    ResponseOverride, SessionType, Vehicle,
 };
 use core_domain::Confidence;
 use ecu::VirtualEcu;
@@ -126,6 +126,12 @@ pub struct CreateEcuBody {
     pub supported_services: Option<Vec<u8>>,
     #[serde(default)]
     pub logical_address: Option<u16>,
+    /// The id of the network it sits on. Left out means nobody has said.
+    #[serde(default)]
+    pub network_id: Option<String>,
+    /// The networks it forwards diagnostics onto, making it a gateway.
+    #[serde(default)]
+    pub gateway_for_network_ids: Vec<String>,
 }
 
 /// Request body for renaming an ECU.
@@ -655,6 +661,13 @@ pub struct TopologyLinkDto {
     /// How confidently the membership of this link is known. Never `Observed` for a link
     /// derived from a capture, because a capture cannot observe bus membership.
     pub membership_confidence: String,
+    /// True for a link a tester attaches to directly. Everything else hangs off a gateway.
+    pub is_entry_point: bool,
+    /// How many gateways a tester crosses to reach this link. `0` for an entry point; `null`
+    /// when no chain of gateways connects it to one, which is a link nothing can reach.
+    pub depth: Option<usize>,
+    /// The node id of the ECU that forwards onto this link, when one does.
+    pub reached_via_node_id: Option<String>,
 }
 
 /// One node hanging off a link.
@@ -672,8 +685,23 @@ pub struct TopologyNodeDto {
     /// How the identifier pair was established — rendered so an inferred pair is visibly
     /// weaker than an observed one.
     pub address_confidence: Option<String>,
-    /// True when the ECU is in the model but cannot be reached on CAN.
+    /// True when the ECU is in the model but nothing can currently reach it.
     pub is_unreachable: bool,
+    /// Why, in the user's words, when `is_unreachable` is set.
+    pub unreachable_reason: Option<String>,
+    /// Its DoIP logical address in hex, when it has one.
+    pub logical_address_hex: Option<String>,
+    /// Which transports address this ECU: "CAN", "DoIP", or both.
+    pub transports: Vec<String>,
+    /// The links this ECU forwards onto, making it a gateway.
+    pub gateway_for_link_ids: Vec<String>,
+    /// The gateways a tester crosses to reach it, nearest the tester first.
+    pub reached_via_ecu_names: Vec<String>,
+    /// How many gateways that is.
+    pub hop_count: usize,
+    /// False when the ECU is declared but the engine cannot drive it on the wire — a DoIP-only
+    /// ECU today, since the wire-level simulation is CAN.
+    pub is_simulated: bool,
 }
 
 /// The diagram, plus the caveats that belong next to it.
@@ -694,85 +722,130 @@ pub async fn GetTopology(State(state): State<Arc<AppState>>) -> Json<TopologyDto
     Json(BuildTopologyDto(&simulation))
 }
 
-/// Build the diagram from the running ECUs and whatever is known about how they are wired.
+/// Build the diagram from the vehicle model and whatever is known about how it is wired.
 ///
-/// A vehicle that states its buses gets one link per bus. One that does not — reconstructed
-/// from a capture, or built by hand — gets a single link that is honest about being a
-/// reachability set rather than a wire.
+/// Drawn from the declared vehicle rather than only the running ECUs, so an ECU the engine
+/// cannot yet drive on the wire — one reachable only over DoIP — is still part of the picture,
+/// marked as declared rather than quietly missing.
+///
+/// A vehicle that declares its buses gets one link per bus, arranged by how many gateways a
+/// tester crosses to reach each. One that does not — reconstructed from a capture, or built by
+/// hand and not yet placed — gets a single link that is honest about being a reachability set
+/// rather than a wire.
 fn BuildTopologyDto(simulation: &SimulationService) -> TopologyDto {
-    let vecEcus: Vec<&VirtualEcu> = simulation
-        .RunningEcus()
-        .map(|(_, runningEcu)| runningEcu)
-        .collect();
-
     let optVehicle = simulation.Vehicle();
-    if vecEcus.is_empty() {
-        return TopologyDto {
-            vehicle_name: optVehicle.map(|vehicle| vehicle.m_strName.clone()),
-            links: Vec::new(),
-            nodes: Vec::new(),
-            caveats: Vec::new(),
-        };
-    }
+    let vehicle = match optVehicle {
+        Some(vehicle) if !vehicle.m_vecEcus.is_empty() => vehicle,
+        _ => {
+            return TopologyDto {
+                vehicle_name: optVehicle.map(|vehicle| vehicle.m_strName.clone()),
+                links: Vec::new(),
+                nodes: Vec::new(),
+                caveats: Vec::new(),
+            }
+        }
+    };
 
-    let vecNetworks: &[Network] = optVehicle
-        .map(|vehicle| vehicle.m_vecNetworks.as_slice())
-        .unwrap_or(&[]);
+    let bHasStatedNetworks = !vehicle.m_vecNetworks.is_empty();
+    let mapDepths = vehicle.NetworkDepths();
 
-    let vecLinks = if vecNetworks.is_empty() {
-        vec![BuildDerivedLink(&vecEcus)]
+    let vecLinks = if bHasStatedNetworks {
+        vehicle
+            .m_vecNetworks
+            .iter()
+            .map(|network| BuildStatedLink(vehicle, network, &mapDepths))
+            .collect()
     } else {
-        vecNetworks.iter().map(BuildStatedLink).collect()
+        vec![BuildDerivedLink(vehicle)]
     };
 
     TopologyDto {
-        vehicle_name: optVehicle.map(|vehicle| vehicle.m_strName.clone()),
-        nodes: BuildTopologyNodes(&vecEcus, !vecNetworks.is_empty()),
+        vehicle_name: Some(vehicle.m_strName.clone()),
+        nodes: BuildTopologyNodes(simulation, vehicle, bHasStatedNetworks),
         links: vecLinks,
-        caveats: BuildTopologyCaveats(&vecEcus, vecNetworks),
+        caveats: BuildTopologyCaveats(vehicle),
     }
 }
 
 /// A link the vehicle actually declares.
-fn BuildStatedLink(network: &Network) -> TopologyLinkDto {
+fn BuildStatedLink(
+    vehicle: &Vehicle,
+    network: &Network,
+    mapDepths: &BTreeMap<String, usize>,
+) -> TopologyLinkDto {
     let strLabel = match network.m_optU32BitrateBps {
         Some(u32BitrateBps) => format!("{} · {} kbit/s", network.m_strName, u32BitrateBps / 1000),
         None => network.m_strName.clone(),
     };
 
+    let optGatewayNodeId = vehicle
+        .FindGatewayForNetwork(&network.m_strId)
+        .map(TopologyNodeId);
+
     TopologyLinkDto {
         id: network.m_strId.clone(),
         label: strLabel,
         kind: NetworkKindName(network.m_kind),
-        functional_can_ids_hex: Vec::new(),
+        functional_can_ids_hex: FunctionalIdsOnNetwork(vehicle, Some(network.m_strId.as_str())),
         membership_confidence: ConfidenceName(network.m_confidence),
+        is_entry_point: network.m_bIsDiagnosticEntryPoint,
+        depth: mapDepths.get(&network.m_strId).copied(),
+        reached_via_node_id: optGatewayNodeId,
     }
 }
 
 /// The single link drawn when nothing said how the ECUs are wired.
-fn BuildDerivedLink(vecEcus: &[&VirtualEcu]) -> TopologyLinkDto {
+fn BuildDerivedLink(vehicle: &Vehicle) -> TopologyLinkDto {
+    TopologyLinkDto {
+        id: c_strDiagnosticLinkId.to_string(),
+        label: "Diagnostic link, as captured".to_string(),
+        kind: "CAN".to_string(),
+        functional_can_ids_hex: FunctionalIdsOnNetwork(vehicle, None),
+        // A capture cannot observe bus membership, and a hand-built model has not been asked
+        // about it, so the strongest honest claim is that these ECUs were reached together.
+        membership_confidence: ConfidenceName(Confidence::Inferred),
+        // Whatever this set is, it is what the tester was plugged into.
+        is_entry_point: true,
+        depth: Some(0),
+        reached_via_node_id: None,
+    }
+}
+
+/// The broadcast identifiers a tester can use on one link, or across the whole vehicle.
+fn FunctionalIdsOnNetwork(vehicle: &Vehicle, optStrNetworkId: Option<&str>) -> Vec<String> {
     let mut setFunctionalIds: BTreeSet<u32> = BTreeSet::new();
-    for runningEcu in vecEcus {
-        if let Some(address) = runningEcu.Config().m_optCanAddress {
+
+    for ecu in &vehicle.m_vecEcus {
+        let bIsOnLink = match optStrNetworkId {
+            Some(strNetworkId) => ecu.m_optStrNetworkId.as_deref() == Some(strNetworkId),
+            None => true,
+        };
+        if !bIsOnLink {
+            continue;
+        }
+        if let Some(address) = ecu.m_optCanAddress {
             if let Some(u32FunctionalCanId) = address.m_optU32FunctionalCanId {
                 setFunctionalIds.insert(u32FunctionalCanId);
             }
         }
     }
+    setFunctionalIds.iter().copied().map(FormatCanId).collect()
+}
 
-    TopologyLinkDto {
-        id: c_strDiagnosticLinkId.to_string(),
-        label: "Diagnostic link, as captured".to_string(),
-        kind: "CAN".to_string(),
-        functional_can_ids_hex: setFunctionalIds.iter().copied().map(FormatCanId).collect(),
-        // A capture cannot observe bus membership, and a hand-built model has not been asked
-        // about it, so the strongest honest claim is that these ECUs were reached together.
-        membership_confidence: ConfidenceName(Confidence::Inferred),
+/// The id a node is referred to by. An ECU with no CAN identifiers still needs one.
+fn TopologyNodeId(ecu: &Ecu) -> String {
+    match ecu.m_optCanAddress {
+        Some(address) => FormatCanId(address.m_u32RequestCanId),
+        None => format!("doip-{:04X}", ecu.m_u16LogicalAddress),
     }
 }
 
-/// The tester plus one node per ECU.
-fn BuildTopologyNodes(vecEcus: &[&VirtualEcu], bHasStatedNetworks: bool) -> Vec<TopologyNodeDto> {
+/// The tester plus one node per declared ECU.
+fn BuildTopologyNodes(
+    simulation: &SimulationService,
+    vehicle: &Vehicle,
+    bHasStatedNetworks: bool,
+) -> Vec<TopologyNodeDto> {
     let mut vecNodes = vec![TopologyNodeDto {
         id: "tester".to_string(),
         label: "Tester".to_string(),
@@ -784,35 +857,111 @@ fn BuildTopologyNodes(vecEcus: &[&VirtualEcu], bHasStatedNetworks: bool) -> Vec<
         addressing_mode: None,
         address_confidence: None,
         is_unreachable: false,
+        unreachable_reason: None,
+        logical_address_hex: None,
+        transports: Vec::new(),
+        gateway_for_link_ids: Vec::new(),
+        reached_via_ecu_names: Vec::new(),
+        hop_count: 0,
+        is_simulated: true,
     }];
 
-    for runningEcu in vecEcus {
-        let config = runningEcu.Config();
-        let address = config
-            .m_optCanAddress
-            .expect("a started ECU always has a CAN address");
-
-        // An ECU on no declared bus is drawn unassigned rather than dropped onto a default
-        // one: "nobody said" is a different fact from "it is on this bus".
-        let optLinkId = if bHasStatedNetworks {
-            config.m_optStrNetworkId.clone()
-        } else {
-            Some(c_strDiagnosticLinkId.to_string())
-        };
-
-        vecNodes.push(TopologyNodeDto {
-            id: FormatCanId(address.m_u32RequestCanId),
-            label: config.m_strName.clone(),
-            kind: "ecu".to_string(),
-            link_id: optLinkId,
-            request_can_id_hex: Some(FormatCanId(address.m_u32RequestCanId)),
-            response_can_id_hex: Some(FormatCanId(address.m_u32ResponseCanId)),
-            addressing_mode: Some(AddressingModeName(address.m_addressingMode)),
-            address_confidence: Some(ConfidenceName(address.m_confidence)),
-            is_unreachable: false,
-        });
+    for ecu in &vehicle.m_vecEcus {
+        vecNodes.push(BuildEcuNode(simulation, vehicle, ecu, bHasStatedNetworks));
     }
     vecNodes
+}
+
+/// One ECU as the diagram sees it: where it sits, what reaches it, and what it can be driven on.
+fn BuildEcuNode(
+    simulation: &SimulationService,
+    vehicle: &Vehicle,
+    ecu: &Ecu,
+    bHasStatedNetworks: bool,
+) -> TopologyNodeDto {
+    // An ECU on no declared bus is drawn unassigned rather than dropped onto a default one:
+    // "nobody said" is a different fact from "it is on this bus".
+    let optLinkId = if bHasStatedNetworks {
+        ecu.m_optStrNetworkId.clone()
+    } else {
+        Some(c_strDiagnosticLinkId.to_string())
+    };
+
+    let mut vecTransports: Vec<String> = Vec::new();
+    if ecu.m_optCanAddress.is_some() {
+        vecTransports.push("CAN".to_string());
+    }
+    if ecu.m_bHasDoIpAddress {
+        vecTransports.push("DoIP".to_string());
+    }
+
+    // Being in the model is not the same as being on a wire: the engine drives CAN today, so
+    // an ECU declared only on DoIP is shown as declared rather than as running.
+    let bIsSimulated = match ecu.m_optCanAddress {
+        Some(address) => simulation
+            .FindEcuByRequestCanId(address.m_u32RequestCanId)
+            .is_some(),
+        None => false,
+    };
+
+    let path = vehicle.DiagnosticPathTo(ecu);
+    let optStrUnreachableReason = DescribeUnreachable(ecu, &path, bIsSimulated);
+
+    TopologyNodeDto {
+        id: TopologyNodeId(ecu),
+        label: ecu.m_strName.clone(),
+        kind: "ecu".to_string(),
+        link_id: optLinkId,
+        request_can_id_hex: ecu
+            .m_optCanAddress
+            .map(|address| FormatCanId(address.m_u32RequestCanId)),
+        response_can_id_hex: ecu
+            .m_optCanAddress
+            .map(|address| FormatCanId(address.m_u32ResponseCanId)),
+        addressing_mode: ecu
+            .m_optCanAddress
+            .map(|address| AddressingModeName(address.m_addressingMode)),
+        address_confidence: ecu
+            .m_optCanAddress
+            .map(|address| ConfidenceName(address.m_confidence)),
+        is_unreachable: optStrUnreachableReason.is_some(),
+        unreachable_reason: optStrUnreachableReason,
+        logical_address_hex: ecu
+            .m_bHasDoIpAddress
+            .then(|| format!("0x{:04X}", ecu.m_u16LogicalAddress)),
+        transports: vecTransports,
+        gateway_for_link_ids: ecu.m_vecGatewayForNetworkIds.clone(),
+        reached_via_ecu_names: path.m_vecGatewayEcuNames,
+        hop_count: path.m_uHopCount,
+        is_simulated: bIsSimulated,
+    }
+}
+
+/// Say why an ECU cannot be reached, or `None` when it can.
+///
+/// Two different failures, kept apart because the fix differs: a wiring problem is the
+/// author's to correct, while "the engine does not speak this transport yet" is ours.
+fn DescribeUnreachable(
+    ecu: &Ecu,
+    path: &core_domain::model::DiagnosticPath,
+    bIsSimulated: bool,
+) -> Option<String> {
+    if !path.m_bIsReachable {
+        return Some(
+            "No chain of gateways connects this ECU's network to a link a tester attaches to."
+                .to_string(),
+        );
+    }
+    if bIsSimulated {
+        return None;
+    }
+    if ecu.m_optCanAddress.is_none() {
+        return Some(
+            "Declared on DoIP only. It is part of the architecture, but the engine drives CAN on the wire today, so nothing is answering for it."
+                .to_string(),
+        );
+    }
+    Some("Declared but not started.".to_string())
 }
 
 /// Name a network kind for display.
@@ -826,25 +975,11 @@ fn NetworkKindName(kind: NetworkKind) -> String {
 }
 
 /// The things this diagram cannot know, stated plainly.
-fn BuildTopologyCaveats(vecEcus: &[&VirtualEcu], vecNetworks: &[Network]) -> Vec<String> {
+fn BuildTopologyCaveats(vehicle: &Vehicle) -> Vec<String> {
     // A vehicle that declares its buses was described by someone who knows it, so the diagram
     // is showing what they said rather than what could be inferred from traffic.
-    if !vecNetworks.is_empty() {
-        let uUnassigned = vecEcus
-            .iter()
-            .filter(|runningEcu| runningEcu.Config().m_optStrNetworkId.is_none())
-            .count();
-
-        let mut vecStated = vec![
-            "These buses come from the loaded simulation file, so they are what its author stated rather than anything observed on a wire."
-                .to_string(),
-        ];
-        if uUnassigned > 0 {
-            vecStated.push(format!(
-                "{uUnassigned} ECU(s) are on no declared bus. They are shown unassigned rather than placed on one, because 'nobody said' is not the same as 'on this bus'."
-            ));
-        }
-        return vecStated;
+    if !vehicle.m_vecNetworks.is_empty() {
+        return BuildStatedTopologyCaveats(vehicle);
     }
 
     let mut vecCaveats = vec![
@@ -852,8 +987,8 @@ fn BuildTopologyCaveats(vecEcus: &[&VirtualEcu], vecNetworks: &[Network]) -> Vec
             .to_string(),
     ];
 
-    let bHasMixedAddressing = vecEcus.iter().any(|runningEcu| IsExtended(runningEcu))
-        && vecEcus.iter().any(|runningEcu| !IsExtended(runningEcu));
+    let bHasMixedAddressing = vehicle.m_vecEcus.iter().any(IsExtended)
+        && vehicle.m_vecEcus.iter().any(|ecu| !IsExtended(ecu));
     if bHasMixedAddressing {
         vecCaveats.push(
             "11-bit and 29-bit ECUs are shown together. Identifier width says nothing about bus membership: one CAN segment carries both, and a gateway can present several segments on one connector."
@@ -865,14 +1000,58 @@ fn BuildTopologyCaveats(vecEcus: &[&VirtualEcu], vecNetworks: &[Network]) -> Vec
         "Only ECUs that answered are here. Bus load, termination, error state and silent nodes are not visible from a tester-side capture."
             .to_string(),
     );
+    vecCaveats.push(
+        "Nothing has said how these ECUs are wired. Declare networks and mark a gateway to turn this reachability set into an architecture."
+            .to_string(),
+    );
+    vecCaveats
+}
+
+/// The caveats that belong next to a vehicle whose wiring somebody actually stated.
+fn BuildStatedTopologyCaveats(vehicle: &Vehicle) -> Vec<String> {
+    let mut vecCaveats = vec![
+        "This architecture was stated by whoever described the vehicle, not observed on a wire."
+            .to_string(),
+    ];
+
+    let uUnassigned = vehicle
+        .m_vecEcus
+        .iter()
+        .filter(|ecu| ecu.m_optStrNetworkId.is_none())
+        .count();
+    if uUnassigned > 0 {
+        vecCaveats.push(format!(
+            "{uUnassigned} ECU(s) are on no declared bus. They are shown unassigned rather than placed on one, because 'nobody said' is not the same as 'on this bus'."
+        ));
+    }
+
+    let uDoIpOnly = vehicle
+        .m_vecEcus
+        .iter()
+        .filter(|ecu| ecu.m_optCanAddress.is_none() && ecu.m_bHasDoIpAddress)
+        .count();
+    if uDoIpOnly > 0 {
+        vecCaveats.push(format!(
+            "{uDoIpOnly} ECU(s) are addressed only over DoIP. They are drawn in the architecture, but the engine's wire-level simulation is CAN, so a tester cannot exchange messages with them yet."
+        ));
+    }
+
+    let bHasGateway = vehicle
+        .m_vecEcus
+        .iter()
+        .any(|ecu| !ecu.m_vecGatewayForNetworkIds.is_empty());
+    if bHasGateway {
+        vecCaveats.push(
+            "Requests are routed by CAN identifier in one namespace. A gateway is drawn, and says which ECUs sit behind it, but it does not yet re-address or delay what passes through it."
+                .to_string(),
+        );
+    }
     vecCaveats
 }
 
 /// True when this ECU uses 29-bit addressing.
-fn IsExtended(runningEcu: &VirtualEcu) -> bool {
-    runningEcu
-        .Config()
-        .m_optCanAddress
+fn IsExtended(ecu: &Ecu) -> bool {
+    ecu.m_optCanAddress
         .map(|address| address.IsExtendedId())
         .unwrap_or(false)
 }
@@ -1032,6 +1211,8 @@ fn BuildEcuFromBody(body: &CreateEcuBody) -> Result<Ecu, ApiError> {
         .clone()
         .unwrap_or_else(DefaultSupportedServices);
     config.m_vecSupportedSessions = DefaultSupportedSessions();
+    config.m_optStrNetworkId = body.network_id.clone();
+    config.m_vecGatewayForNetworkIds = body.gateway_for_network_ids.clone();
 
     Ok(config)
 }
@@ -1493,4 +1674,135 @@ mod emitter_tests {
         assert_eq!(vecDtos[0].frames[0].actual_ms, 50);
         assert_eq!(vecDtos[0].frames[1].actual_ms, 200);
     }
+}
+
+/// A network to declare on the loaded vehicle.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclareNetworkBody {
+    /// The key ECUs refer to it by.
+    pub id: String,
+    /// What to call it on screen.
+    pub name: String,
+    /// `"CAN"`, `"CAN-FD"` or `"Ethernet"`.
+    pub kind: String,
+    #[serde(default)]
+    pub bitrate_bps: Option<u32>,
+    #[serde(default)]
+    pub data_bitrate_bps: Option<u32>,
+    /// True for the link a tester attaches to directly. Left false on every network, the
+    /// engine treats each link nothing gateways onto as an entry point.
+    #[serde(default)]
+    pub entry_point: bool,
+}
+
+/// Where one ECU sits, and what it gateways onto.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EcuPlacementBody {
+    /// The id of the network it is on, or `null` for "nobody has said".
+    #[serde(default)]
+    pub network_id: Option<String>,
+    /// The networks it forwards diagnostics onto.
+    #[serde(default)]
+    pub gateway_for_network_ids: Vec<String>,
+}
+
+/// POST /simulation/networks — declare a bus on the loaded vehicle, or replace one.
+///
+/// The point of this endpoint: a CAN capture cannot observe bus membership, so a
+/// log-reconstructed vehicle arrives with no architecture at all. This is how it gets one,
+/// and it is the same call the from-scratch builder makes.
+pub async fn PostDeclareNetwork(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeclareNetworkBody>,
+) -> Result<Json<TopologyDto>, ApiError> {
+    let network = BuildNetworkFromBody(&body)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .UpsertNetwork(network)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+
+    Ok(Json(BuildTopologyDto(&simulation)))
+}
+
+/// DELETE /simulation/networks/{networkId} — undeclare a bus.
+pub async fn DeleteNetwork(
+    State(state): State<Arc<AppState>>,
+    Path(strNetworkId): Path<String>,
+) -> Result<Json<TopologyDto>, ApiError> {
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .RemoveNetwork(&strNetworkId)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+
+    Ok(Json(BuildTopologyDto(&simulation)))
+}
+
+/// PUT /simulation/ecus/{requestCanIdHex}/placement — say where one ECU sits.
+pub async fn PutEcuPlacement(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+    Json(body): Json<EcuPlacementBody>,
+) -> Result<Json<TopologyDto>, ApiError> {
+    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let optStrNetworkId = body
+        .network_id
+        .as_ref()
+        .map(|strNetworkId| strNetworkId.trim().to_string())
+        .filter(|strNetworkId| !strNetworkId.is_empty());
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .SetEcuPlacement(
+            u32RequestCanId,
+            optStrNetworkId,
+            body.gateway_for_network_ids.clone(),
+        )
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+
+    Ok(Json(BuildTopologyDto(&simulation)))
+}
+
+/// Read a network out of a request body, refusing anything that could not be drawn.
+fn BuildNetworkFromBody(body: &DeclareNetworkBody) -> Result<Network, ApiError> {
+    let strId = body.id.trim();
+    if strId.is_empty() {
+        return Err(ApiError::BadRequest(
+            "the network needs an id for ECUs to refer to it by".to_string(),
+        ));
+    }
+
+    let strName = body.name.trim();
+    if strName.is_empty() {
+        return Err(ApiError::BadRequest(
+            "the network needs a name to show on screen".to_string(),
+        ));
+    }
+
+    let kind = match body.kind.to_ascii_lowercase().as_str() {
+        "can" | "can-classic" => NetworkKind::CanClassic,
+        "can-fd" | "canfd" => NetworkKind::CanFd,
+        "ethernet" | "doip" | "ethernet-doip" => NetworkKind::EthernetDoIp,
+        "unknown" => NetworkKind::Unknown,
+        strOther => {
+            return Err(ApiError::BadRequest(format!(
+                "'{strOther}' is not a kind of link; use CAN, CAN-FD or Ethernet"
+            )))
+        }
+    };
+
+    Ok(Network {
+        m_strId: strId.to_string(),
+        m_strName: strName.to_string(),
+        m_kind: kind,
+        m_optU32BitrateBps: body.bitrate_bps,
+        m_optU32DataBitrateBps: body.data_bitrate_bps,
+        m_bIsDiagnosticEntryPoint: body.entry_point,
+        // Somebody sat down and said how this vehicle is wired. Nothing was observed, but
+        // nothing was guessed either — the standing a specification has.
+        m_confidence: Confidence::Confirmed,
+    })
 }
