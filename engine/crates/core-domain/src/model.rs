@@ -124,6 +124,55 @@ impl Default for EcuTiming {
     }
 }
 
+/// How an ECU is addressed on CAN (ISO 15765-2). The MVP simulates physically-addressed
+/// UDS-on-CAN only; the variant is carried so a later phase can add the other modes without
+/// reshaping the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CanAddressingMode {
+    /// Normal 11-bit addressing — one CAN ID per direction, no address byte in the payload.
+    #[default]
+    Normal11Bit,
+    /// Normal fixed 29-bit addressing — 0x18DA<target><source>, tester source address 0xF1.
+    NormalFixed29Bit,
+}
+
+/// The pair of CAN identifiers a physically-addressed ECU uses: the identifier a tester sends
+/// requests on, and the identifier the ECU answers on.
+///
+/// Both are stored as `u32` because 29-bit (extended) identifiers do not fit in a `u16`.
+/// `m_confidence` records how the pair was established: `Observed` when both identifiers were
+/// actually seen in a trace, `Inferred` when one of them was derived from the other by a
+/// convention (e.g. response = request + 8) rather than witnessed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanAddress {
+    /// CAN identifier the tester sends requests on (e.g. 0x7E0).
+    pub m_u32RequestCanId: u32,
+    /// CAN identifier the ECU sends responses on (e.g. 0x7E8).
+    pub m_u32ResponseCanId: u32,
+    /// Addressing mode the two identifiers follow.
+    pub m_addressingMode: CanAddressingMode,
+    /// How the pair was established.
+    pub m_confidence: Confidence,
+}
+
+/// Offset between an 11-bit UDS request identifier and its response identifier (0x7E0 -> 0x7E8).
+/// This is a widely-used convention, not a requirement of ISO 15765-2, so any identifier
+/// derived with it is recorded as `Confidence::Inferred`.
+pub const c_u32Response11BitOffset: u32 = 0x08;
+
+impl CanAddress {
+    /// Build a normal 11-bit address pair from both observed identifiers.
+    pub fn NewObserved11Bit(u32RequestCanId: u32, u32ResponseCanId: u32) -> Self {
+        CanAddress {
+            m_u32RequestCanId: u32RequestCanId,
+            m_u32ResponseCanId: u32ResponseCanId,
+            m_addressingMode: CanAddressingMode::Normal11Bit,
+            m_confidence: Confidence::Observed,
+        }
+    }
+}
+
 /// A single virtual ECU's static diagnostic configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +181,12 @@ pub struct Ecu {
     pub m_strName: String,
     /// UDS logical/diagnostic address (used for DoIP and addressing later).
     pub m_u16LogicalAddress: u16,
+    /// CAN identifiers this ECU is reached on. `None` means the ECU's CAN addressing is not
+    /// known (e.g. a hand-built model, or one imported from a source that carries no CAN
+    /// addressing); such an ECU cannot be routed to on CAN. Defaulted on deserialization so
+    /// models written before this field existed still load.
+    #[serde(default)]
+    pub m_optCanAddress: Option<CanAddress>,
     /// Service IDs (request SIDs) this ECU supports, e.g. 0x10, 0x22, 0x27.
     pub m_vecSupportedServices: Vec<u8>,
     /// Sessions this ECU can enter.
@@ -153,6 +208,7 @@ impl Ecu {
         Ecu {
             m_strName: strName.to_string(),
             m_u16LogicalAddress: u16LogicalAddress,
+            m_optCanAddress: None,
             m_vecSupportedServices: Vec::new(),
             m_vecSupportedSessions: vec![SessionType::Default],
             m_mapDids: BTreeMap::new(),
