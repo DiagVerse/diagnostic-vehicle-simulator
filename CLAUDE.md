@@ -20,7 +20,9 @@ Phase 2 (core) delivered: `crates/can` (CAN/CAN-FD frame types), `crates/isotp` 
 
 **Simulation files** (`feat/simfile-import`): a third source alongside logs and the hand-builder. `crates/simfile` reads a hand-writable JSON document — buses, ECUs by name, DIDs, DTCs in `P0123-11` form, security, response overrides — into a `Vehicle`. `POST /simulation/simfile`. The model gained `Network`/`m_vecNetworks` and `Ecu.m_optStrNetworkId`, so the Topology tab draws **real buses** for a simfile and keeps the honest single-link view for the other two sources. Sample: `samples/demo-vehicle.simfile.json`. See ADR 0008.
 
-Deferred from the MVP-1 CAN/UDS review (recorded in ADR 0004, worth a `fix/*` PR): ISO-TP messages are ordered by their first frame rather than their last; consecutive-frame sequence numbers are not validated; the Vector `.asc` `x` extended-frame marker is discarded; `m_u16LogicalAddress` still stands in as an 11-bit ECU's response id; and the `~/.claude/can-analyzer/reference/` log format is not parseable yet.
+**Reconstruction correctness fixes delivered** (`fix/reconstruction-correctness`): `IsoTpMessage` now records when a PDU *started* and when it *completed*, the offline reassembler validates consecutive-frame sequence numbers (abandoning a message rather than handing on a corrupt one), and correlation enforces causality — a response must have started after its request finished arriving, so a long request can no longer swallow a response that appeared while it was still being transmitted. See ADR 0011.
+
+Still deferred from the MVP-1 CAN/UDS review (recorded in ADR 0004): `m_u16LogicalAddress` still stands in as an 11-bit ECU's response id, and the `~/.claude/can-analyzer/reference/` log format is not parseable yet. (The Vector `.asc` `x` extended-frame marker *is* handled — `reconstruct/src/parser.rs` strips it and tests assert the extended flag.)
 
 Known cosmetic item: the raw Vehicle model JSON uses `mStrName`-style keys (Hungarian field names + serde camelCase); UI-facing DTOs use clean camelCase. Revisit with explicit serde renames if the model JSON becomes user-facing.
 

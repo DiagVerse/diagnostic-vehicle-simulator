@@ -37,7 +37,10 @@ const c_uMaxPendingRequests: usize = 64;
 /// One reassembled PDU tagged with the CAN ID it arrived on and its time.
 struct PduRecord {
     m_u32CanId: u32,
-    m_f64TimestampSec: f64,
+    /// When the PDU's first frame appeared.
+    m_f64StartedAtSec: f64,
+    /// When its last frame appeared. Equal to the start for a single-frame PDU.
+    m_f64CompletedAtSec: f64,
     m_vecBytes: Vec<u8>,
     /// Whether the source log said this travelled from the tester to an ECU. `None` for a
     /// format that records no direction, where it has to be inferred from the service id.
@@ -50,6 +53,9 @@ struct PendingRequest {
     m_u32RequestCanId: u32,
     m_byServiceId: u8,
     m_vecBytes: Vec<u8>,
+    /// When the last frame of the request appeared. Nothing that started transmitting before
+    /// this instant can be an answer to it.
+    m_f64CompletedAtSec: f64,
 }
 
 /// Reconstruct a vehicle model from time-ordered CAN frames.
@@ -148,7 +154,8 @@ fn ReassembleAllStreams(vecFrames: &[CanFrame]) -> Vec<PduRecord> {
         for msg in ReassembleStream(vecStream) {
             vecPdus.push(PduRecord {
                 m_u32CanId: *u32CanId,
-                m_f64TimestampSec: msg.m_f64TimestampSec,
+                m_f64StartedAtSec: msg.m_f64StartedAtSec,
+                m_f64CompletedAtSec: msg.m_f64CompletedAtSec,
                 m_vecBytes: msg.m_vecData,
                 m_optBIsRequest: optBIsRequest,
             });
@@ -156,9 +163,15 @@ fn ReassembleAllStreams(vecFrames: &[CanFrame]) -> Vec<PduRecord> {
     }
 
     // Global time order so request/response correlation follows the real exchange.
+    //
+    // Ordered by when each PDU *started*, which is the order a bus observer saw them begin. It
+    // is deliberately not completion order: a long response can still be in flight when the
+    // tester sends its next request, and completion order would let that later request evict
+    // the one the response actually answers. What completion time is for is the rule in
+    // `FindPendingRequestFor` — it constrains which pairings are physically possible.
     vecPdus.sort_by(|a, b| {
-        a.m_f64TimestampSec
-            .partial_cmp(&b.m_f64TimestampSec)
+        a.m_f64StartedAtSec
+            .partial_cmp(&b.m_f64StartedAtSec)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     vecPdus
@@ -194,12 +207,19 @@ fn RememberRequest(vecPending: &mut Vec<PendingRequest>, pdu: &PduRecord) {
         m_u32RequestCanId: pdu.m_u32CanId,
         m_byServiceId: pdu.m_vecBytes[0],
         m_vecBytes: pdu.m_vecBytes.clone(),
+        m_f64CompletedAtSec: pdu.m_f64CompletedAtSec,
     });
 }
 
 /// Find which outstanding request `pdu` answers, if any.
 ///
-/// Two rules, in order:
+/// Three rules, in order:
+///   0. **Causality** — the response must have started transmitting after the request finished
+///      arriving. An ECU cannot begin answering a request it has not yet fully received, so a
+///      pairing that violates this is not merely unlikely, it is impossible. Without the check
+///      a long request (a `0x2E` write, a `0x36` TransferData) would swallow whatever response
+///      happened to arrive while it was still being sent — and reconstruction would record
+///      that as observed behaviour.
 ///   1. **Conventional pair** — a request identifier whose conventional response identifier is
 ///      the one this PDU arrived on (0x7E0 -> 0x7E8, or the 29-bit normal-fixed swap). This is
 ///      the strong signal and is checked first so interleaved exchanges with several ECUs
@@ -211,6 +231,7 @@ fn FindPendingRequestFor(vecPending: &[PendingRequest], pdu: &PduRecord) -> Opti
         .iter()
         .enumerate()
         .filter(|(_, pending)| IsResponseTo(pending, &pdu.m_vecBytes))
+        .filter(|(_, pending)| CouldHaveAnswered(pending, pdu))
         .map(|(uIndex, _)| uIndex)
         .collect();
 
@@ -223,6 +244,16 @@ fn FindPendingRequestFor(vecPending: &[PendingRequest], pdu: &PduRecord) -> Opti
 
     // Most recently seen request first.
     vecCandidates.last().copied()
+}
+
+/// Whether this PDU could physically be an answer to that request.
+///
+/// The response has to have started after the request finished. Timestamps in a capture are
+/// not perfectly precise, so frames recorded at the very same instant are allowed — the check
+/// exists to reject a response that began *while the request was still being transmitted*,
+/// which is a gap of whole frames, not of rounding.
+fn CouldHaveAnswered(pending: &PendingRequest, pdu: &PduRecord) -> bool {
+    pdu.m_f64StartedAtSec >= pending.m_f64CompletedAtSec
 }
 
 /// The response identifier conventionally paired with a request identifier, or `None` when no
@@ -315,6 +346,7 @@ fn ClonePendingRequest(pending: &PendingRequest) -> PendingRequest {
         m_u32RequestCanId: pending.m_u32RequestCanId,
         m_byServiceId: pending.m_byServiceId,
         m_vecBytes: pending.m_vecBytes.clone(),
+        m_f64CompletedAtSec: pending.m_f64CompletedAtSec,
     }
 }
 
@@ -596,6 +628,57 @@ mod tests {
         assert_eq!(address.m_addressingMode, CanAddressingMode::Normal11Bit);
         // Both identifiers were on the bus, so nothing was guessed.
         assert_eq!(address.m_confidence, Confidence::Observed);
+    }
+
+    #[test]
+    fn a_response_that_began_before_its_request_finished_is_not_paired_with_it() {
+        // An ECU cannot start answering a request it has not finished receiving. Here a long
+        // request is still being transmitted at t=2.0 when a response appears — that response
+        // answers something else, and pairing it here would record DID 0xF190 as behaviour
+        // this ECU was observed to have.
+        let frames = vec![
+            // Request on 0x7E0, 13 bytes: reads five DIDs. Starts at 1.0, finishes at 3.0.
+            f(
+                0x7E0,
+                1.0,
+                vec![0x10, 0x0D, 0x22, 0xF1, 0x90, 0xF1, 0x8C, 0xF1],
+            ),
+            f(
+                0x7E0,
+                3.0,
+                vec![0x21, 0x91, 0xF1, 0x92, 0xF1, 0x93, 0xF1, 0x94],
+            ),
+            // A response on the conventional partner identifier, mid-request.
+            f(0x7E8, 2.0, vec![0x06, 0x62, 0xF1, 0x90, 0x01, 0x02, 0x03]),
+            // A second, entirely ordinary exchange with another ECU, to prove the causality
+            // rule rejects the impossible pairing rather than breaking correlation outright.
+            f(
+                0x7E1,
+                4.0,
+                vec![0x03, 0x22, 0xF1, 0x8C, 0x00, 0x00, 0x00, 0x00],
+            ),
+            f(0x7E9, 4.1, vec![0x06, 0x62, 0xF1, 0x8C, 0x41, 0x42, 0x43]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+
+        assert_eq!(
+            vehicle.m_vecEcus.len(),
+            1,
+            "only the well-formed exchange should have produced an ECU"
+        );
+        assert_eq!(vehicle.m_vecEcus[0].m_u16LogicalAddress, 0x7E9);
+        assert!(
+            vehicle.m_vecEcus[0].m_mapDids.contains_key(&0xF18C),
+            "the valid exchange must still be recorded"
+        );
+        assert!(
+            !vehicle
+                .m_vecEcus
+                .iter()
+                .any(|ecu| ecu.m_mapDids.contains_key(&0xF190)),
+            "DID 0xF190 was never answered; nothing should claim it was"
+        );
     }
 
     #[test]
