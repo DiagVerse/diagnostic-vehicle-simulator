@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 
 use can::CanFrame;
 use core_domain::model::{
-    c_u32Response11BitOffset, CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode,
-    Ecu, SecurityLevel, SessionType, Vehicle,
+    c_u32Functional11BitCanId, c_u32LegislatedRequestCanIdFirst, c_u32LegislatedRequestCanIdLast,
+    c_u32Response11BitOffset, CanAddress, CanAddressingMode, DataIdentifier,
+    DefaultFunctionalCanId, DiagnosticTroubleCode, Ecu, SecurityLevel, SessionType, Vehicle,
 };
 use core_domain::Confidence;
 use isotp::ReassembleStream;
@@ -19,12 +20,16 @@ use isotp::ReassembleStream;
 const c_byPositiveResponseOffset: u8 = 0x40;
 /// First byte of a negative response.
 const c_byNegativeResponseSid: u8 = 0x7F;
-/// The OBD/UDS functional (broadcast) request identifier: every ECU on the bus listens to it,
-/// so it is never one ECU's own request identifier (ISO 15765-4).
-const c_u32FunctionalRequestCanId: u32 = 0x7DF;
-/// The fixed high half of a 29-bit normal-fixed physical identifier (ISO 15765-2):
-/// 0x18DA<target><source>.
-const c_u32NormalFixed29BitPrefix: u32 = 0x18DA_0000;
+/// Lowest and highest UDS request service identifiers (ISO 14229-1 clause 7.3). Requests fall
+/// in two ranges; everything else on the bus is not a diagnostic request.
+const c_bySidRequestLowFirst: u8 = 0x10;
+const c_bySidRequestLowLast: u8 = 0x3E;
+const c_bySidRequestHighFirst: u8 = 0x83;
+const c_bySidRequestHighLast: u8 = 0x88;
+/// The N_TAtype byte (bits 23..16 of a 29-bit identifier) that marks normal-fixed physical
+/// addressing; 0xDB marks the functional variant (ISO 15765-2).
+const c_byNormalFixedPhysicalTaType: u8 = 0xDA;
+const c_byNormalFixedFunctionalTaType: u8 = 0xDB;
 /// Upper bound on outstanding unanswered requests kept during correlation. Logs routinely
 /// contain requests nothing ever answers; without a cap the list would grow with the log.
 const c_uMaxPendingRequests: usize = 64;
@@ -111,9 +116,17 @@ fn ReassembleAllStreams(vecFrames: &[CanFrame]) -> Vec<PduRecord> {
     vecPdus
 }
 
-/// A request SID (the ones this phase understands are all below 0x40).
+/// True for a UDS request service identifier (ISO 14229-1 clause 7.3, Table 2).
+///
+/// This is a whitelist rather than "anything below 0x40" because a CAN log is mostly ordinary
+/// periodic traffic: a powertrain frame whose first byte happens to look like a valid ISO-TP
+/// single-frame header would otherwise be taken for a diagnostic request and pollute
+/// correlation. The high range 0x83..=0x88 (AccessTimingParameter, ControlDTCSetting,
+/// LinkControl, …) is included; it appears in real flashing sequences.
 fn IsRequestSid(byFirst: u8) -> bool {
-    byFirst < 0x40
+    let bIsLowRange = (c_bySidRequestLowFirst..=c_bySidRequestLowLast).contains(&byFirst);
+    let bIsHighRange = (c_bySidRequestHighFirst..=c_bySidRequestHighLast).contains(&byFirst);
+    bIsLowRange || bIsHighRange
 }
 
 /// Record a newly seen request as outstanding.
@@ -168,15 +181,15 @@ fn FindPendingRequestFor(vecPending: &[PendingRequest], pdu: &PduRecord) -> Opti
 /// convention applies (e.g. the functional identifier 0x7DF, which every ECU answers on its
 /// own physical identifier).
 fn DeriveResponseCanId(u32RequestCanId: u32) -> Option<u32> {
-    if u32RequestCanId == c_u32FunctionalRequestCanId {
+    if IsFunctionalRequestCanId(u32RequestCanId) {
         return None;
     }
     if IsNormal11BitRequestId(u32RequestCanId) {
         return Some(u32RequestCanId + c_u32Response11BitOffset);
     }
-    if let Some((byTarget, bySource)) = SplitNormalFixed29BitId(u32RequestCanId) {
+    if SplitNormalFixed29BitId(u32RequestCanId).is_some() {
         // 29-bit normal fixed (ISO 15765-2): the answer swaps target and source.
-        return Some(BuildNormalFixed29BitId(bySource, byTarget));
+        return Some(SwapTargetAndSource(u32RequestCanId));
     }
     None
 }
@@ -187,26 +200,33 @@ fn DeriveRequestCanId(u32ResponseCanId: u32) -> Option<u32> {
     if IsNormal11BitResponseId(u32ResponseCanId) {
         return Some(u32ResponseCanId - c_u32Response11BitOffset);
     }
-    if let Some((byTarget, bySource)) = SplitNormalFixed29BitId(u32ResponseCanId) {
-        return Some(BuildNormalFixed29BitId(bySource, byTarget));
+    if SplitNormalFixed29BitId(u32ResponseCanId).is_some() {
+        return Some(SwapTargetAndSource(u32ResponseCanId));
     }
     None
 }
 
-/// True for the conventional 11-bit UDS request identifiers 0x7E0..=0x7E7 (ISO 15765-4).
+/// True for the legislated 11-bit UDS request identifiers 0x7E0..=0x7E7 (ISO 15765-4). Outside
+/// this range the request/response pairing is OEM-specific and cannot be derived.
 fn IsNormal11BitRequestId(u32CanId: u32) -> bool {
-    (0x7E0..=0x7E7).contains(&u32CanId)
+    (c_u32LegislatedRequestCanIdFirst..=c_u32LegislatedRequestCanIdLast).contains(&u32CanId)
 }
 
-/// True for the conventional 11-bit UDS response identifiers 0x7E8..=0x7EF (ISO 15765-4).
+/// True for the legislated 11-bit UDS response identifiers 0x7E8..=0x7EF (ISO 15765-4).
 fn IsNormal11BitResponseId(u32CanId: u32) -> bool {
-    (0x7E8..=0x7EF).contains(&u32CanId)
+    let u32First = c_u32LegislatedRequestCanIdFirst + c_u32Response11BitOffset;
+    let u32Last = c_u32LegislatedRequestCanIdLast + c_u32Response11BitOffset;
+    (u32First..=u32Last).contains(&u32CanId)
 }
 
-/// Split a 29-bit normal-fixed physical identifier (0x18DA<target><source>) into its target
-/// and source addresses, or `None` if it is not one.
+/// Split a 29-bit normal-fixed **physical** identifier (`<prio><res><DP>DA<target><source>`)
+/// into its target and source addresses, or `None` if it is not one.
+///
+/// Only the N_TAtype byte is checked, not the whole high half: the priority bits are not fixed
+/// by the standard (0x18 is common, 0x1C also occurs), so matching a hard-coded 0x18DA prefix
+/// would miss valid identifiers.
 fn SplitNormalFixed29BitId(u32CanId: u32) -> Option<(u8, u8)> {
-    if (u32CanId & 0xFFFF0000) != c_u32NormalFixed29BitPrefix {
+    if NormalFixedTaTypeOf(u32CanId) != Some(c_byNormalFixedPhysicalTaType) {
         return None;
     }
     let byTarget = ((u32CanId >> 8) & 0xFF) as u8;
@@ -214,9 +234,31 @@ fn SplitNormalFixed29BitId(u32CanId: u32) -> Option<(u8, u8)> {
     Some((byTarget, bySource))
 }
 
-/// Build a 29-bit normal-fixed physical identifier from a target and source address.
-fn BuildNormalFixed29BitId(byTarget: u8, bySource: u8) -> u32 {
-    c_u32NormalFixed29BitPrefix | ((byTarget as u32) << 8) | (bySource as u32)
+/// The N_TAtype byte of a 29-bit identifier (0xDA physical, 0xDB functional), or `None` for an
+/// 11-bit identifier.
+fn NormalFixedTaTypeOf(u32CanId: u32) -> Option<u8> {
+    if u32CanId <= 0x7FF {
+        return None;
+    }
+    Some(((u32CanId >> 16) & 0xFF) as u8)
+}
+
+/// Swap the target and source addresses of a 29-bit normal-fixed identifier, preserving the
+/// priority, reserved, data-page and N_TAtype bits: 0x18DAD4F1 -> 0x18DAF1D4.
+fn SwapTargetAndSource(u32CanId: u32) -> u32 {
+    let u32Header = u32CanId & 0xFFFF_0000;
+    let u32Target = (u32CanId >> 8) & 0xFF;
+    let u32Source = u32CanId & 0xFF;
+    u32Header | (u32Source << 8) | u32Target
+}
+
+/// True for a functional (broadcast) request identifier: the legislated 11-bit 0x7DF, or a
+/// 29-bit identifier whose N_TAtype marks it functional.
+fn IsFunctionalRequestCanId(u32CanId: u32) -> bool {
+    if u32CanId == c_u32Functional11BitCanId {
+        return true;
+    }
+    NormalFixedTaTypeOf(u32CanId) == Some(c_byNormalFixedFunctionalTaType)
 }
 
 /// Record the CAN identifier pair an ECU is reached on.
@@ -227,7 +269,7 @@ fn BuildNormalFixed29BitId(byTarget: u8, bySource: u8) -> u32 {
 /// convention and recorded as `Inferred`. An already-`Observed` pair is never downgraded by a
 /// later inference.
 fn RecordCanAddress(ecu: &mut Ecu, u32RequestCanId: u32, u32ResponseCanId: u32) {
-    let bIsFunctional = u32RequestCanId == c_u32FunctionalRequestCanId;
+    let bIsFunctional = IsFunctionalRequestCanId(u32RequestCanId);
 
     let (u32PhysicalRequestId, confidence) = if bIsFunctional {
         match DeriveRequestCanId(u32ResponseCanId) {
@@ -248,12 +290,29 @@ fn RecordCanAddress(ecu: &mut Ecu, u32RequestCanId: u32, u32ResponseCanId: u32) 
         return;
     }
 
+    let mode = AddressingModeOf(u32PhysicalRequestId, u32ResponseCanId);
+
+    // A functional identifier actually seen addressing this ECU beats the standard's default,
+    // because it was observed rather than assumed.
+    let optU32FunctionalCanId = if bIsFunctional {
+        Some(u32RequestCanId)
+    } else {
+        ExistingFunctionalCanId(ecu).or_else(|| DefaultFunctionalCanId(u32PhysicalRequestId, mode))
+    };
+
     ecu.m_optCanAddress = Some(CanAddress {
         m_u32RequestCanId: u32PhysicalRequestId,
         m_u32ResponseCanId: u32ResponseCanId,
-        m_addressingMode: AddressingModeOf(u32PhysicalRequestId, u32ResponseCanId),
+        m_optU32FunctionalCanId: optU32FunctionalCanId,
+        m_addressingMode: mode,
         m_confidence: confidence,
     });
+}
+
+/// The functional identifier already recorded for this ECU, if any.
+fn ExistingFunctionalCanId(ecu: &Ecu) -> Option<u32> {
+    ecu.m_optCanAddress
+        .and_then(|address| address.m_optU32FunctionalCanId)
 }
 
 /// Classify an identifier pair's addressing mode. Anything outside the 29-bit normal-fixed
@@ -555,6 +614,101 @@ mod tests {
             CanAddressingMode::NormalFixed29Bit
         );
         assert_eq!(address.m_confidence, Confidence::Observed);
+    }
+
+    #[test]
+    fn ordinary_periodic_traffic_does_not_disturb_correlation() {
+        // A powertrain frame whose first byte happens to look like a valid single-frame PCI
+        // sits between a real request and its real response. Real logs are mostly traffic
+        // like this, so it must not be mistaken for a diagnostic request.
+        let frames = vec![
+            f(0x7E0, 0.0010, vec![0x03, 0x22, 0xF1, 0x90]),
+            f(0x0C9, 0.0015, vec![0x02, 0x12, 0x34, 0x00]),
+            f(0x7E8, 0.0020, vec![0x04, 0x62, 0xF1, 0x90, 0x41]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+
+        assert_eq!(
+            vehicle.m_vecEcus.len(),
+            1,
+            "only the diagnostic ECU is discovered"
+        );
+        let ecu = &vehicle.m_vecEcus[0];
+        assert_eq!(ecu.m_optCanAddress.unwrap().m_u32RequestCanId, 0x7E0);
+        assert_eq!(ecu.FindDid(0xF190).unwrap().m_vecValue, vec![0x41]);
+    }
+
+    #[test]
+    fn discovers_a_service_from_the_high_request_sid_range() {
+        // 0x85 ControlDTCSetting / 0xC5 positive response — outside the 0x10..=0x3E range but
+        // a normal part of a flashing sequence.
+        let frames = vec![
+            f(0x7E0, 0.001, vec![0x02, 0x85, 0x02]),
+            f(0x7E8, 0.002, vec![0x02, 0xC5, 0x02]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        assert_eq!(vehicle.m_vecEcus.len(), 1);
+        assert!(vehicle.m_vecEcus[0].m_vecSupportedServices.contains(&0x85));
+    }
+
+    #[test]
+    fn a_legislated_pair_listens_functionally_but_an_oem_pair_does_not() {
+        let frames = vec![
+            f(0x7E0, 0.001, vec![0x02, 0x10, 0x03]),
+            f(0x7E8, 0.002, vec![0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4]),
+            // 0x745 -> 0x765 is a real OEM pair: +0x20, outside anything a standard defines.
+            f(0x745, 0.003, vec![0x02, 0x10, 0x03]),
+            f(0x765, 0.004, vec![0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        assert_eq!(vehicle.m_vecEcus.len(), 2);
+
+        let mapByRequestId: Vec<(u32, Option<u32>)> = vehicle
+            .m_vecEcus
+            .iter()
+            .map(|ecu| {
+                let address = ecu.m_optCanAddress.expect("CAN address recorded");
+                (address.m_u32RequestCanId, address.m_optU32FunctionalCanId)
+            })
+            .collect();
+
+        // ISO 15765-4 mandates 0x7DF only for the legislated range; the OEM pair gets nothing.
+        assert!(mapByRequestId.contains(&(0x7E0, Some(c_u32Functional11BitCanId))));
+        assert!(mapByRequestId.contains(&(0x745, None)));
+    }
+
+    #[test]
+    fn a_29_bit_ecu_listens_on_the_normal_fixed_functional_id() {
+        let frames = vec![
+            f(0x18DAD4F1, 0.001, vec![0x03, 0x22, 0xF1, 0x90]),
+            f(0x18DAF1D4, 0.002, vec![0x04, 0x62, 0xF1, 0x90, 0x41]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        let address = vehicle.m_vecEcus[0].m_optCanAddress.unwrap();
+        assert_eq!(address.m_optU32FunctionalCanId, Some(0x18DB33F1));
+        assert!(address.IsExtendedId());
+    }
+
+    #[test]
+    fn a_29_bit_priority_other_than_0x18_is_still_recognised() {
+        // The priority bits are not fixed by ISO 15765-2; only the N_TAtype byte (0xDA) marks
+        // normal-fixed physical addressing.
+        let frames = vec![
+            f(0x1CDAD4F1, 0.001, vec![0x03, 0x22, 0xF1, 0x90]),
+            f(0x1CDAF1D4, 0.002, vec![0x04, 0x62, 0xF1, 0x90, 0x41]),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        let address = vehicle.m_vecEcus[0].m_optCanAddress.unwrap();
+        assert_eq!(address.m_u32RequestCanId, 0x1CDAD4F1);
+        assert_eq!(
+            address.m_addressingMode,
+            CanAddressingMode::NormalFixed29Bit
+        );
     }
 
     #[test]

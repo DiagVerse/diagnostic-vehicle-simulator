@@ -150,6 +150,12 @@ pub struct CanAddress {
     pub m_u32RequestCanId: u32,
     /// CAN identifier the ECU sends responses on (e.g. 0x7E8).
     pub m_u32ResponseCanId: u32,
+    /// Functional (broadcast) identifier this ECU also accepts requests on, if any: 0x7DF for
+    /// legislated 11-bit addressing, 0x18DB33F1 for 29-bit normal fixed. `None` when nothing
+    /// in the sources or the standards says the ECU listens functionally. Defaulted on
+    /// deserialization so models written before this field existed still load.
+    #[serde(default)]
+    pub m_optU32FunctionalCanId: Option<u32>,
     /// Addressing mode the two identifiers follow.
     pub m_addressingMode: CanAddressingMode,
     /// How the pair was established.
@@ -157,9 +163,25 @@ pub struct CanAddress {
 }
 
 /// Offset between an 11-bit UDS request identifier and its response identifier (0x7E0 -> 0x7E8).
-/// This is a widely-used convention, not a requirement of ISO 15765-2, so any identifier
-/// derived with it is recorded as `Confidence::Inferred`.
+///
+/// ISO 15765-4 fixes this pairing for the legislated range 0x7E0..=0x7E7 only. Outside that
+/// range identifier pairs are OEM-specific and follow no derivable rule (0x745 -> 0x765 is a
+/// real, observed example), so the offset must never be applied there.
 pub const c_u32Response11BitOffset: u32 = 0x08;
+
+/// Lowest legislated 11-bit UDS request identifier (ISO 15765-4).
+pub const c_u32LegislatedRequestCanIdFirst: u32 = 0x7E0;
+/// Highest legislated 11-bit UDS request identifier (ISO 15765-4).
+pub const c_u32LegislatedRequestCanIdLast: u32 = 0x7E7;
+
+/// The 11-bit functional (broadcast) request identifier every legislated ECU listens on
+/// (ISO 15765-4). It is a listen address shared by all ECUs, never one ECU's own request
+/// identifier.
+pub const c_u32Functional11BitCanId: u32 = 0x7DF;
+
+/// The 29-bit normal-fixed functional request identifier: target address 0x33 (all ECUs),
+/// source address 0xF1 (tester), N_TAtype 0xDB (functional) — ISO 15765-2.
+pub const c_u32FunctionalNormalFixed29BitCanId: u32 = 0x18DB_33F1;
 
 impl CanAddress {
     /// Build a normal 11-bit address pair from both observed identifiers.
@@ -167,8 +189,47 @@ impl CanAddress {
         CanAddress {
             m_u32RequestCanId: u32RequestCanId,
             m_u32ResponseCanId: u32ResponseCanId,
+            m_optU32FunctionalCanId: DefaultFunctionalCanId(
+                u32RequestCanId,
+                CanAddressingMode::Normal11Bit,
+            ),
             m_addressingMode: CanAddressingMode::Normal11Bit,
             m_confidence: Confidence::Observed,
+        }
+    }
+
+    /// True when the identifiers are 29-bit extended.
+    ///
+    /// Derived from the addressing mode rather than from the identifier value: a value below
+    /// 0x800 may legally be transmitted in an extended frame, so the value alone cannot decide.
+    pub fn IsExtendedId(&self) -> bool {
+        self.m_addressingMode == CanAddressingMode::NormalFixed29Bit
+    }
+
+    /// True when this ECU listens on the given functional (broadcast) identifier.
+    pub fn ListensFunctionallyOn(&self, u32CanId: u32) -> bool {
+        self.m_optU32FunctionalCanId == Some(u32CanId)
+    }
+}
+
+/// The functional identifier an ECU on this request identifier is required to listen on, or
+/// `None` when no standard mandates one.
+///
+/// ISO 15765-4 requires every ECU in the legislated 11-bit range to accept 0x7DF, and
+/// ISO 15765-2 defines 0x18DB33F1 for 29-bit normal-fixed addressing. An OEM-specific 11-bit
+/// pair (e.g. 0x745/0x765) is outside both standards, so nothing can be assumed for it.
+pub fn DefaultFunctionalCanId(u32RequestCanId: u32, mode: CanAddressingMode) -> Option<u32> {
+    match mode {
+        CanAddressingMode::NormalFixed29Bit => Some(c_u32FunctionalNormalFixed29BitCanId),
+        CanAddressingMode::Normal11Bit => {
+            let bIsLegislated = (c_u32LegislatedRequestCanIdFirst
+                ..=c_u32LegislatedRequestCanIdLast)
+                .contains(&u32RequestCanId);
+            if bIsLegislated {
+                Some(c_u32Functional11BitCanId)
+            } else {
+                None
+            }
         }
     }
 }
