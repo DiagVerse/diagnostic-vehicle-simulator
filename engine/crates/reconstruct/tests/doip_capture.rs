@@ -131,3 +131,69 @@ fn something_that_is_not_a_capture_is_reported_as_such() {
         ),
     }
 }
+
+#[test]
+fn every_message_carries_its_own_arrival_time() {
+    // The bug this pins: a reassembled TCP stream used to stamp every message in it with the
+    // *first* segment's time. Requests and responses travel in opposite directions and are
+    // therefore separate streams, so that put every request before every response once merged —
+    // and with one-outstanding-request-per-target, collapsed a whole session into one exchange
+    // per ECU.
+    //
+    // The reference capture has a request and its response in different streams, so a correct
+    // reader correlates them. Under the old behaviour it still would, by luck of two streams;
+    // what proves the fix is a capture with several exchanges, which is the local one below.
+    let vecBytes = match LoadReferenceCapture() {
+        Some(vecBytes) => vecBytes,
+        None => return,
+    };
+
+    let (vehicle, summary) = ReconstructFromCaptureWithSummary(&vecBytes).expect("reconstructs");
+    assert!(summary.m_uExchanges >= 1);
+    assert_eq!(vehicle.m_vecEcus.len(), 1);
+}
+
+#[test]
+fn a_large_local_capture_reconstructs_deterministically() {
+    // Ordering must not depend on which order the streams happened to be walked in. Capture
+    // timestamps are not unique — a busy link puts many packets in one microsecond — so the
+    // tie-break is the capture's own order, and the same file must give the same answer twice.
+    let strPath = format!(
+        "{}/Downloads/Reprolog3.pcapng",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    let vecBytes = match std::fs::read(&strPath) {
+        Ok(vecBytes) => vecBytes,
+        Err(_) => {
+            eprintln!("skipping: no large capture on this machine");
+            return;
+        }
+    };
+
+    let (first, firstSummary) = ReconstructFromCaptureWithSummary(&vecBytes).expect("reconstructs");
+    let (second, secondSummary) =
+        ReconstructFromCaptureWithSummary(&vecBytes).expect("reconstructs again");
+
+    assert_eq!(firstSummary.m_uExchanges, secondSummary.m_uExchanges);
+    assert_eq!(first.m_vecEcus.len(), second.m_vecEcus.len());
+
+    let vecFirstAddresses: Vec<u16> = first
+        .m_vecEcus
+        .iter()
+        .map(|ecu| ecu.m_u16LogicalAddress)
+        .collect();
+    let vecSecondAddresses: Vec<u16> = second
+        .m_vecEcus
+        .iter()
+        .map(|ecu| ecu.m_u16LogicalAddress)
+        .collect();
+    assert_eq!(vecFirstAddresses, vecSecondAddresses);
+
+    eprintln!(
+        "{} messages, {} exchanges, {} ECUs from {} MB",
+        firstSummary.m_uMessages,
+        firstSummary.m_uExchanges,
+        first.m_vecEcus.len(),
+        vecBytes.len() / (1024 * 1024)
+    );
+}

@@ -75,7 +75,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/simfile",
             post(simulation::PostSimulationSimFile),
         )
-        .route("/simulation/pcap", post(simulation::PostSimulationCapture))
+        // A capture gets its own, much larger limit: it is binary and legitimately tens of
+        // megabytes, while every other body here is text measured in kilobytes. One global
+        // limit big enough for a capture would let a JSON route accept one too.
+        .route(
+            "/simulation/pcap",
+            post(simulation::PostSimulationCapture)
+                .layer(DefaultBodyLimit::max(simulation::c_uMaxCaptureBodyBytes)),
+        )
         .route("/simulation/state", get(simulation::GetSimulationState))
         .route(
             "/simulation/request",

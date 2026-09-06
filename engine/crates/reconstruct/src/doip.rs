@@ -73,6 +73,7 @@ pub fn ReconstructFromCaptureWithSummary(
         exchanges = summary.m_uExchanges,
         ecus = vehicle.m_vecEcus.len(),
         encrypted = summary.m_uEncryptedPackets,
+        abandonedStreams = summary.m_uAbandonedStreams,
         "reconstructed a vehicle from a DoIP capture"
     );
     Ok((vehicle, summary))
@@ -81,6 +82,14 @@ pub fn ReconstructFromCaptureWithSummary(
 /// One decoded DoIP message, with where it came from.
 struct DoIpMessage {
     m_f64TimestampSec: f64,
+    /// Where in the capture file this message's first byte arrived.
+    ///
+    /// Timestamps are not unique — this capture puts up to eighteen packets in one microsecond
+    /// — so sorting on time alone leaves the order of tied messages down to whatever order the
+    /// streams happened to be walked in. That is not a detail: correlation depends on requests
+    /// and responses interleaving as they actually did, so the tie-break has to be the capture's
+    /// own order rather than an accident of iteration.
+    m_uCaptureIndex: usize,
     m_strSourceIp: String,
     m_payloadType: PayloadType,
     m_vecPayload: Vec<u8>,
@@ -108,12 +117,11 @@ fn ExtractDoIpMessages(
             // A UDP datagram is already exactly one DoIP message (REQ 7.DoIP-122 AL), so it
             // needs no reassembly and must not be concatenated with its neighbours.
             TransportKind::Udp => {
-                ReadMessages(
-                    &packet.m_vecPayload,
-                    packet.m_f64TimestampSec,
-                    &packet.m_strSourceIp,
-                    &mut vecMessages,
-                );
+                let stream = TcpStream {
+                    m_vecBytes: packet.m_vecPayload.clone(),
+                    m_vecSegmentStarts: vec![(0, packet.m_f64TimestampSec, packet.m_uCaptureIndex)],
+                };
+                ReadMessages(&stream, &packet.m_strSourceIp, &mut vecMessages);
             }
             TransportKind::Tcp => {
                 mapStreams.entry(packet.FlowKey()).or_default().push(packet);
@@ -124,10 +132,9 @@ fn ExtractDoIpMessages(
     for (strFlow, mut vecSegments) in mapStreams {
         vecSegments.sort_by_key(|packet| packet.m_u32SequenceNumber);
         match JoinTcpStream(&vecSegments) {
-            Some(vecStream) => {
-                let f64TimestampSec = vecSegments[0].m_f64TimestampSec;
+            Some(stream) => {
                 let strSourceIp = vecSegments[0].m_strSourceIp.clone();
-                ReadMessages(&vecStream, f64TimestampSec, &strSourceIp, &mut vecMessages);
+                ReadMessages(&stream, &strSourceIp, &mut vecMessages);
             }
             None => {
                 summary.m_uAbandonedStreams += 1;
@@ -139,11 +146,15 @@ fn ExtractDoIpMessages(
         }
     }
 
-    // Framing produced messages per stream; a reader wants them in the order they happened.
+    // Framing produced messages per stream; correlation needs them interleaved as they
+    // actually happened. Time first, then the capture's own order for messages that share a
+    // timestamp — which is common, and without which the result depends on the order the
+    // streams were walked in rather than on the capture.
     vecMessages.sort_by(|a, b| {
         a.m_f64TimestampSec
             .partial_cmp(&b.m_f64TimestampSec)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.m_uCaptureIndex.cmp(&b.m_uCaptureIndex))
     });
     summary.m_uMessages = vecMessages.len();
     vecMessages
@@ -155,8 +166,11 @@ fn ExtractDoIpMessages(
 /// ISO-TP consecutive-frame check applies, and for the same reason: a PDU assembled across a
 /// hole is the right length and the wrong content, and reconstruction would then record it as
 /// observed ECU behaviour.
-fn JoinTcpStream(vecSegments: &[&CapturedPacket]) -> Option<Vec<u8>> {
-    let mut vecStream: Vec<u8> = Vec::new();
+fn JoinTcpStream(vecSegments: &[&CapturedPacket]) -> Option<TcpStream> {
+    let mut stream = TcpStream {
+        m_vecBytes: Vec::new(),
+        m_vecSegmentStarts: Vec::with_capacity(vecSegments.len()),
+    };
     let mut optU32Expected: Option<u32> = None;
 
     for packet in vecSegments {
@@ -172,23 +186,52 @@ fn JoinTcpStream(vecSegments: &[&CapturedPacket]) -> Option<Vec<u8>> {
                 return None;
             }
         }
-        vecStream.extend_from_slice(&packet.m_vecPayload);
+
+        stream.m_vecSegmentStarts.push((
+            stream.m_vecBytes.len(),
+            packet.m_f64TimestampSec,
+            packet.m_uCaptureIndex,
+        ));
+        stream.m_vecBytes.extend_from_slice(&packet.m_vecPayload);
         optU32Expected = Some(
             packet
                 .m_u32SequenceNumber
                 .wrapping_add(packet.m_vecPayload.len() as u32),
         );
     }
-    Some(vecStream)
+    Some(stream)
+}
+
+/// A reassembled stream, and when each part of it arrived.
+struct TcpStream {
+    m_vecBytes: Vec<u8>,
+    /// The offset each segment starts at, with the time that segment was captured. Sorted by
+    /// offset, so the time a message arrived is a binary search away.
+    m_vecSegmentStarts: Vec<(usize, f64, usize)>,
+}
+
+impl TcpStream {
+    /// When the byte at this offset arrived.
+    ///
+    /// Every message needs its own time, not the stream's. Requests and responses travel in
+    /// opposite directions and are therefore reassembled as separate streams; giving every
+    /// message in a stream one timestamp puts *all* requests before *all* responses once the
+    /// streams are merged, which destroys the interleaving correlation depends on — and with
+    /// one-outstanding-request-per-target, collapses a whole session into one exchange per ECU.
+    fn ArrivalOf(&self, uOffset: usize) -> (f64, usize) {
+        let uIndex = self
+            .m_vecSegmentStarts
+            .partition_point(|(uStart, _, _)| *uStart <= uOffset);
+        self.m_vecSegmentStarts
+            .get(uIndex.saturating_sub(1))
+            .map(|(_, f64TimestampSec, uCaptureIndex)| (*f64TimestampSec, *uCaptureIndex))
+            .unwrap_or((0.0, 0))
+    }
 }
 
 /// Frame a byte stream into DoIP messages using each header's length field.
-fn ReadMessages(
-    arrStream: &[u8],
-    f64TimestampSec: f64,
-    strSourceIp: &str,
-    vecMessages: &mut Vec<DoIpMessage>,
-) {
+fn ReadMessages(stream: &TcpStream, strSourceIp: &str, vecMessages: &mut Vec<DoIpMessage>) {
+    let arrStream = &stream.m_vecBytes;
     let limits = HeaderLimits {
         m_u32MaxDataSize: c_u32MaxMessageLength,
         m_u32AvailableMemory: c_u32MaxMessageLength,
@@ -213,8 +256,12 @@ fn ReadMessages(
             return;
         }
 
+        let (f64TimestampSec, uCaptureIndex) = stream.ArrivalOf(uOffset);
         vecMessages.push(DoIpMessage {
+            // The arrival of the segment carrying this message's first byte, not the stream's
+            // — see `TcpStream::ArrivalOf`.
             m_f64TimestampSec: f64TimestampSec,
+            m_uCaptureIndex: uCaptureIndex,
             m_strSourceIp: strSourceIp.to_string(),
             m_payloadType: header.m_payloadType,
             m_vecPayload: arrStream[uStart..uEnd].to_vec(),

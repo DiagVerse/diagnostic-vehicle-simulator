@@ -20,6 +20,12 @@ use ethernet::TransportKind;
 /// One packet's transport payload, with enough context to group it into a conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedPacket {
+    /// Where this packet sat in the file, counting every packet the reader accepted.
+    ///
+    /// Capture timestamps are not unique — a busy link routinely puts several packets in one
+    /// microsecond — so anything that reorders packets needs a tie-break that is faithful
+    /// rather than arbitrary. A capture is written in arrival order, so this is it.
+    pub m_uCaptureIndex: usize,
     /// Capture time in seconds. Whole seconds plus the sub-second field the file carried, at
     /// whatever resolution it declared.
     pub m_f64TimestampSec: f64,
@@ -99,7 +105,7 @@ pub fn ReadCapture(arrBytes: &[u8]) -> Result<Vec<CapturedPacket>, PcapError> {
         });
     }
 
-    let vecPackets = if pcapng::IsPcapNg(arrBytes) {
+    let mut vecPackets = if pcapng::IsPcapNg(arrBytes) {
         pcapng::ReadPcapNg(arrBytes)?
     } else if classic::IsClassicPcap(arrBytes) {
         classic::ReadClassicPcap(arrBytes)?
@@ -108,6 +114,12 @@ pub fn ReadCapture(arrBytes: &[u8]) -> Result<Vec<CapturedPacket>, PcapError> {
             strLeadingBytes: DescribeLeadingBytes(arrBytes),
         });
     };
+
+    // Numbered here rather than in each container reader, so both formats get it and neither
+    // can forget to.
+    for (uIndex, packet) in vecPackets.iter_mut().enumerate() {
+        packet.m_uCaptureIndex = uIndex;
+    }
 
     tracing::info!(packets = vecPackets.len(), "read a capture");
     Ok(vecPackets)

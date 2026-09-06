@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use ::simulation::execute::{EmittedFrame, ExecutePlans};
 use ::simulation::{EcuKey, RoutedResponse, RoutingOutcome, SimulationService};
+use axum::body::Bytes;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -37,25 +38,27 @@ use crate::AppState;
 
 /// Longest CAN log accepted in one upload (characters). A log is pasted or uploaded by a
 /// human; anything larger is a mistake or an attempt to exhaust the engine's memory.
-const c_uMaxLogTextChars: usize = 8 * 1024 * 1024;
+const c_uMaxLogTextChars: usize = 16 * 1024 * 1024;
 
-/// Largest request body the engine will read at all, in bytes.
+/// Largest body the text endpoints will read, in bytes.
 ///
 /// axum caps a body at 2 MB unless told otherwise, and refuses an oversized one *before* any
-/// handler runs — which made the limits below unreachable and turned a large upload into a bare
+/// handler runs — which made the limits here unreachable and turned a large upload into a bare
 /// 413, or an EPIPE through a dev proxy while the body was still being written.
 ///
-/// Deliberately far above the per-endpoint limits: this is a backstop against something
-/// pathological, not a limit anyone should meet. The endpoints check their own smaller limits
-/// and explain themselves, which is the message a user should get.
-pub const c_uMaxRequestBodyBytes: usize = 64 * 1024 * 1024;
+/// A little above `c_uMaxLogTextChars` so the endpoint's own guard is what refuses an oversized
+/// log, with a message that explains itself rather than a framework status code.
+pub const c_uMaxRequestBodyBytes: usize = 24 * 1024 * 1024;
 
-/// Largest capture accepted, as base64 characters.
+/// Largest capture accepted, in bytes.
 ///
-/// Base64 costs a third more than the bytes it carries, so this is roughly a 24 MB capture.
-/// Captures are legitimately larger than logs — a few seconds of a busy Ethernet link is
-/// megabytes — so this is deliberately more generous than the text limit above.
-const c_uMaxCaptureBase64Chars: usize = 32 * 1024 * 1024;
+/// Captures are a different order of magnitude from logs — a few seconds of a busy Ethernet
+/// link is tens of megabytes, and a diagnostic session recorded alongside ordinary traffic is
+/// larger still. This is sized for a real capture rather than a sample.
+pub const c_uMaxCaptureBytes: usize = 256 * 1024 * 1024;
+
+/// The body limit for the capture endpoint, a little above what it will accept.
+pub const c_uMaxCaptureBodyBytes: usize = c_uMaxCaptureBytes + 8 * 1024 * 1024;
 
 /// The single link the topology view can honestly draw today: everything reachable through one
 /// tester connection. A real `Network` type in the model is what would let there be more.
@@ -360,77 +363,38 @@ pub struct SimulationRequestResultDto {
     pub silenced_reason: Option<String>,
 }
 
-/// A capture, base64-encoded because it is binary and every other body here is JSON text.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadCaptureBody {
-    /// The pcap or pcapng file, base64.
-    pub capture_base64: String,
-}
-
 /// POST /simulation/pcap — reconstruct a vehicle from a DoIP capture.
+///
+/// Takes the capture as a **raw binary body**, not base64 and not JSON. A capture is bytes;
+/// base64 would cost a third more on the wire and force a full copy at both ends, for a file
+/// that is already the largest thing this API accepts.
 pub async fn PostSimulationCapture(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<LoadCaptureBody>,
+    body: Bytes,
 ) -> Result<Json<SimulationStateDto>, ApiError> {
-    if body.capture_base64.len() > c_uMaxCaptureBase64Chars {
-        // Reported in megabytes of capture rather than characters of base64, because that is
-        // the number the person choosing the file can actually compare against.
-        return Err(ApiError::BadRequest(format!(
-            "this capture is larger than the {} MB this endpoint accepts. Trim it with a capture \
-             filter, or cut it to the exchange you are interested in.",
-            c_uMaxCaptureBase64Chars * 3 / 4 / (1024 * 1024)
-        )));
-    }
-
-    let vecBytes = DecodeBase64(&body.capture_base64).map_err(|strReason| {
-        ApiError::BadRequest(format!("the capture is not valid base64: {strReason}"))
-    })?;
-    if vecBytes.is_empty() {
+    if body.is_empty() {
         return Err(ApiError::BadRequest("the capture is empty".to_string()));
+    }
+    if body.len() > c_uMaxCaptureBytes {
+        // Reported in megabytes, which is the number the person choosing the file can compare
+        // against what their file manager told them.
+        return Err(ApiError::BadRequest(format!(
+            "this capture is {} MB; the limit is {} MB. Trim it with a capture filter, or cut it \
+             to the exchange you are interested in.",
+            body.len() / (1024 * 1024),
+            c_uMaxCaptureBytes / (1024 * 1024)
+        )));
     }
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .LoadFromCapture(&vecBytes)
+        .LoadFromCapture(&body)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
 }
 
-/// Decode standard base64, with or without padding.
-///
-/// Hand-rolled for the same reason the capture parser is: it is a dozen lines, and a browser
-/// sending a file is the only thing that will ever call it.
-fn DecodeBase64(strEncoded: &str) -> Result<Vec<u8>, String> {
-    const c_strAlphabet: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut vecBytes = Vec::with_capacity(strEncoded.len() * 3 / 4);
-    let mut u32Accumulator: u32 = 0;
-    let mut uBitsHeld = 0u32;
-
-    for byChar in strEncoded.bytes() {
-        // Whitespace is common in base64 that has travelled through anything, and padding
-        // carries no bits.
-        if byChar.is_ascii_whitespace() || byChar == b'=' {
-            continue;
-        }
-        let uValue = c_strAlphabet
-            .iter()
-            .position(|byAlphabet| *byAlphabet == byChar)
-            .ok_or_else(|| format!("'{}' is not a base64 character", byChar as char))?;
-
-        u32Accumulator = (u32Accumulator << 6) | uValue as u32;
-        uBitsHeld += 6;
-        if uBitsHeld >= 8 {
-            uBitsHeld -= 8;
-            vecBytes.push((u32Accumulator >> uBitsHeld) as u8);
-        }
-    }
-    Ok(vecBytes)
-}
-
+/// POST /simulation/simfile — load a vehicle from a simulation file.
 /// POST /simulation/simfile — load a vehicle from a simulation file.
 pub async fn PostSimulationSimFile(
     State(state): State<Arc<AppState>>,
