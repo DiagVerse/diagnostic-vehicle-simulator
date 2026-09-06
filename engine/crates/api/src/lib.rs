@@ -83,6 +83,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(simulation::PostSimulationCapture)
                 .layer(DefaultBodyLimit::max(simulation::c_uMaxCaptureBodyBytes)),
         )
+        .route(
+            "/simulation/identity",
+            get(simulation::GetVehicleIdentity).put(simulation::PutVehicleIdentity),
+        )
         .route("/simulation/state", get(simulation::GetSimulationState))
         .route(
             "/simulation/request",
@@ -97,6 +101,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/hw/stop", post(hardware::PostHardwareStop))
         .route("/events", get(traffic::GetEvents))
         .route("/doip/status", get(doip::GetDoIpStatus))
+        .route(
+            "/doip/settings",
+            get(doip::GetDoIpSettings).put(doip::PutDoIpSettings),
+        )
         .route("/doip/start", post(doip::PostDoIpStart))
         .route("/doip/stop", post(doip::PostDoIpStop))
         .route("/simulation/topology", get(simulation::GetTopology))

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::{extract::State, Json};
-use doip_server::{DoIpEntity, DoIpServer, ServerHandle};
+use doip_server::{DoIpEntity, DoIpServer, DoIpSettings, ServerHandle};
 use serde::{Deserialize, Serialize};
 
 use crate::simulation::ApiError;
@@ -22,6 +22,13 @@ pub struct DoIpState {
     pub m_optHandle: Option<ServerHandle>,
     pub m_strBoundAddress: String,
     pub m_u16EntityAddress: u16,
+    /// What the entity says about itself, and what it has been told to say instead.
+    ///
+    /// Lives here rather than inside the entity so it survives stop/start and can be set before
+    /// the server is running. Shared with a running entity, so a change takes effect at once —
+    /// injecting a fault only by restarting would make it useless for reproducing one
+    /// mid-session, which is exactly when a fault matters.
+    pub m_arcMtxSettings: Arc<Mutex<DoIpSettings>>,
 }
 
 /// Where to listen, and as which entity.
@@ -98,9 +105,17 @@ pub async fn PostDoIpStart(
         }
     }
 
+    let arcSettings = Arc::clone(
+        &state
+            .doip
+            .lock()
+            .expect("DoIP mutex poisoned")
+            .m_arcMtxSettings,
+    );
     let arcEntity = Arc::new(Mutex::new(DoIpEntity::New(
         Arc::clone(&state.simulation),
         u16EntityAddress,
+        arcSettings,
     )));
 
     let handle = DoIpServer::Start(arcEntity, bindAddress, Arc::from(protocol))
@@ -171,4 +186,147 @@ fn ResolveEntityAddress(state: &Arc<AppState>, optStrHex: Option<&str>) -> Resul
                 .to_string(),
         )
     })
+}
+
+/// The entity's parameters and fault injection, as the UI sees them.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoIpSettingsDto {
+    /// `0x00` not ready, `0x01` ready, `0x02` not supported.
+    pub power_mode: u8,
+    /// `0x00` gateway, `0x01` node.
+    pub node_type: u8,
+    /// Concurrent TCP data sockets reported, excluding the reserve the standard requires.
+    pub max_sockets: u8,
+    /// Reported *and* enforced — a tester that reads this and sends a message that size expects
+    /// it to be accepted.
+    pub max_data_size: u32,
+    /// Answer nothing to a vehicle identification request.
+    pub suppress_identification_response: bool,
+    /// Force this routing activation response code instead of deciding. Null to decide normally.
+    pub forced_routing_activation_code: Option<u8>,
+    /// Negatively acknowledge every diagnostic message with this code. Null to route normally.
+    pub forced_diagnostic_nack: Option<u8>,
+    /// Refuse every message with this generic header NACK code. Null to read them normally.
+    pub forced_header_nack: Option<u8>,
+    /// True when any of the above is making the entity behave as a healthy one would not.
+    ///
+    /// Reported so the UI can say so: an entity quietly refusing everything because a knob was
+    /// left on is a confusing afternoon.
+    #[serde(skip_deserializing)]
+    pub is_injecting_faults: bool,
+}
+
+/// GET /doip/settings — what this entity says about itself.
+pub async fn GetDoIpSettings(State(state): State<Arc<AppState>>) -> Json<DoIpSettingsDto> {
+    let doip = state.doip.lock().expect("DoIP mutex poisoned");
+    let settings = doip
+        .m_arcMtxSettings
+        .lock()
+        .expect("DoIP settings mutex poisoned");
+    Json(BuildSettingsDto(&settings))
+}
+
+/// PUT /doip/settings — change what it says, including making it misbehave.
+pub async fn PutDoIpSettings(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DoIpSettingsDto>,
+) -> Result<Json<DoIpSettingsDto>, ApiError> {
+    ValidateSettings(&body)?;
+
+    let doip = state.doip.lock().expect("DoIP mutex poisoned");
+    let mut settings = doip
+        .m_arcMtxSettings
+        .lock()
+        .expect("DoIP settings mutex poisoned");
+
+    settings.m_byPowerMode = body.power_mode;
+    settings.m_byNodeType = body.node_type;
+    settings.m_byMaxSockets = body.max_sockets;
+    settings.m_u32MaxDataSize = body.max_data_size;
+    settings.m_bSuppressIdentificationResponse = body.suppress_identification_response;
+    settings.m_optByForcedRoutingActivationCode = body.forced_routing_activation_code;
+    settings.m_optByForcedDiagnosticNack = body.forced_diagnostic_nack;
+    settings.m_optByForcedHeaderNack = body.forced_header_nack;
+
+    if settings.IsInjectingFaults() {
+        tracing::warn!(
+            routingActivation = ?settings.m_optByForcedRoutingActivationCode,
+            diagnosticNack = ?settings.m_optByForcedDiagnosticNack,
+            headerNack = ?settings.m_optByForcedHeaderNack,
+            suppressIdentification = settings.m_bSuppressIdentificationResponse,
+            "the DoIP entity is now injecting faults"
+        );
+    } else {
+        tracing::info!("DoIP entity settings updated; nothing is being injected");
+    }
+
+    Ok(Json(BuildSettingsDto(&settings)))
+}
+
+fn BuildSettingsDto(settings: &DoIpSettings) -> DoIpSettingsDto {
+    DoIpSettingsDto {
+        power_mode: settings.m_byPowerMode,
+        node_type: settings.m_byNodeType,
+        max_sockets: settings.m_byMaxSockets,
+        max_data_size: settings.m_u32MaxDataSize,
+        suppress_identification_response: settings.m_bSuppressIdentificationResponse,
+        forced_routing_activation_code: settings.m_optByForcedRoutingActivationCode,
+        forced_diagnostic_nack: settings.m_optByForcedDiagnosticNack,
+        forced_header_nack: settings.m_optByForcedHeaderNack,
+        is_injecting_faults: settings.IsInjectingFaults(),
+    }
+}
+
+/// Refuse settings that would put something on the wire no vehicle would ever send.
+///
+/// Fault injection is for reproducing what a real entity does wrong, not for inventing bytes the
+/// standard does not define — a tester tested against those has been tested against nothing.
+fn ValidateSettings(body: &DoIpSettingsDto) -> Result<(), ApiError> {
+    if body.power_mode > 0x02 {
+        return Err(ApiError::BadRequest(format!(
+            "diagnostic power mode 0x{:02X} is not defined; use 00 not ready, 01 ready or 02 not supported",
+            body.power_mode
+        )));
+    }
+    if body.node_type > 0x01 {
+        return Err(ApiError::BadRequest(format!(
+            "node type 0x{:02X} is not defined; use 00 for a gateway or 01 for a node",
+            body.node_type
+        )));
+    }
+    if body.max_sockets == 0 {
+        return Err(ApiError::BadRequest(
+            "an entity that reports zero sockets could never be connected to".to_string(),
+        ));
+    }
+    if body.max_data_size < 64 {
+        return Err(ApiError::BadRequest(
+            "a maximum data size below 64 bytes would refuse even a routing activation".to_string(),
+        ));
+    }
+
+    if let Some(byCode) = body.forced_routing_activation_code {
+        let bIsKnown = matches!(byCode, 0x00..=0x04 | 0x06 | 0x10);
+        if !bIsKnown {
+            return Err(ApiError::BadRequest(format!(
+                "0x{byCode:02X} is not a routing activation response code this entity can send"
+            )));
+        }
+    }
+    if let Some(byCode) = body.forced_diagnostic_nack {
+        if !(0x02..=0x06).contains(&byCode) {
+            return Err(ApiError::BadRequest(format!(
+                "0x{byCode:02X} is not a diagnostic message NACK code (02 to 06 are defined)"
+            )));
+        }
+    }
+    if let Some(byCode) = body.forced_header_nack {
+        if byCode > 0x04 {
+            return Err(ApiError::BadRequest(format!(
+                "0x{byCode:02X} is not a generic header NACK code (00 to 04 are defined)"
+            )));
+        }
+    }
+    Ok(())
 }

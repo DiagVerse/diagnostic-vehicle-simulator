@@ -4,11 +4,12 @@ import { Diagnostics } from './features/Diagnostics'
 import { Overview } from './features/Overview'
 import { Simulate } from './features/Simulate'
 import { Hardware } from './features/Hardware'
+import { DoIp } from './features/DoIp'
 import { Topology } from './features/Topology'
 import { TrafficMonitor } from './features/TrafficMonitor'
 import { api, type Health } from './shared/api'
 
-type Tab = 'simulate' | 'topology' | 'hardware' | 'diagnostics' | 'overview'
+type Tab = 'simulate' | 'topology' | 'hardware' | 'doip' | 'diagnostics' | 'overview'
 
 export default function App() {
   // The monitor opens as its own browser window, addressed by a hash rather than a route: it
@@ -82,6 +83,9 @@ function Workbench() {
           <TabButton active={tab === 'hardware'} onClick={() => setTab('hardware')}>
             Hardware
           </TabButton>
+          <TabButton active={tab === 'doip'} onClick={() => setTab('doip')}>
+            DoIP
+          </TabButton>
           <TabButton active={tab === 'diagnostics'} onClick={() => setTab('diagnostics')}>
             Diagnostics
           </TabButton>
@@ -95,6 +99,7 @@ function Workbench() {
         {tab === 'simulate' && <Simulate />}
         {tab === 'topology' && <Topology />}
         {tab === 'hardware' && <Hardware />}
+        {tab === 'doip' && <DoIp />}
         {tab === 'diagnostics' && <Diagnostics />}
         {tab === 'overview' && <Overview />}
       </main>
