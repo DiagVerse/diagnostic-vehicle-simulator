@@ -188,7 +188,7 @@ async fn a_response_pending_goes_out_before_the_answer() {
         .lock()
         .unwrap()
         .SetEcuTiming(
-            0x7E0,
+            simulation::EcuKey::Can(0x7E0),
             EcuTiming {
                 m_u32ResponseDelayMs: 60,
                 ..EcuTiming::default()

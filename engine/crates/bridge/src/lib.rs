@@ -136,7 +136,14 @@ impl CanBridge {
             .expect("simulation mutex poisoned");
         let mut mapEndpoints = BTreeMap::new();
 
-        for (u32RequestCanId, runningEcu) in simulation.RunningEcus() {
+        for (key, runningEcu) in simulation.RunningEcus() {
+            // The bridge is a CAN bus. An ECU reachable only over DoIP has no identifier to
+            // listen on here, and skipping it is not a limitation — it is simply not on this
+            // wire.
+            let u32RequestCanId = match key.RequestCanId() {
+                Some(u32RequestCanId) => u32RequestCanId,
+                None => continue,
+            };
             let address = match runningEcu.Config().m_optCanAddress {
                 Some(address) => address,
                 None => continue,

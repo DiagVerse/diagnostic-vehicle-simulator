@@ -39,12 +39,12 @@ export function Topology() {
    * gateway going off changes what is reachable behind it, which is a fact about other nodes.
    */
   async function toggleEcu(node: TopologyNode) {
-    if (node.requestCanIdHex === null) {
+    if (node.handle === null) {
       return
     }
     setBusy(true)
     try {
-      await api.simulationSetEcuEnabled(node.requestCanIdHex, !node.isEnabled)
+      await api.simulationSetEcuEnabled(node.handle, !node.isEnabled)
       setTopology(await api.simulationTopology())
       setError(null)
     } catch (e) {
@@ -367,7 +367,7 @@ function EcuCardNode({
     >
       <div className="flex items-start justify-between gap-2">
         <span className="flex items-center gap-2">
-          {node.requestCanIdHex !== null && (
+          {node.handle !== null && (
             <PowerSwitch
               isOn={node.isEnabled}
               disabled={busy}
@@ -502,7 +502,7 @@ function ArchitectureEditor({
           </h5>
           <ul className="space-y-2">
             {ecus
-              .filter((node) => node.requestCanIdHex !== null)
+              .filter((node) => node.handle !== null)
               .map((node) => (
                 <PlacementRow
                   key={node.id}
@@ -511,17 +511,15 @@ function ArchitectureEditor({
                   busy={busy}
                   onPlace={(placement) =>
                     run(() =>
-                      api.simulationSetEcuPlacement(node.requestCanIdHex ?? '', placement),
+                      api.simulationSetEcuPlacement(node.handle ?? '', placement),
                     )
                   }
                 />
               ))}
           </ul>
-          {ecus.some((node) => node.requestCanIdHex === null) && (
+          {ecus.some((node) => node.handle === null) && (
             <p className="text-[11px] text-slate-600">
-              ECUs addressed only over DoIP are placed by the simulation file that declared
-              them; the engine addresses ECUs by CAN identifier, so it has no handle to move
-              them by yet.
+              The tester is drawn rather than driven, so it has no controls of its own.
             </p>
           )}
         </div>
@@ -637,7 +635,9 @@ function PlacementRow({
     <li className="rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2">
       <div className="flex flex-wrap items-center gap-2">
         <span className="min-w-36 text-sm text-slate-200">{node.label}</span>
-        <span className="font-mono text-[11px] text-slate-500">{node.requestCanIdHex}</span>
+        <span className="font-mono text-[11px] text-slate-500">
+          {node.requestCanIdHex ?? `logical ${node.logicalAddressHex}`}
+        </span>
 
         <label className="flex items-center gap-1.5 text-xs text-slate-500">
           on

@@ -740,7 +740,7 @@ function EcuCard({
   }
 
   async function rename() {
-    await run(() => api.simulationRenameEcu(ecu.requestCanIdHex, name))
+    await run(() => api.simulationRenameEcu(ecu.handle, name))
     setRenaming(false)
   }
 
@@ -787,7 +787,7 @@ function EcuCard({
                 disabled={busy || working}
                 label={`Switch ${ecu.name} ${ecu.isEnabled ? 'off' : 'on'}`}
                 onToggle={() =>
-                  run(() => api.simulationSetEcuEnabled(ecu.requestCanIdHex, !ecu.isEnabled))
+                  run(() => api.simulationSetEcuEnabled(ecu.handle, !ecu.isEnabled))
                 }
               />
               <h4 className={`font-semibold ${ecu.isEnabled ? '' : 'text-slate-500'}`}>
@@ -808,7 +808,7 @@ function EcuCard({
                 rename
               </button>
               <button
-                onClick={() => run(() => api.simulationRemoveEcu(ecu.requestCanIdHex))}
+                onClick={() => run(() => api.simulationRemoveEcu(ecu.handle))}
                 disabled={busy || working}
                 title="Remove this ECU from the vehicle"
                 className="text-xs text-slate-500 transition hover:text-rose-400 disabled:opacity-40"
@@ -1056,7 +1056,7 @@ function OverridePanel({
     if (!ecu) return
     setWorking(true)
     try {
-      setOverrides(await api.setEcuOverrides(ecu.requestCanIdHex, vecNext))
+      setOverrides(await api.setEcuOverrides(ecu.handle, vecNext))
       onError(null)
       if (strAppliedLabel) {
         // Applied: fold away and leave the log the room. The summary bar is the way back.
@@ -1433,7 +1433,7 @@ function TimingPanel({
     if (!ecu) return
     setSaving(true)
     try {
-      const result = await api.setEcuTiming(ecu.requestCanIdHex, timing)
+      const result = await api.setEcuTiming(ecu.handle, timing)
       setDraft(null)
       onError(null)
       setNote(
@@ -1718,9 +1718,11 @@ function AddressOptions(state: SimulationState | null): AddressOption[] {
     return []
   }
 
+  // Keyed by handle, so an ECU reachable only over DoIP can be addressed here too — otherwise
+  // a vehicle imported from an Ethernet capture would list ECUs nothing could query.
   const vecOptions: AddressOption[] = state.ecus.map((ecu) => ({
-    canIdHex: ecu.requestCanIdHex,
-    label: `${ecu.requestCanIdHex} — ${ecu.name}`,
+    canIdHex: ecu.handle,
+    label: `${ecu.requestCanIdHex ?? `logical ${ecu.logicalAddressHex}`} — ${ecu.name}`,
   }))
 
   const mapListeners = new Map<string, string[]>()

@@ -71,8 +71,14 @@ export interface EcuTimingUpdate extends EcuTiming {
 export interface SimulationEcu {
   name: string
   logicalAddress: number
-  requestCanIdHex: string
-  responseCanIdHex: string
+  /** How this ECU is named in a URL: its CAN identifier, or `doip-1234`. */
+  handle: string
+  /** The identifier a tester addresses it on. Null for an ECU reachable only over DoIP. */
+  requestCanIdHex: string | null
+  /** The identifier it answers on. Null for an ECU reachable only over DoIP. */
+  responseCanIdHex: string | null
+  /** Its DoIP logical address in hex, when that address is a routable one. */
+  logicalAddressHex: string | null
   /** The broadcast identifier this ECU also listens on, if any. */
   functionalCanIdHex: string | null
   addressingMode: string
@@ -213,6 +219,8 @@ export interface TopologyLink {
 export interface TopologyNode {
   id: string
   label: string
+  /** How this ECU is named in a URL. Null for the tester node, which is drawn, not driven. */
+  handle: string | null
   /** 'ecu' or 'tester'. */
   kind: string
   linkId: string | null
@@ -353,10 +361,10 @@ export const api = {
   simulationCreateVehicle: (name: string) =>
     postJson<SimulationState>('/simulation/vehicle', { name }),
   simulationAddEcu: (ecu: NewEcu) => postJson<SimulationState>('/simulation/ecus', ecu),
-  simulationRemoveEcu: (requestCanIdHex: string) =>
-    deleteJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}`),
-  simulationRenameEcu: (requestCanIdHex: string, name: string) =>
-    putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/name`, { name }),
+  simulationRemoveEcu: (handle: string) =>
+    deleteJson<SimulationState>(`/simulation/ecus/${handle}`),
+  simulationRenameEcu: (handle: string, name: string) =>
+    putJson<SimulationState>(`/simulation/ecus/${handle}/name`, { name }),
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
   simulationLoadSimFile: (logText: string) =>
     postJson<SimulationState>('/simulation/simfile', { logText }),
@@ -370,21 +378,21 @@ export const api = {
     postJson<Topology>('/simulation/networks', network),
   simulationRemoveNetwork: (networkId: string) =>
     deleteJson<Topology>(`/simulation/networks/${encodeURIComponent(networkId)}`),
-  simulationSetEcuPlacement: (requestCanIdHex: string, placement: EcuPlacement) =>
-    putJson<Topology>(`/simulation/ecus/${requestCanIdHex}/placement`, placement),
-  simulationSetEcuEnabled: (requestCanIdHex: string, enabled: boolean) =>
-    putJson<SimulationState>(`/simulation/ecus/${requestCanIdHex}/enabled`, { enabled }),
+  simulationSetEcuPlacement: (handle: string, placement: EcuPlacement) =>
+    putJson<Topology>(`/simulation/ecus/${handle}/placement`, placement),
+  simulationSetEcuEnabled: (handle: string, enabled: boolean) =>
+    putJson<SimulationState>(`/simulation/ecus/${handle}/enabled`, { enabled }),
   serialPorts: () => getJson<SerialPorts>('/hw/ports'),
   hardwareStatus: () => getJson<HardwareStatus>('/hw/status'),
   hardwareStart: (port: string, bitrateBps: number) =>
     postJson<HardwareStatus>('/hw/start', { port, bitrateBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
-  ecuOverrides: (requestCanIdHex: string) =>
-    getJson<ResponseOverride[]>(`/simulation/ecus/${requestCanIdHex}/overrides`),
-  setEcuOverrides: (requestCanIdHex: string, overrides: ResponseOverride[]) =>
-    putJson<ResponseOverride[]>(`/simulation/ecus/${requestCanIdHex}/overrides`, { overrides }),
-  ecuTiming: (requestCanIdHex: string) =>
-    getJson<EcuTiming>(`/simulation/ecus/${requestCanIdHex}/timing`),
-  setEcuTiming: (requestCanIdHex: string, timing: EcuTiming) =>
-    putJson<EcuTimingUpdate>(`/simulation/ecus/${requestCanIdHex}/timing`, timing),
+  ecuOverrides: (handle: string) =>
+    getJson<ResponseOverride[]>(`/simulation/ecus/${handle}/overrides`),
+  setEcuOverrides: (handle: string, overrides: ResponseOverride[]) =>
+    putJson<ResponseOverride[]>(`/simulation/ecus/${handle}/overrides`, { overrides }),
+  ecuTiming: (handle: string) =>
+    getJson<EcuTiming>(`/simulation/ecus/${handle}/timing`),
+  setEcuTiming: (handle: string, timing: EcuTiming) =>
+    putJson<EcuTimingUpdate>(`/simulation/ecus/${handle}/timing`, timing),
 }

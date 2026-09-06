@@ -201,3 +201,35 @@ async fn the_event_stream_is_reachable_and_announces_itself_as_sse() {
         "the feed must be served as SSE, got '{strContentType}'"
     );
 }
+
+#[tokio::test]
+async fn an_ecu_can_be_named_by_a_doip_handle_as_well_as_a_can_identifier() {
+    // The whole point of handles: an ECU reconstructed from an Ethernet capture has no CAN
+    // identifier, so without this it would be loaded, routable, and unreachable from the API.
+    // A malformed handle must reach the handler and be rejected there — 404 would be ambiguous.
+    for strHandle in ["doip-ZZZZ", "DOIP-QQ"] {
+        assert_eq!(
+            StatusOf(
+                "GET",
+                &format!("/simulation/ecus/{strHandle}/overrides"),
+                ""
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "'{strHandle}' is not a hex logical address and the handler should say so"
+        );
+    }
+
+    // A well-formed one reaches the handler and reports the ECU as absent, which is right with
+    // nothing loaded.
+    assert_eq!(
+        StatusOf("GET", "/simulation/ecus/doip-1234/overrides", "").await,
+        StatusCode::NOT_FOUND
+    );
+
+    // And a bare hex identifier still means a CAN ECU, so every URL that worked before does.
+    assert_eq!(
+        StatusOf("GET", "/simulation/ecus/7E0/overrides", "").await,
+        StatusCode::NOT_FOUND
+    );
+}

@@ -8,7 +8,7 @@ use application::ProtocolHandler;
 use core_domain::model::{CanAddress, CanAddressingMode, DataIdentifier, Ecu, SessionType};
 use core_domain::Confidence;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
-use simulation::{RoutingOutcome, SimulationService};
+use simulation::{EcuKey, RoutingOutcome, SimulationService};
 
 struct UdsHandler;
 
@@ -109,7 +109,9 @@ fn a_removed_ecu_stops_answering_and_leaves_the_model() {
     simulation.AddEcu(BuildEcu("Engine", 0x7E0, 0x7E8)).unwrap();
     simulation.AddEcu(BuildEcu("Body", 0x7E1, 0x7E9)).unwrap();
 
-    simulation.RemoveEcu(0x7E0).expect("ECU on 0x7E0");
+    simulation
+        .RemoveEcu(EcuKey::Can(0x7E0))
+        .expect("ECU on 0x7E0");
 
     assert_eq!(simulation.RunningEcus().count(), 1);
     assert_eq!(
@@ -129,7 +131,7 @@ fn a_removed_ecu_stops_answering_and_leaves_the_model() {
 fn removing_an_ecu_that_is_not_there_is_refused() {
     let mut simulation = SimulationService::New();
     simulation.CreateEmptyVehicle("Bench vehicle");
-    assert!(simulation.RemoveEcu(0x7E0).is_err());
+    assert!(simulation.RemoveEcu(EcuKey::Can(0x7E0)).is_err());
 }
 
 #[test]
@@ -140,7 +142,9 @@ fn renaming_an_ecu_updates_both_the_running_ecu_and_the_model() {
         .AddEcu(BuildEcu("ECU_7E8", 0x7E0, 0x7E8))
         .unwrap();
 
-    simulation.RenameEcu(0x7E0, "Engine").expect("ECU on 0x7E0");
+    simulation
+        .RenameEcu(EcuKey::Can(0x7E0), "Engine")
+        .expect("ECU on 0x7E0");
 
     assert_eq!(
         simulation

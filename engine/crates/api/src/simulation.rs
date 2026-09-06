@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ::simulation::execute::{EmittedFrame, ExecutePlans};
-use ::simulation::{RoutedResponse, RoutingOutcome, SimulationService};
+use ::simulation::{EcuKey, RoutedResponse, RoutingOutcome, SimulationService};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -147,6 +147,8 @@ pub struct RenameEcuBody {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulationRequestBody {
+    /// The identifier to address, for an ECU on CAN. Also accepts a `doip-1234` handle, which
+    /// is the only way to name an ECU reachable solely over Ethernet.
     pub can_id_hex: String,
     pub request_hex: String,
 }
@@ -157,8 +159,17 @@ pub struct SimulationRequestBody {
 pub struct SimulationEcuDto {
     pub name: String,
     pub logical_address: u16,
-    pub request_can_id_hex: String,
-    pub response_can_id_hex: String,
+    /// How this ECU is named in a URL: its CAN identifier, or `doip-1234`.
+    ///
+    /// For a CAN-addressed ECU the handle *is* the identifier, so every URL that worked before
+    /// handles existed still resolves.
+    pub handle: String,
+    /// The identifier a tester addresses it on. `None` for an ECU reachable only over DoIP.
+    pub request_can_id_hex: Option<String>,
+    /// The identifier it answers on. `None` for an ECU reachable only over DoIP.
+    pub response_can_id_hex: Option<String>,
+    /// Its DoIP logical address in hex, when that address is a routable one.
+    pub logical_address_hex: Option<String>,
     /// The broadcast identifier this ECU also listens on, if any.
     pub functional_can_id_hex: Option<String>,
     /// The ECU's current timing parameters.
@@ -430,8 +441,12 @@ pub async fn PostSimulationRequest(
 ) -> Result<Json<SimulationRequestResultDto>, ApiError> {
     // Parse both inputs before touching the simulation, so a malformed request cannot leave
     // ECU state half-changed.
-    let u32RequestCanId = ParseCanId(&body.can_id_hex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&body.can_id_hex).map_err(ApiError::BadRequest)?;
     let vecRequest = ParseHex(&body.request_hex).map_err(ApiError::BadRequest)?;
+
+    // What the exchange is reported as having been addressed on. A DoIP-only ECU has no CAN
+    // identifier at all, and 0 is the same "not addressed on CAN" the routing layer uses.
+    let u32RequestCanId = key.RequestCanId().unwrap_or(0);
 
     let protocol = match &state.protocol {
         Some(protocol) => protocol,
@@ -451,8 +466,18 @@ pub async fn PostSimulationRequest(
             ));
         }
 
-        let bIsFunctional = simulation.IsFunctionalCanId(u32RequestCanId);
-        let outcome = simulation.ProcessByCanId(u32RequestCanId, &vecRequest, protocol);
+        // The two transports differ only in how the target is found; everything past that is
+        // the same ECU and the same code.
+        let (bIsFunctional, outcome) = match key {
+            EcuKey::Can(u32CanId) => (
+                simulation.IsFunctionalCanId(u32CanId),
+                simulation.ProcessByCanId(u32CanId, &vecRequest, protocol),
+            ),
+            EcuKey::DoIp(u16LogicalAddress) => (
+                false,
+                simulation.ProcessByLogicalAddress(u16LogicalAddress, &vecRequest, protocol),
+            ),
+        };
         (bIsFunctional, outcome)
         // The guard is dropped here, before anything sleeps. The compiler enforces it: a
         // std::sync::MutexGuard is !Send and could not be held across the awaits below.
@@ -551,7 +576,7 @@ pub async fn PostSimulationRequest(
     );
 
     Ok(Json(SimulationRequestResultDto {
-        can_id_hex: FormatCanId(u32RequestCanId),
+        can_id_hex: FormatEcuHandle(key),
         request_hex: FormatHex(&vecRequest),
         addressing: strAddressing,
         routed: true,
@@ -691,11 +716,11 @@ pub async fn DeleteEcu(
     State(state): State<Arc<AppState>>,
     Path(strRequestCanIdHex): Path<String>,
 ) -> Result<Json<SimulationStateDto>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .RemoveEcu(u32RequestCanId)
+        .RemoveEcu(key)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
@@ -707,7 +732,7 @@ pub async fn PutEcuName(
     Path(strRequestCanIdHex): Path<String>,
     Json(body): Json<RenameEcuBody>,
 ) -> Result<Json<SimulationStateDto>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let strName = body.name.trim();
     if strName.is_empty() {
@@ -716,7 +741,7 @@ pub async fn PutEcuName(
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .RenameEcu(u32RequestCanId, strName)
+        .RenameEcu(key, strName)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
@@ -755,6 +780,9 @@ pub struct TopologyLinkDto {
 pub struct TopologyNodeDto {
     pub id: String,
     pub label: String,
+    /// How this ECU is named in a URL, so the diagram's controls work for a DoIP-only ECU too.
+    /// `None` for the tester node, which is drawn rather than driven.
+    pub handle: Option<String>,
     /// "ecu" or "tester".
     pub kind: String,
     pub link_id: Option<String>,
@@ -933,6 +961,7 @@ fn BuildTopologyNodes(
     let mut vecNodes = vec![TopologyNodeDto {
         id: "tester".to_string(),
         label: "Tester".to_string(),
+        handle: None,
         kind: "tester".to_string(),
         // The tester attaches at the diagnostic connector, which is not any one declared bus.
         link_id: (!bHasStatedNetworks).then(|| c_strDiagnosticLinkId.to_string()),
@@ -997,6 +1026,11 @@ fn BuildEcuNode(
     TopologyNodeDto {
         id: TopologyNodeId(ecu),
         label: ecu.m_strName.clone(),
+        // Whatever the simulation stores this ECU under is what its URL says.
+        handle: Some(FormatEcuHandle(match ecu.m_optCanAddress {
+            Some(address) => EcuKey::Can(address.m_u32RequestCanId),
+            None => EcuKey::DoIp(ecu.m_u16LogicalAddress),
+        })),
         kind: "ecu".to_string(),
         link_id: optLinkId,
         request_can_id_hex: ecu
@@ -1160,11 +1194,11 @@ pub async fn GetEcuOverrides(
     State(state): State<Arc<AppState>>,
     Path(strRequestCanIdHex): Path<String>,
 ) -> Result<Json<Vec<ResponseOverrideDto>>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let simulation = state.simulation.lock().expect("simulation mutex poisoned");
     let vecOverrides = simulation
-        .EcuOverridesOf(u32RequestCanId)
+        .EcuOverridesOf(key)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(vecOverrides.iter().map(BuildOverrideDto).collect()))
@@ -1179,7 +1213,7 @@ pub async fn PutEcuOverrides(
     Path(strRequestCanIdHex): Path<String>,
     Json(body): Json<SetOverridesBody>,
 ) -> Result<Json<Vec<ResponseOverrideDto>>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let mut vecOverrides = Vec::with_capacity(body.overrides.len());
     for (uIndex, dto) in body.overrides.iter().enumerate() {
@@ -1193,11 +1227,11 @@ pub async fn PutEcuOverrides(
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .SetEcuOverrides(u32RequestCanId, vecOverrides)
+        .SetEcuOverrides(key, vecOverrides)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     let vecStored = simulation
-        .EcuOverridesOf(u32RequestCanId)
+        .EcuOverridesOf(key)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
     Ok(Json(vecStored.iter().map(BuildOverrideDto).collect()))
 }
@@ -1345,11 +1379,11 @@ pub async fn GetEcuTiming(
     State(state): State<Arc<AppState>>,
     Path(strRequestCanIdHex): Path<String>,
 ) -> Result<Json<EcuTimingDto>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let simulation = state.simulation.lock().expect("simulation mutex poisoned");
     let timing = simulation
-        .EcuTimingOf(u32RequestCanId)
+        .EcuTimingOf(key)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(BuildTimingDto(&timing)))
@@ -1364,7 +1398,7 @@ pub async fn PutEcuTiming(
     Path(strRequestCanIdHex): Path<String>,
     Json(body): Json<EcuTimingDto>,
 ) -> Result<Json<EcuTimingUpdateDto>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
     let timing = BuildTiming(&body);
 
     timing
@@ -1373,7 +1407,7 @@ pub async fn PutEcuTiming(
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .SetEcuTiming(u32RequestCanId, timing)
+        .SetEcuTiming(key, timing)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(EcuTimingUpdateDto {
@@ -1434,7 +1468,7 @@ fn BuildTiming(dto: &EcuTimingDto) -> EcuTiming {
 fn BuildStateDto(simulation: &SimulationService, bProtocolLoaded: bool) -> SimulationStateDto {
     let vecEcus: Vec<SimulationEcuDto> = simulation
         .RunningEcus()
-        .map(|(_, runningEcu)| BuildEcuDto(runningEcu))
+        .map(|(key, runningEcu)| BuildEcuDto(key, runningEcu))
         .collect();
 
     SimulationStateDto {
@@ -1448,25 +1482,33 @@ fn BuildStateDto(simulation: &SimulationService, bProtocolLoaded: bool) -> Simul
     }
 }
 
-/// Describe one running ECU, including how confidently its CAN addressing is known.
-fn BuildEcuDto(runningEcu: &VirtualEcu) -> SimulationEcuDto {
+/// Describe one running ECU, including how confidently its addressing is known.
+fn BuildEcuDto(key: EcuKey, runningEcu: &VirtualEcu) -> SimulationEcuDto {
     let config = runningEcu.Config();
 
-    // Every running ECU has a CAN address — the simulation service refuses to start one
-    // without it — so this is a genuine invariant rather than a hopeful unwrap.
-    let address: CanAddress = config
-        .m_optCanAddress
-        .expect("a running ECU always has a CAN address; the simulation service enforces it");
+    // A DoIP-addressed ECU carries no CAN identifiers at all, so these are absent rather than
+    // unreadable — which is exactly what makes them `Option` on the wire.
+    let optAddress: Option<CanAddress> = config.m_optCanAddress;
 
     SimulationEcuDto {
         name: config.m_strName.clone(),
         logical_address: config.m_u16LogicalAddress,
-        request_can_id_hex: FormatCanId(address.m_u32RequestCanId),
-        response_can_id_hex: FormatCanId(address.m_u32ResponseCanId),
-        functional_can_id_hex: address.m_optU32FunctionalCanId.map(FormatCanId),
+        handle: FormatEcuHandle(key),
+        request_can_id_hex: optAddress.map(|address| FormatCanId(address.m_u32RequestCanId)),
+        response_can_id_hex: optAddress.map(|address| FormatCanId(address.m_u32ResponseCanId)),
+        logical_address_hex: config
+            .m_bHasDoIpAddress
+            .then(|| format!("{:04X}", config.m_u16LogicalAddress)),
+        functional_can_id_hex: optAddress
+            .and_then(|address| address.m_optU32FunctionalCanId)
+            .map(FormatCanId),
         timing: BuildTimingDto(&config.m_timing),
-        addressing_mode: AddressingModeName(address.m_addressingMode),
-        address_confidence: ConfidenceName(address.m_confidence),
+        addressing_mode: optAddress
+            .map(|address| AddressingModeName(address.m_addressingMode))
+            .unwrap_or_else(|| "DoIP".to_string()),
+        address_confidence: optAddress
+            .map(|address| ConfidenceName(address.m_confidence))
+            .unwrap_or_else(|| ConfidenceName(Confidence::Confirmed)),
         session: runningEcu.CurrentSession(),
         session_name: SessionName(runningEcu.CurrentSession()),
         security_unlocked: runningEcu.IsSecurityUnlocked(),
@@ -1848,7 +1890,7 @@ pub async fn PutEcuPlacement(
     Path(strRequestCanIdHex): Path<String>,
     Json(body): Json<EcuPlacementBody>,
 ) -> Result<Json<TopologyDto>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let optStrNetworkId = body
         .network_id
@@ -1858,11 +1900,7 @@ pub async fn PutEcuPlacement(
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .SetEcuPlacement(
-            u32RequestCanId,
-            optStrNetworkId,
-            body.gateway_for_network_ids.clone(),
-        )
+        .SetEcuPlacement(key, optStrNetworkId, body.gateway_for_network_ids.clone())
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
 
     Ok(Json(BuildTopologyDto(&simulation)))
@@ -1926,11 +1964,11 @@ pub async fn PutEcuEnabled(
     Path(strRequestCanIdHex): Path<String>,
     Json(body): Json<EcuEnabledBody>,
 ) -> Result<Json<SimulationStateDto>, ApiError> {
-    let u32RequestCanId = ParseCanId(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
 
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
-        .SetEcuEnabled(u32RequestCanId, body.enabled)
+        .SetEcuEnabled(key, body.enabled)
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
 
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
@@ -1970,4 +2008,38 @@ fn PublishExchange(
         responses: vecEventResponses,
         reason: optStrReason,
     });
+}
+
+/// Read the handle that names one ECU in a URL.
+///
+/// Two spellings, because an ECU may be reachable two ways. A bare hex number is a CAN request
+/// identifier — every existing URL keeps working unchanged. `doip-1234` names a DoIP logical
+/// address, which is the only handle an ECU reconstructed from an Ethernet capture has.
+///
+/// Kept in one place rather than repeated per route: eight handlers parse a handle, and eight
+/// slightly different parsers is how one of them ends up accepting something the others do not.
+pub fn ParseEcuHandle(strHandle: &str) -> Result<EcuKey, String> {
+    let strTrimmed = strHandle.trim();
+
+    if let Some(strAddress) = strTrimmed
+        .strip_prefix("doip-")
+        .or_else(|| strTrimmed.strip_prefix("DOIP-"))
+    {
+        let u16LogicalAddress = u16::from_str_radix(strAddress, 16)
+            .map_err(|_| format!("'{strAddress}' is not a hex DoIP logical address"))?;
+        return Ok(EcuKey::DoIp(u16LogicalAddress));
+    }
+
+    ParseCanId(strTrimmed).map(EcuKey::Can)
+}
+
+/// How an ECU is named in a URL and in the UI.
+///
+/// The inverse of `ParseEcuHandle`, and the reason a CAN-addressed ECU's handle is simply its
+/// identifier: every URL that worked before this existed still resolves.
+pub fn FormatEcuHandle(key: EcuKey) -> String {
+    match key {
+        EcuKey::Can(u32RequestCanId) => FormatCanId(u32RequestCanId),
+        EcuKey::DoIp(u16LogicalAddress) => format!("doip-{u16LogicalAddress:04X}"),
+    }
 }
