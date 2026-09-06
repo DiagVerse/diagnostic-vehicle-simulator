@@ -368,6 +368,8 @@ export const api = {
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
   simulationLoadSimFile: (logText: string) =>
     postJson<SimulationState>('/simulation/simfile', { logText }),
+  simulationLoadCapture: (captureBase64: string) =>
+    postJson<SimulationState>('/simulation/pcap', { captureBase64 }),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationStart: () => postJson<SimulationState>('/simulation/start', {}),
   simulationStop: () => postJson<SimulationState>('/simulation/stop', {}),

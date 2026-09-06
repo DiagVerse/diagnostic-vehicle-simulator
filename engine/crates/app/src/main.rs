@@ -7,7 +7,7 @@
 //! Usage:
 //!   dvsim serve       [--addr 127.0.0.1:8080] [--plugins <dir>]
 //!   dvsim demo        [--plugins <dir>]
-//!   dvsim reconstruct <canlog-file>
+//!   dvsim reconstruct <canlog-or-pcap>
 //!
 //! With no arguments it defaults to `serve` on 127.0.0.1:8080 reading `plugins.d/`.
 
@@ -135,7 +135,7 @@ fn print_help() {
          USAGE:\n\
          \x20   dvsim serve       [--addr <ip:port>] [--plugins <dir>]\n\
          \x20   dvsim demo        [--plugins <dir>]\n\
-         \x20   dvsim reconstruct <canlog-file>\n\n\
+         \x20   dvsim reconstruct <canlog-or-pcap>\n\n\
          OPTIONS:\n\
          \x20   --addr <ip:port>   Address to listen on (default 127.0.0.1:8080)\n\
          \x20   --plugins <dir>    Plugin drop-in directory (default plugins.d)\n\

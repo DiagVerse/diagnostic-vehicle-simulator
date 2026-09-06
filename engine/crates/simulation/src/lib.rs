@@ -401,6 +401,14 @@ impl SimulationService {
         self.LoadVehicle(vehicle)
     }
 
+    /// Load a vehicle reconstructed from a pcap or pcapng capture of DoIP traffic.
+    ///
+    /// The fourth source, and the only one that arrives as binary rather than text.
+    pub fn LoadFromCapture(&mut self, arrBytes: &[u8]) -> Result<&Vehicle, SimulationError> {
+        let vehicle = reconstruct::doip::ReconstructFromCapture(arrBytes)?;
+        self.LoadVehicle(vehicle)
+    }
+
     /// Start an empty vehicle to build up by hand.
     ///
     /// Unlike a reconstruction, an empty vehicle is a legitimate starting point: the user is

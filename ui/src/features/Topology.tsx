@@ -67,7 +67,7 @@ export function Topology() {
       <div className="space-y-4">
         {error && <ErrorBanner message={error} />}
         <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-10 text-center text-sm text-slate-500">
-          Nothing to draw yet. Load a CAN log, load a simulation file, or build a vehicle in the
+          Nothing to draw yet. Load a CAN log or a DoIP capture, load a simulation file, or build a vehicle in the
           Simulate tab.
         </p>
       </div>

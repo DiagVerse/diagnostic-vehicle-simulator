@@ -5,6 +5,8 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+pub mod behaviour;
+pub mod doip;
 pub mod parser;
 pub mod pipeline;
 
@@ -16,6 +18,19 @@ pub use pipeline::ReconstructFromFrames;
 /// Errors from the end-to-end reconstruction.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconstructError {
+    /// The capture file could not be read.
+    #[error("failed to read the capture: {0}")]
+    Capture(#[from] pcap::PcapError),
+
+    /// The capture parsed, but held no DoIP traffic to reconstruct from.
+    #[error(
+        "no DoIP traffic in this capture ({uPacketsSeen} packet(s) seen, {uEncryptedPackets} of them encrypted on port 3496)"
+    )]
+    NoDoIpTraffic {
+        uPacketsSeen: usize,
+        uEncryptedPackets: usize,
+    },
+
     /// The log could not be parsed.
     #[error(transparent)]
     Parse(#[from] ParseError),

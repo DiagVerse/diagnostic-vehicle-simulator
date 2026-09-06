@@ -75,6 +75,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/simfile",
             post(simulation::PostSimulationSimFile),
         )
+        .route("/simulation/pcap", post(simulation::PostSimulationCapture))
         .route("/simulation/state", get(simulation::GetSimulationState))
         .route(
             "/simulation/request",

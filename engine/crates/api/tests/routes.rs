@@ -233,3 +233,29 @@ async fn an_ecu_can_be_named_by_a_doip_handle_as_well_as_a_can_identifier() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn the_capture_route_is_reachable_and_rejects_what_is_not_base64() {
+    // A malformed body must reach the handler and be rejected there. A 404 would be ambiguous
+    // with a route that was never wired up, which is the trap this whole file exists for.
+    assert_eq!(
+        StatusOf(
+            "POST",
+            "/simulation/pcap",
+            r#"{"captureBase64":"not base64 !!!"}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Valid base64 that is not a capture is also a bad request, with a different reason.
+    assert_eq!(
+        StatusOf(
+            "POST",
+            "/simulation/pcap",
+            r#"{"captureBase64":"aGVsbG8="}"#
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+}
