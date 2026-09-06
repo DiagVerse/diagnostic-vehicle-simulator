@@ -10,7 +10,7 @@
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
-use simulation::{RoutingOutcome, SimulationService};
+use simulation::{EcuKey, RoutingOutcome, SimulationService};
 
 /// A gateway on both transports, an engine on CAN only, an airbag on DoIP only.
 const c_strMixedSimFile: &str = r#"{
@@ -114,7 +114,7 @@ fn switching_an_ecu_off_silences_it_on_both_transports() {
     // is not there whichever way you try to reach it.
     let mut simulation = LoadMixed();
     simulation
-        .SetEcuEnabled(0x7E7, false)
+        .SetEcuEnabled(EcuKey::Can(0x7E7), false)
         .expect("the gateway is addressable by its CAN id");
 
     assert!(matches!(
@@ -133,7 +133,9 @@ fn switching_an_ecu_off_silences_it_on_both_transports() {
 #[test]
 fn a_disabled_gateway_silences_an_ecu_behind_it_over_doip_as_well() {
     let mut simulation = LoadMixed();
-    simulation.SetEcuEnabled(0x7E7, false).expect("loaded");
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E7), false)
+        .expect("loaded");
 
     // The engine is CAN-only, so this is the CAN path — but the point is that the architecture
     // rule is enforced in one place and both transports inherit it.

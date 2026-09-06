@@ -15,7 +15,7 @@ use core_domain::model::{
 };
 use core_domain::Confidence;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
-use simulation::{RoutedResponse, RoutingOutcome, SimulationService};
+use simulation::{EcuKey, RoutedResponse, RoutingOutcome, SimulationService};
 
 struct UdsHandler;
 
@@ -267,7 +267,7 @@ fn an_override_replaces_the_final_response_and_never_the_pending_messages() {
     )]);
     simulation
         .SetEcuTiming(
-            0x7E0,
+            EcuKey::Can(0x7E0),
             EcuTiming {
                 m_u32ResponseDelayMs: 200,
                 ..EcuTiming::default()
@@ -297,7 +297,7 @@ fn suppressing_after_a_pending_is_flagged_as_leaving_the_tester_waiting() {
     )]);
     simulation
         .SetEcuTiming(
-            0x7E0,
+            EcuKey::Can(0x7E0),
             EcuTiming {
                 m_u32ResponseDelayMs: 200,
                 ..EcuTiming::default()

@@ -10,7 +10,7 @@
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
-use simulation::{RoutingOutcome, SimulationService};
+use simulation::{EcuKey, RoutingOutcome, SimulationService};
 
 const c_strSingleEcuLog: &str = include_str!("fixtures/single_ecu.log");
 const c_strTwoEcuLog: &str = include_str!("fixtures/two_ecus.log");
@@ -416,7 +416,7 @@ fn LoadGatewayedSimulation() -> SimulationService {
 fn a_switched_off_ecu_is_silent_rather_than_negative() {
     let mut simulation = LoadGatewayedSimulation();
     simulation
-        .SetEcuEnabled(0x7E0, false)
+        .SetEcuEnabled(EcuKey::Can(0x7E0), false)
         .expect("the engine ECU is loaded");
 
     let outcome = simulation.ProcessByCanId(0x7E0, &[0x22, 0xF1, 0x90], &UdsHandler);
@@ -436,8 +436,12 @@ fn switching_an_ecu_back_on_resumes_rather_than_restarts() {
     let mut simulation = LoadGatewayedSimulation();
     SendExpectingHandled(&mut simulation, 0x7E0, &[0x10, 0x03]);
 
-    simulation.SetEcuEnabled(0x7E0, false).expect("loaded");
-    simulation.SetEcuEnabled(0x7E0, true).expect("loaded");
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E0), false)
+        .expect("loaded");
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E0), true)
+        .expect("loaded");
 
     let vecResponses = SendExpectingHandled(&mut simulation, 0x7E0, &[0x22, 0xF1, 0x90]);
     assert_eq!(
@@ -450,7 +454,7 @@ fn switching_an_ecu_back_on_resumes_rather_than_restarts() {
 fn a_switched_off_gateway_takes_everything_behind_it_off_the_air() {
     let mut simulation = LoadGatewayedSimulation();
     simulation
-        .SetEcuEnabled(0x7E7, false)
+        .SetEcuEnabled(EcuKey::Can(0x7E7), false)
         .expect("the gateway is loaded");
 
     let outcome = simulation.ProcessByCanId(0x7E0, &[0x22, 0xF1, 0x90], &UdsHandler);
@@ -475,7 +479,9 @@ fn an_ecu_on_the_entry_point_still_answers_when_a_gateway_is_off() {
     // Only what is *behind* the gateway goes quiet. The gateway being off must not silence
     // the bus the tester is plugged into.
     let mut simulation = LoadGatewayedSimulation();
-    simulation.SetEcuEnabled(0x7E7, false).expect("loaded");
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E7), false)
+        .expect("loaded");
 
     let outcome = simulation.ProcessByCanId(0x7E7, &[0x22, 0xF1, 0x90], &UdsHandler);
     assert!(
@@ -485,14 +491,18 @@ fn an_ecu_on_the_entry_point_still_answers_when_a_gateway_is_off() {
 
     // And an ECU on the entry-point bus that is still on keeps answering. Re-enable the
     // gateway and the ECU behind it comes back too.
-    simulation.SetEcuEnabled(0x7E7, true).expect("loaded");
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E7), true)
+        .expect("loaded");
     SendExpectingHandled(&mut simulation, 0x7E0, &[0x22, 0xF1, 0x90]);
 }
 
 #[test]
 fn a_broadcast_skips_ecus_that_are_off_without_skipping_the_rest() {
     let mut simulation = LoadGatewayedSimulation();
-    simulation.SetEcuEnabled(0x7E0, false).expect("loaded");
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E0), false)
+        .expect("loaded");
 
     let vecResponses = SendExpectingHandled(&mut simulation, 0x7DF, &[0x3E, 0x00]);
 
@@ -504,7 +514,7 @@ fn a_broadcast_skips_ecus_that_are_off_without_skipping_the_rest() {
 fn switching_an_absent_ecu_is_an_error_rather_than_a_silent_no_op() {
     let mut simulation = LoadGatewayedSimulation();
     assert!(
-        simulation.SetEcuEnabled(0x123, false).is_err(),
+        simulation.SetEcuEnabled(EcuKey::Can(0x123), false).is_err(),
         "an operator toggling an ECU that is not there must be told"
     );
 }

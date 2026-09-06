@@ -11,7 +11,7 @@ use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
 use core_domain::model::EcuTiming;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
-use simulation::{RoutedResponse, RoutingOutcome, SimulationService};
+use simulation::{EcuKey, RoutedResponse, RoutingOutcome, SimulationService};
 
 /// Three ECUs: 0x7E0/0x7E8 (services 0x10, 0x22, 0x3E; DID 0xF190), the OEM pair 0x745/0x765
 /// (services 0x10, 0x3E), and the 29-bit 0x18DAD4F1/0x18DAF1D4 (services 0x10, 0x22; DID
@@ -81,7 +81,7 @@ fn a_delay_beyond_p2_produces_a_response_pending_before_the_answer() {
     let mut simulation = LoadSimulation();
     simulation
         .SetEcuTiming(
-            0x7E0,
+            EcuKey::Can(0x7E0),
             EcuTiming {
                 m_u32ResponseDelayMs: 200,
                 ..EcuTiming::default()
@@ -113,7 +113,7 @@ fn a_response_pending_overrides_a_suppressed_positive_response() {
     // Once a ResponsePending is in play the server must send a final response regardless of
     // that bit (ISO 14229-1 Annex A.1, and the third condition of the clause 7.5.5 pseudocode).
     simulation
-        .SetEcuTiming(0x7E0, ForcedPendingTiming(200, 1))
+        .SetEcuTiming(EcuKey::Can(0x7E0), ForcedPendingTiming(200, 1))
         .expect("ECU on 0x7E0");
 
     let answered = SendExpectingOneAnswer(&mut simulation, 0x7E0, &[0x3E, 0x80]);
@@ -131,7 +131,7 @@ fn a_response_pending_overrides_a_suppressed_positive_response() {
 fn a_suppressed_session_change_still_changes_session_and_answers_after_a_pending() {
     let mut simulation = LoadSimulation();
     simulation
-        .SetEcuTiming(0x7E0, ForcedPendingTiming(300, 2))
+        .SetEcuTiming(EcuKey::Can(0x7E0), ForcedPendingTiming(300, 2))
         .expect("ECU on 0x7E0");
 
     let response = SendExpectingOneAnswer(&mut simulation, 0x7E0, &[0x10, 0x83]);
@@ -166,7 +166,7 @@ fn the_session_response_advertises_the_ecus_own_p2_and_p2_star() {
 
     simulation
         .SetEcuTiming(
-            0x7E0,
+            EcuKey::Can(0x7E0),
             EcuTiming {
                 m_u32P2ServerMaxMs: 100,
                 m_u32P2StarServerMaxMs: 10_000,
@@ -192,7 +192,7 @@ fn the_session_response_advertises_the_ecus_own_p2_and_p2_star() {
 fn an_unsupported_service_never_draws_a_response_pending() {
     let mut simulation = LoadSimulation();
     simulation
-        .SetEcuTiming(0x7E0, ForcedPendingTiming(200, 1))
+        .SetEcuTiming(EcuKey::Can(0x7E0), ForcedPendingTiming(200, 1))
         .expect("ECU on 0x7E0");
 
     // 0x28 CommunicationControl was never observed, so the ECU does not support it.
@@ -215,7 +215,7 @@ fn a_pending_on_a_broadcast_un_suppresses_the_final_negative_response() {
     assert_eq!(outcome, RoutingOutcome::Handled(Vec::new()));
 
     simulation
-        .SetEcuTiming(0x18DAD4F1, ForcedPendingTiming(200, 1))
+        .SetEcuTiming(EcuKey::Can(0x18DAD4F1), ForcedPendingTiming(200, 1))
         .expect("ECU on 0x18DAD4F1");
 
     // Having announced itself with a ResponsePending, the server must now send the final
@@ -234,7 +234,7 @@ fn a_dropped_final_response_leaves_the_tester_waiting_after_the_pending() {
     let mut simulation = LoadSimulation();
     simulation
         .SetEcuTiming(
-            0x7E0,
+            EcuKey::Can(0x7E0),
             EcuTiming {
                 m_bDropFinalResponse: true,
                 ..ForcedPendingTiming(200, 1)
@@ -256,7 +256,7 @@ fn a_dropped_final_response_leaves_the_tester_waiting_after_the_pending() {
 fn timing_survives_a_reset_but_diagnostic_state_does_not() {
     let mut simulation = LoadSimulation();
     simulation
-        .SetEcuTiming(0x7E0, ForcedPendingTiming(200, 1))
+        .SetEcuTiming(EcuKey::Can(0x7E0), ForcedPendingTiming(200, 1))
         .expect("ECU on 0x7E0");
     SendExpectingOneAnswer(&mut simulation, 0x7E0, &[0x10, 0x03]);
 
@@ -270,7 +270,9 @@ fn timing_survives_a_reset_but_diagnostic_state_does_not() {
             .CurrentSession(),
         0x01
     );
-    let timing = simulation.EcuTimingOf(0x7E0).expect("ECU on 0x7E0");
+    let timing = simulation
+        .EcuTimingOf(EcuKey::Can(0x7E0))
+        .expect("ECU on 0x7E0");
     assert_eq!(timing.m_u32ResponseDelayMs, 200);
     assert!(timing.m_bForceResponsePending);
 }
@@ -278,6 +280,6 @@ fn timing_survives_a_reset_but_diagnostic_state_does_not() {
 #[test]
 fn setting_timing_on_an_unknown_identifier_is_refused() {
     let mut simulation = LoadSimulation();
-    let resError = simulation.SetEcuTiming(0x7E5, EcuTiming::default());
+    let resError = simulation.SetEcuTiming(EcuKey::Can(0x7E5), EcuTiming::default());
     assert!(resError.is_err());
 }

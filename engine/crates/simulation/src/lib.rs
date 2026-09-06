@@ -165,11 +165,11 @@ pub enum SimulationError {
         strEcuName: String,
     },
 
-    /// No running ECU is addressed by the given identifier.
-    #[error("no ECU is addressed on CAN id 0x{u32RequestCanId:03X}")]
+    /// No running ECU is addressed by the given handle.
+    #[error("no ECU is addressed by {strHandle}")]
     EcuNotFound {
-        /// The identifier that matched nothing.
-        u32RequestCanId: u32,
+        /// The handle that matched nothing, described the way it was asked for.
+        strHandle: String,
     },
 
     /// One identifier is both a broadcast address and an ECU's own request address, which
@@ -370,14 +370,10 @@ impl SimulationService {
     }
 
     /// Every running ECU, in request-identifier order, as (requestCanId, ECU) pairs.
-    pub fn RunningEcus(&self) -> impl Iterator<Item = (u32, &VirtualEcu)> {
-        self.m_mapEcus.iter().filter_map(|(key, runningEcu)| {
-            // Keyed by CAN identifier, because that is the handle the HTTP API addresses an
-            // ECU by. A DoIP-only ECU has no such handle; the topology reads it from the
-            // vehicle model instead, which is where it is fully described anyway.
-            key.RequestCanId()
-                .map(|u32RequestCanId| (u32RequestCanId, runningEcu))
-        })
+    pub fn RunningEcus(&self) -> impl Iterator<Item = (EcuKey, &VirtualEcu)> {
+        self.m_mapEcus
+            .iter()
+            .map(|(key, runningEcu)| (*key, runningEcu))
     }
 
     /// True when the identifier is a functional (broadcast) address some running ECU listens
@@ -389,6 +385,11 @@ impl SimulationService {
     /// Look up one running ECU by the identifier it is addressed on.
     pub fn FindEcuByRequestCanId(&self, u32RequestCanId: u32) -> Option<&VirtualEcu> {
         self.m_mapEcus.get(&EcuKey::Can(u32RequestCanId))
+    }
+
+    /// Look up one running ECU by whichever handle names it.
+    pub fn FindEcu(&self, key: EcuKey) -> Option<&VirtualEcu> {
+        self.m_mapEcus.get(&key)
     }
 
     /// Load a vehicle described in a simulation file.
@@ -458,18 +459,18 @@ impl SimulationService {
     }
 
     /// Remove one ECU and stop it.
-    pub fn RemoveEcu(&mut self, u32RequestCanId: u32) -> Result<(), SimulationError> {
+    pub fn RemoveEcu(&mut self, key: EcuKey) -> Result<(), SimulationError> {
         let removed = self
             .m_mapEcus
-            .remove(&EcuKey::Can(u32RequestCanId))
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+            .remove(&key)
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })?;
 
         tracing::info!(ecu = %removed.Config().m_strName, "ECU removed");
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
-            vehicle
-                .m_vecEcus
-                .retain(|config| !IsAddressedOn(config, u32RequestCanId));
+            vehicle.m_vecEcus.retain(|config| !MatchesKey(config, key));
         }
 
         self.RebuildFunctionalTargets()
@@ -480,20 +481,18 @@ impl SimulationService {
     /// A reconstructed ECU is named after the identifier it answers on (`ECU_7E8`), which is
     /// accurate but tells a reader nothing. Naming it "Engine" is the single most useful thing
     /// a user can add to a reconstructed model.
-    pub fn RenameEcu(
-        &mut self,
-        u32RequestCanId: u32,
-        strName: &str,
-    ) -> Result<(), SimulationError> {
-        let runningEcu = self
-            .m_mapEcus
-            .get_mut(&EcuKey::Can(u32RequestCanId))
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+    pub fn RenameEcu(&mut self, key: EcuKey, strName: &str) -> Result<(), SimulationError> {
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
         runningEcu.SetName(strName);
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             for config in &mut vehicle.m_vecEcus {
-                if IsAddressedOn(config, u32RequestCanId) {
+                if MatchesKey(config, key) {
                     config.m_strName = strName.to_string();
                 }
             }
@@ -508,18 +507,20 @@ impl SimulationService {
     /// gets serialized cannot drift. The caller validates each override first.
     pub fn SetEcuOverrides(
         &mut self,
-        u32RequestCanId: u32,
+        key: EcuKey,
         vecOverrides: Vec<ResponseOverride>,
     ) -> Result<(), SimulationError> {
-        let runningEcu = self
-            .m_mapEcus
-            .get_mut(&EcuKey::Can(u32RequestCanId))
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
         runningEcu.SetResponseOverrides(vecOverrides.clone());
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             for config in &mut vehicle.m_vecEcus {
-                if IsAddressedOn(config, u32RequestCanId) {
+                if MatchesKey(config, key) {
                     config.m_vecResponseOverrides = vecOverrides;
                     break;
                 }
@@ -530,14 +531,13 @@ impl SimulationService {
     }
 
     /// One ECU's response overrides.
-    pub fn EcuOverridesOf(
-        &self,
-        u32RequestCanId: u32,
-    ) -> Result<&[ResponseOverride], SimulationError> {
+    pub fn EcuOverridesOf(&self, key: EcuKey) -> Result<&[ResponseOverride], SimulationError> {
         self.m_mapEcus
-            .get(&EcuKey::Can(u32RequestCanId))
+            .get(&key)
             .map(|runningEcu| runningEcu.Config().m_vecResponseOverrides.as_slice())
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })
     }
 
     /// Recompute which ECUs listen on each broadcast identifier, after the set of running ECUs
@@ -559,27 +559,27 @@ impl SimulationService {
     /// The change applies to the **next** request: an answer already scheduled keeps the
     /// values it was built with, and the tester only learns new P2/P2* values at the next
     /// DiagnosticSessionControl response, which is the sole place ISO 14229-1 carries them.
-    pub fn SetEcuTiming(
-        &mut self,
-        u32RequestCanId: u32,
-        timing: EcuTiming,
-    ) -> Result<(), SimulationError> {
-        let runningEcu = self
-            .m_mapEcus
-            .get_mut(&EcuKey::Can(u32RequestCanId))
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+    pub fn SetEcuTiming(&mut self, key: EcuKey, timing: EcuTiming) -> Result<(), SimulationError> {
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
         runningEcu.SetTiming(timing);
 
-        UpdateVehicleTiming(self.m_optVehicle.as_mut(), u32RequestCanId, timing);
+        UpdateVehicleTiming(self.m_optVehicle.as_mut(), key, timing);
         Ok(())
     }
 
     /// One ECU's current timing parameters.
-    pub fn EcuTimingOf(&self, u32RequestCanId: u32) -> Result<EcuTiming, SimulationError> {
+    pub fn EcuTimingOf(&self, key: EcuKey) -> Result<EcuTiming, SimulationError> {
         self.m_mapEcus
-            .get(&EcuKey::Can(u32RequestCanId))
+            .get(&key)
             .map(|runningEcu| runningEcu.Timing())
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })
     }
 
     /// Restart every running ECU: back to the default session with security locked. The
@@ -662,7 +662,7 @@ impl SimulationService {
     /// together by hand and one read from a file are placed in the architecture identically.
     pub fn SetEcuPlacement(
         &mut self,
-        u32RequestCanId: u32,
+        key: EcuKey,
         optStrNetworkId: Option<String>,
         vecGatewayForNetworkIds: Vec<String>,
     ) -> Result<(), SimulationError> {
@@ -671,8 +671,10 @@ impl SimulationService {
         let config = vehicle
             .m_vecEcus
             .iter_mut()
-            .find(|config| IsAddressedOn(config, u32RequestCanId))
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+            .find(|config| MatchesKey(config, key))
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })?;
 
         config.m_optStrNetworkId = optStrNetworkId.clone();
         config.m_vecGatewayForNetworkIds = vecGatewayForNetworkIds.clone();
@@ -682,7 +684,7 @@ impl SimulationService {
 
         // The running ECU carries its own copy of the configuration; leaving it stale would
         // make the diagram and the simulation disagree about the same ECU.
-        if let Some(runningEcu) = self.m_mapEcus.get_mut(&EcuKey::Can(u32RequestCanId)) {
+        if let Some(runningEcu) = self.m_mapEcus.get_mut(&key) {
             runningEcu.SetPlacement(optStrNetworkId.clone(), vecGatewayForNetworkIds.clone());
         }
 
@@ -699,20 +701,18 @@ impl SimulationService {
     ///
     /// Written to both the running ECU and the loaded model, so what is simulated and what
     /// gets serialized cannot drift — the same rule every other per-ECU setting follows.
-    pub fn SetEcuEnabled(
-        &mut self,
-        u32RequestCanId: u32,
-        bIsEnabled: bool,
-    ) -> Result<(), SimulationError> {
-        let runningEcu = self
-            .m_mapEcus
-            .get_mut(&EcuKey::Can(u32RequestCanId))
-            .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
+    pub fn SetEcuEnabled(&mut self, key: EcuKey, bIsEnabled: bool) -> Result<(), SimulationError> {
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
         runningEcu.SetEnabled(bIsEnabled);
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             for config in &mut vehicle.m_vecEcus {
-                if IsAddressedOn(config, u32RequestCanId) {
+                if MatchesKey(config, key) {
                     config.m_bIsEnabled = bIsEnabled;
                 }
             }
@@ -1217,26 +1217,30 @@ fn BuildFunctionalTargetMap(
 }
 
 /// True when this ECU configuration is addressed on the given request identifier.
-fn IsAddressedOn(config: &Ecu, u32RequestCanId: u32) -> bool {
-    matches!(
-        config.m_optCanAddress,
-        Some(address) if address.m_u32RequestCanId == u32RequestCanId
-    )
+fn MatchesKey(config: &Ecu, key: EcuKey) -> bool {
+    match key {
+        EcuKey::Can(u32RequestCanId) => matches!(
+            config.m_optCanAddress,
+            Some(address) if address.m_u32RequestCanId == u32RequestCanId
+        ),
+        // Only an ECU that actually carries a routable DoIP address answers to one. A CAN-only
+        // ECU's logical address is a placeholder, and matching on it would let a DoIP handle
+        // reach an ECU that has no DoIP presence at all.
+        EcuKey::DoIp(u16LogicalAddress) => {
+            config.m_bHasDoIpAddress && config.m_u16LogicalAddress == u16LogicalAddress
+        }
+    }
 }
 
 /// Mirror a timing change into the loaded model, so the model JSON matches what is running.
-fn UpdateVehicleTiming(optVehicle: Option<&mut Vehicle>, u32RequestCanId: u32, timing: EcuTiming) {
+fn UpdateVehicleTiming(optVehicle: Option<&mut Vehicle>, key: EcuKey, timing: EcuTiming) {
     let vehicle = match optVehicle {
         Some(vehicle) => vehicle,
         None => return,
     };
 
     for config in &mut vehicle.m_vecEcus {
-        let bIsTarget = matches!(
-            config.m_optCanAddress,
-            Some(address) if address.m_u32RequestCanId == u32RequestCanId
-        );
-        if bIsTarget {
+        if MatchesKey(config, key) {
             config.m_timing = timing;
             return;
         }
