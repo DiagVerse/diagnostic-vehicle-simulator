@@ -17,6 +17,7 @@ ecu.workspace = true
 simulation.workspace = true
 serial-can.workspace = true
 bridge.workspace = true
+doip-server.workspace = true
 isotp.workspace = true
 slcan.workspace = true
 core-domain.workspace = true

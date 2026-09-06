@@ -92,6 +92,9 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
         // ECUs share a wire or sit behind a gateway. Inventing a bus here would turn "we do
         // not know" into a claim.
         m_vecNetworks: Vec::new(),
+        // A capture carries no vehicle identity: no VIN unless an ECU was asked for one, and
+        // certainly no EID or GID. Left unprogrammed, which announces honestly.
+        m_identity: Default::default(),
     }
 }
 

@@ -71,6 +71,7 @@ async fn serve(addr: SocketAddr, plugins_dir: PathBuf) -> anyhow::Result<()> {
         busy_ecus: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         hardware: std::sync::Mutex::new(api::hardware::HardwareState::default()),
         traffic: api::traffic::TrafficChannel::New(),
+        doip: Default::default(),
     });
 
     api::serve(addr, state)
