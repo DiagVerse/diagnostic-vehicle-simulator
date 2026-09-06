@@ -17,7 +17,7 @@ use std::{
 use ::simulation::SimulationService;
 use application::{PluginInfo, ProtocolPlugin};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -126,6 +126,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
         )
+        // axum caps a request body at 2 MB unless told otherwise, and it rejects an oversized
+        // one *before* any handler runs. That made the per-endpoint size guards unreachable:
+        // a caller sending a 3 MB CAN log got a bare 413 and, through a dev proxy, an EPIPE
+        // while the body was still being written — which looks like a crash rather than a
+        // limit. This is the backstop; the endpoints' own guards are deliberately smaller, so
+        // the message a user sees is the one that explains itself.
+        .layer(DefaultBodyLimit::max(simulation::c_uMaxRequestBodyBytes))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

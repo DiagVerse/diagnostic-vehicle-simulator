@@ -39,6 +39,24 @@ use crate::AppState;
 /// human; anything larger is a mistake or an attempt to exhaust the engine's memory.
 const c_uMaxLogTextChars: usize = 8 * 1024 * 1024;
 
+/// Largest request body the engine will read at all, in bytes.
+///
+/// axum caps a body at 2 MB unless told otherwise, and refuses an oversized one *before* any
+/// handler runs — which made the limits below unreachable and turned a large upload into a bare
+/// 413, or an EPIPE through a dev proxy while the body was still being written.
+///
+/// Deliberately far above the per-endpoint limits: this is a backstop against something
+/// pathological, not a limit anyone should meet. The endpoints check their own smaller limits
+/// and explain themselves, which is the message a user should get.
+pub const c_uMaxRequestBodyBytes: usize = 64 * 1024 * 1024;
+
+/// Largest capture accepted, as base64 characters.
+///
+/// Base64 costs a third more than the bytes it carries, so this is roughly a 24 MB capture.
+/// Captures are legitimately larger than logs — a few seconds of a busy Ethernet link is
+/// megabytes — so this is deliberately more generous than the text limit above.
+const c_uMaxCaptureBase64Chars: usize = 32 * 1024 * 1024;
+
 /// The single link the topology view can honestly draw today: everything reachable through one
 /// tester connection. A real `Network` type in the model is what would let there be more.
 const c_strDiagnosticLinkId: &str = "diagnostic-link";
@@ -355,10 +373,13 @@ pub async fn PostSimulationCapture(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LoadCaptureBody>,
 ) -> Result<Json<SimulationStateDto>, ApiError> {
-    if body.capture_base64.len() > c_uMaxLogTextChars {
+    if body.capture_base64.len() > c_uMaxCaptureBase64Chars {
+        // Reported in megabytes of capture rather than characters of base64, because that is
+        // the number the person choosing the file can actually compare against.
         return Err(ApiError::BadRequest(format!(
-            "the capture is larger than this endpoint accepts ({} characters of base64)",
-            c_uMaxLogTextChars
+            "this capture is larger than the {} MB this endpoint accepts. Trim it with a capture \
+             filter, or cut it to the exchange you are interested in.",
+            c_uMaxCaptureBase64Chars * 3 / 4 / (1024 * 1024)
         )));
     }
 

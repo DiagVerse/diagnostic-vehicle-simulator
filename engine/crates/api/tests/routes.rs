@@ -259,3 +259,41 @@ async fn the_capture_route_is_reachable_and_rejects_what_is_not_base64() {
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn a_body_larger_than_axums_default_limit_still_reaches_the_handler() {
+    // The regression this exists for: axum caps a request body at 2 MB unless told otherwise,
+    // and rejects an oversized one *before* any handler runs. That made every per-endpoint size
+    // guard unreachable and, through a dev proxy, produced an EPIPE while the body was still
+    // being written — which reads as a crash rather than a limit.
+    //
+    // A 3 MB body must now reach the handler and be judged on its contents. Any 4xx that is not
+    // 413 proves it got there; 413 would mean the framework refused it first.
+    let strLargeLog = "x".repeat(3 * 1024 * 1024);
+    let strBody = format!(r#"{{"logText":"{strLargeLog}"}}"#);
+
+    let status = StatusOf("POST", "/simulation/load", &strBody).await;
+    assert_ne!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the framework must not refuse a body the endpoint is willing to read"
+    );
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "three megabytes of 'x' is not a CAN log, which is the handler's judgement to make"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_past_the_endpoints_own_limit_is_refused_with_an_explanation() {
+    // Above the endpoint's guard but below the framework backstop, so the handler is what
+    // refuses it — and it says how big the limit is rather than returning a bare status.
+    let strOversized = "A".repeat(33 * 1024 * 1024);
+    let strBody = format!(r#"{{"captureBase64":"{strOversized}"}}"#);
+
+    assert_eq!(
+        StatusOf("POST", "/simulation/pcap", &strBody).await,
+        StatusCode::BAD_REQUEST
+    );
+}
