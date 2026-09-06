@@ -18,6 +18,8 @@ export interface TrafficExchangeResponse {
   responseCanIdHex: string
   responseHex: string
   suppressed: boolean
+  /** True when one of your response overrides produced this answer, not the UDS plugin. */
+  overridden: boolean
 }
 
 /** One request routed through the simulation, with whatever answered it. */
@@ -184,7 +186,10 @@ export function FormatEventLine(event: TrafficEvent): string {
       const strAnswers =
         event.responses.length > 0
           ? event.responses
-              .map((response) => `${response.ecuName}: ${response.responseHex}`)
+              .map(
+                (response) =>
+                  `${response.ecuName}: ${response.responseHex}${response.overridden ? ' (override)' : ''}`,
+              )
               .join(' | ')
           : (event.reason ?? 'no answer')
       return `${strAt}  --  ${event.canIdHex.padEnd(8)} ${event.requestHex}  [${event.addressing}]  ${strAnswers}`

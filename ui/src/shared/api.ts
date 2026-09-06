@@ -125,6 +125,8 @@ export interface SimulationResponse {
   finalResponseDropped: boolean
   isoConformant: boolean
   conformanceWarnings: string[]
+  /** True when one of your response overrides produced this answer, not the UDS plugin. */
+  overridden: boolean
 }
 
 /**
