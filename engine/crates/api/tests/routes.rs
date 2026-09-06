@@ -286,14 +286,21 @@ async fn a_body_larger_than_axums_default_limit_still_reaches_the_handler() {
 }
 
 #[tokio::test]
-async fn a_capture_past_the_endpoints_own_limit_is_refused_with_an_explanation() {
-    // Above the endpoint's guard but below the framework backstop, so the handler is what
-    // refuses it — and it says how big the limit is rather than returning a bare status.
-    let strOversized = "A".repeat(33 * 1024 * 1024);
-    let strBody = format!(r#"{{"captureBase64":"{strOversized}"}}"#);
+async fn a_capture_larger_than_a_text_body_is_still_accepted_by_its_own_route() {
+    // The capture route carries its own, much larger body limit. A 32 MB body would be refused
+    // by the text routes' limit, and must not be by this one — that separation is the point.
+    let vecLarge = vec![0x00u8; 32 * 1024 * 1024];
+    let strBody = String::from_utf8_lossy(&vecLarge).to_string();
 
+    let status = StatusOf("POST", "/simulation/pcap", &strBody).await;
+    assert_ne!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a 32 MB capture must reach the handler, which then judges its contents"
+    );
     assert_eq!(
-        StatusOf("POST", "/simulation/pcap", &strBody).await,
-        StatusCode::BAD_REQUEST
+        status,
+        StatusCode::BAD_REQUEST,
+        "32 MB of zeroes is not a capture"
     );
 }

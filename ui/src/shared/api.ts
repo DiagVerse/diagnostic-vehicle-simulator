@@ -321,6 +321,24 @@ async function deleteJson<T>(path: string): Promise<T> {
   return (await res.json()) as T
 }
 
+/**
+ * Send raw bytes.
+ *
+ * A capture is binary and can be tens of megabytes. Base64 would cost a third more on the wire
+ * and force the whole file through a JavaScript string on the way — so it goes as it is.
+ */
+async function postBinary<T>(path: string, arrBody: ArrayBuffer): Promise<T> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: arrBody,
+  })
+  if (!res.ok) {
+    throw new Error(await describeFailure(path, res))
+  }
+  return (await res.json()) as T
+}
+
 async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -368,8 +386,8 @@ export const api = {
   simulationLoad: (logText: string) => postJson<SimulationState>('/simulation/load', { logText }),
   simulationLoadSimFile: (logText: string) =>
     postJson<SimulationState>('/simulation/simfile', { logText }),
-  simulationLoadCapture: (captureBase64: string) =>
-    postJson<SimulationState>('/simulation/pcap', { captureBase64 }),
+  simulationLoadCapture: (arrCapture: ArrayBuffer) =>
+    postBinary<SimulationState>('/simulation/pcap', arrCapture),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationStart: () => postJson<SimulationState>('/simulation/start', {}),
   simulationStop: () => postJson<SimulationState>('/simulation/stop', {}),

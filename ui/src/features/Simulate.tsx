@@ -81,7 +81,7 @@ export function Simulate() {
   async function loadCapture(arrBytes: ArrayBuffer) {
     setBusy(true)
     try {
-      setState(await api.simulationLoadCapture(EncodeBase64(arrBytes)))
+      setState(await api.simulationLoadCapture(arrBytes))
       setLastResult(null)
       setError(null)
     } catch (e) {
@@ -657,24 +657,6 @@ function CaptureLoader({
       </div>
     </section>
   )
-}
-
-/**
- * Base64-encode a capture for the JSON body.
- *
- * `btoa` takes a string, and a naive `String.fromCharCode(...bytes)` blows the argument limit on
- * anything but a tiny file — hence the chunking.
- */
-function EncodeBase64(arrBuffer: ArrayBuffer): string {
-  const arrBytes = new Uint8Array(arrBuffer)
-  const uChunkSize = 0x8000
-  let strBinary = ''
-
-  for (let uOffset = 0; uOffset < arrBytes.length; uOffset += uChunkSize) {
-    const arrChunk = arrBytes.subarray(uOffset, uOffset + uChunkSize)
-    strBinary += String.fromCharCode(...arrChunk)
-  }
-  return btoa(strBinary)
 }
 
 function SimFileLoader({

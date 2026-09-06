@@ -152,6 +152,8 @@ fn ReadTransport(
             }
 
             Ok(Some(CapturedPacket {
+                // Filled in by `ReadCapture` once the whole file has been read.
+                m_uCaptureIndex: 0,
                 m_f64TimestampSec: f64TimestampSec,
                 m_transport: TransportKind::Tcp,
                 m_strSourceIp: strSourceIp,
@@ -173,6 +175,8 @@ fn ReadTransport(
             let uEnd = uLength.clamp(8, arrSegment.len());
 
             Ok(Some(CapturedPacket {
+                // Filled in by `ReadCapture` once the whole file has been read.
+                m_uCaptureIndex: 0,
                 m_f64TimestampSec: f64TimestampSec,
                 m_transport: TransportKind::Udp,
                 m_strSourceIp: strSourceIp,
