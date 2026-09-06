@@ -76,8 +76,11 @@ impl EcuKey {
 /// Errors from loading or driving a simulation.
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
-    /// The CAN log could not be parsed or reconstructed.
-    #[error("failed to reconstruct a vehicle from the log: {0}")]
+    /// The source could not be parsed or reconstructed.
+    ///
+    /// Says "source" rather than "log" because this now covers packet captures too, and being
+    /// told a capture failed "from the log" sends you looking in the wrong place.
+    #[error("failed to reconstruct a vehicle: {0}")]
     Reconstruct(#[from] reconstruct::ReconstructError),
 
     /// The simulation file could not be read.
