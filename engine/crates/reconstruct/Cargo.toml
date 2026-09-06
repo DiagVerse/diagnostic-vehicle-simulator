@@ -9,6 +9,8 @@ description = "CAN-log -> Unified Vehicle Model reconstruction pipeline."
 [dependencies]
 can.workspace = true
 isotp.workspace = true
+doip.workspace = true
+pcap.workspace = true
 core-domain.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

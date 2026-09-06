@@ -342,6 +342,74 @@ pub struct SimulationRequestResultDto {
     pub silenced_reason: Option<String>,
 }
 
+/// A capture, base64-encoded because it is binary and every other body here is JSON text.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadCaptureBody {
+    /// The pcap or pcapng file, base64.
+    pub capture_base64: String,
+}
+
+/// POST /simulation/pcap — reconstruct a vehicle from a DoIP capture.
+pub async fn PostSimulationCapture(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoadCaptureBody>,
+) -> Result<Json<SimulationStateDto>, ApiError> {
+    if body.capture_base64.len() > c_uMaxLogTextChars {
+        return Err(ApiError::BadRequest(format!(
+            "the capture is larger than this endpoint accepts ({} characters of base64)",
+            c_uMaxLogTextChars
+        )));
+    }
+
+    let vecBytes = DecodeBase64(&body.capture_base64).map_err(|strReason| {
+        ApiError::BadRequest(format!("the capture is not valid base64: {strReason}"))
+    })?;
+    if vecBytes.is_empty() {
+        return Err(ApiError::BadRequest("the capture is empty".to_string()));
+    }
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .LoadFromCapture(&vecBytes)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
+}
+
+/// Decode standard base64, with or without padding.
+///
+/// Hand-rolled for the same reason the capture parser is: it is a dozen lines, and a browser
+/// sending a file is the only thing that will ever call it.
+fn DecodeBase64(strEncoded: &str) -> Result<Vec<u8>, String> {
+    const c_strAlphabet: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut vecBytes = Vec::with_capacity(strEncoded.len() * 3 / 4);
+    let mut u32Accumulator: u32 = 0;
+    let mut uBitsHeld = 0u32;
+
+    for byChar in strEncoded.bytes() {
+        // Whitespace is common in base64 that has travelled through anything, and padding
+        // carries no bits.
+        if byChar.is_ascii_whitespace() || byChar == b'=' {
+            continue;
+        }
+        let uValue = c_strAlphabet
+            .iter()
+            .position(|byAlphabet| *byAlphabet == byChar)
+            .ok_or_else(|| format!("'{}' is not a base64 character", byChar as char))?;
+
+        u32Accumulator = (u32Accumulator << 6) | uValue as u32;
+        uBitsHeld += 6;
+        if uBitsHeld >= 8 {
+            uBitsHeld -= 8;
+            vecBytes.push((u32Accumulator >> uBitsHeld) as u8);
+        }
+    }
+    Ok(vecBytes)
+}
+
 /// POST /simulation/simfile — load a vehicle from a simulation file.
 pub async fn PostSimulationSimFile(
     State(state): State<Arc<AppState>>,

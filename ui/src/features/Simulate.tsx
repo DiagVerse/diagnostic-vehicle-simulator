@@ -72,6 +72,27 @@ export function Simulate() {
     }
   }
 
+  /**
+   * Load a pcap or pcapng capture.
+   *
+   * The only source that arrives as binary, so it is base64-encoded here — the API client sends
+   * JSON, and a capture is not text.
+   */
+  async function loadCapture(arrBytes: ArrayBuffer) {
+    setBusy(true)
+    try {
+      setState(await api.simulationLoadCapture(EncodeBase64(arrBytes)))
+      setLastResult(null)
+      setError(null)
+    } catch (e) {
+      // A capture with no DoIP traffic in it, or one that is not a capture at all, leaves the
+      // previously loaded vehicle running and says which it was.
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function loadSimFile(fileText: string) {
     setBusy(true)
     try {
@@ -156,6 +177,7 @@ export function Simulate() {
 
       {source === 'log' && <LogLoader onLoad={load} busy={busy} />}
       {source === 'simfile' && <SimFileLoader onLoad={loadSimFile} busy={busy} />}
+      {source === 'pcap' && <CaptureLoader onLoad={loadCapture} busy={busy} />}
       {source === 'build' && (
         <VehicleBuilder onChanged={setState} onError={setError} busy={busy} />
       )}
@@ -212,7 +234,7 @@ export function Simulate() {
 // ---------------------------------------------------------------------------------------
 
 /** A vehicle is either reconstructed from a capture or stated by hand. */
-type VehicleSource = 'log' | 'simfile' | 'build'
+type VehicleSource = 'log' | 'simfile' | 'pcap' | 'build'
 
 function SourcePicker({
   source,
@@ -228,6 +250,9 @@ function SourcePicker({
       </SourceTab>
       <SourceTab active={source === 'simfile'} onClick={() => onChange('simfile')}>
         From a simulation file
+      </SourceTab>
+      <SourceTab active={source === 'pcap'} onClick={() => onChange('pcap')}>
+        From a DoIP capture
       </SourceTab>
       <SourceTab active={source === 'build'} onClick={() => onChange('build')}>
         Build from scratch
@@ -562,6 +587,96 @@ function LogLoader({ onLoad, busy }: { onLoad: (logText: string) => void; busy: 
  * membership and someone clicking ECUs together has not been asked, so this is what makes the
  * topology diagram show real buses.
  */
+/**
+ * Load a packet capture.
+ *
+ * Deliberately file-only, with no paste box: a capture is binary, and the other two loaders'
+ * textarea would be worse than useless here — it would invite pasting something that cannot
+ * work and then report a confusing failure.
+ */
+function CaptureLoader({
+  onLoad,
+  busy,
+}: {
+  onLoad: (arrBytes: ArrayBuffer) => void
+  busy: boolean
+}) {
+  const [fileName, setFileName] = useState<string | null>(null)
+  const [sizeBytes, setSizeBytes] = useState(0)
+  const [arrBytes, setBytes] = useState<ArrayBuffer | null>(null)
+
+  async function readFile(file: File) {
+    setFileName(file.name)
+    setSizeBytes(file.size)
+    setBytes(await file.arrayBuffer())
+  }
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Load a DoIP capture
+        </h3>
+        <span className="text-xs text-slate-500">pcap or pcapng</span>
+      </div>
+
+      <p className="mt-2 text-xs leading-relaxed text-slate-500">
+        Every logical address that answered becomes an ECU, and the vehicle announcement supplies
+        the VIN, EID and GID. An address that was asked and never replied is not invented as an
+        ECU. Traffic on port 3496 is TLS and cannot be read &mdash; it is counted and reported,
+        never guessed at.
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500">
+          Choose file&hellip;
+          <input
+            type="file"
+            accept=".pcap,.pcapng,.cap"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) readFile(file)
+            }}
+          />
+        </label>
+
+        <button
+          onClick={() => arrBytes && onLoad(arrBytes)}
+          disabled={busy || arrBytes === null}
+          className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Reconstruct &amp; simulate
+        </button>
+
+        {fileName && (
+          <span className="font-mono text-xs text-slate-400">
+            {fileName} &middot; {(sizeBytes / 1024).toFixed(1)} kB
+          </span>
+        )}
+      </div>
+    </section>
+  )
+}
+
+/**
+ * Base64-encode a capture for the JSON body.
+ *
+ * `btoa` takes a string, and a naive `String.fromCharCode(...bytes)` blows the argument limit on
+ * anything but a tiny file — hence the chunking.
+ */
+function EncodeBase64(arrBuffer: ArrayBuffer): string {
+  const arrBytes = new Uint8Array(arrBuffer)
+  const uChunkSize = 0x8000
+  let strBinary = ''
+
+  for (let uOffset = 0; uOffset < arrBytes.length; uOffset += uChunkSize) {
+    const arrChunk = arrBytes.subarray(uOffset, uOffset + uChunkSize)
+    strBinary += String.fromCharCode(...arrChunk)
+  }
+  return btoa(strBinary)
+}
+
 function SimFileLoader({
   onLoad,
   busy,
@@ -638,8 +753,8 @@ function SimFileLoader({
 function EmptyState() {
   return (
     <p className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-10 text-center text-sm text-slate-500">
-      No vehicle loaded. Reconstruct one from a CAN log, load a simulation file, or build one
-      ECU at a time.
+      No vehicle loaded. Reconstruct one from a CAN log or a DoIP capture, load a simulation
+      file, or build one ECU at a time.
     </p>
   )
 }
