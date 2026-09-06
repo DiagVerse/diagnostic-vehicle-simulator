@@ -985,7 +985,8 @@ fn BuildEcuNode(
         Some(address) => simulation
             .FindEcuByRequestCanId(address.m_u32RequestCanId)
             .is_some(),
-        None => false,
+        // A DoIP-addressed ECU is started and answers; it simply is not on CAN.
+        None => ecu.m_bHasDoIpAddress && simulation.IsKnownLogicalAddress(ecu.m_u16LogicalAddress),
     };
 
     let path = vehicle.DiagnosticPathTo(ecu);
@@ -1053,7 +1054,7 @@ fn DescribeUnreachable(
     }
     if ecu.m_optCanAddress.is_none() {
         return Some(
-            "Declared on DoIP only. It is part of the architecture, but the engine drives CAN on the wire today, so nothing is answering for it."
+            "Declared on DoIP only, and not currently started — check its logical address is unique."
                 .to_string(),
         );
     }
@@ -1128,7 +1129,7 @@ fn BuildStatedTopologyCaveats(vehicle: &Vehicle) -> Vec<String> {
         .count();
     if uDoIpOnly > 0 {
         vecCaveats.push(format!(
-            "{uDoIpOnly} ECU(s) are addressed only over DoIP. They are drawn in the architecture, but the engine's wire-level simulation is CAN, so a tester cannot exchange messages with them yet."
+            "{uDoIpOnly} ECU(s) are addressed only over DoIP. They are routed by logical address; putting them on a wire needs the DoIP server, which is not built yet."
         ));
     }
 
