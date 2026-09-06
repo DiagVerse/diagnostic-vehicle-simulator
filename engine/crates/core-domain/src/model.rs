@@ -1076,8 +1076,78 @@ pub struct Network {
     pub m_confidence: Confidence,
 }
 
-/// The whole reconstructed/simulated vehicle: its buses and the ECUs on them.
+/// How a vehicle identifies itself to a DoIP tester (ISO 13400-2 Table 5).
+///
+/// Every field of the vehicle announcement is here rather than invented at the transport, so
+/// what a tester is told matches what the model says — and so an unprogrammed vehicle announces
+/// itself as unprogrammed instead of as something plausible and wrong.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VehicleIdentity {
+    /// The 17-character VIN (ISO 3779), as bytes.
+    ///
+    /// `None` means not programmed, which is a real state a vehicle can be in — a body in
+    /// white on a production line has no VIN yet. ISO 13400-2 Table 1 gives it a defined
+    /// on-the-wire form (seventeen `0x00` or seventeen `0xFF`), so "not set" is announced
+    /// honestly rather than as a plausible-looking wrong VIN.
+    #[serde(default)]
+    pub m_optVecVin: Option<Vec<u8>>,
+
+    /// The DoIP entity identification: six bytes, unique per entity, conventionally its MAC.
+    ///
+    /// ISO 13400-2 REQ 8.DoIP-123 APP requires a vehicle be uniquely identifiable by the VIN,
+    /// the EID, or both — so this is what identifies it while the VIN is absent.
+    #[serde(default)]
+    pub m_optArrEid: Option<[u8; 6]>,
+
+    /// The group identification: six bytes shared by every DoIP entity of one vehicle.
+    ///
+    /// What groups several entities into one vehicle before a VIN exists (REQ 8.DoIP-142 APP).
+    #[serde(default)]
+    pub m_optArrGid: Option<[u8; 6]>,
+
+    /// ISO 13400-2 Table 6 "further action required", announced to a tester.
+    ///
+    /// `0x00` is "no further action"; `0x10` means routing activation with the central-security
+    /// activation type is required. Kept as a raw byte because the range above `0x10` is
+    /// manufacturer-defined and inventing an enum for it would forbid modelling a real vehicle.
+    #[serde(default)]
+    pub m_byFurtherActionRequired: u8,
+
+    /// ISO 13400-2 Table 7 "VIN/GID synchronization status": `0x00` synchronized, `0x10` not.
+    ///
+    /// A fault-injection knob as much as a state: announcing `0x10` is how a vehicle tells a
+    /// tester to wait and ask again, and a tester's handling of that is worth exercising.
+    #[serde(default)]
+    pub m_byVinGidSyncStatus: u8,
+}
+
+impl VehicleIdentity {
+    /// The VIN as it goes on the wire: seventeen bytes, using the ISO 13400-2 Table 1
+    /// invalidity fill when it is not programmed.
+    pub fn VinBytes(&self) -> [u8; 17] {
+        let mut arrVin = [0x00u8; 17];
+        if let Some(vecVin) = &self.m_optVecVin {
+            for (uIndex, byByte) in vecVin.iter().take(17).enumerate() {
+                arrVin[uIndex] = *byByte;
+            }
+        }
+        arrVin
+    }
+
+    /// The EID as it goes on the wire, with the Table 1 invalidity fill when unset.
+    pub fn EidBytes(&self) -> [u8; 6] {
+        self.m_optArrEid.unwrap_or([0x00; 6])
+    }
+
+    /// The GID as it goes on the wire, with the Table 1 invalidity fill when unset.
+    pub fn GidBytes(&self) -> [u8; 6] {
+        self.m_optArrGid.unwrap_or([0x00; 6])
+    }
+}
+
+/// The whole reconstructed/simulated vehicle: its buses and the ECUs on them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Vehicle {
     /// Vehicle name/identifier.

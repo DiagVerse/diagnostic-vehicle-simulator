@@ -42,6 +42,37 @@ const c_arrFunctionallySuppressedNrcs: [u8; 5] = [
 /// addressing.
 const c_uMaxFunctionalRequestBytes: usize = 7;
 
+/// How the simulation refers to one running ECU internally.
+///
+/// An ECU may be reachable on CAN, over DoIP, or both — and when it is both, it must be **one**
+/// `VirtualEcu`, not two. A tester that enters the extended session over DoIP and then reads a
+/// data identifier over CAN has to find the ECU still in that session; two instances keyed
+/// separately would diverge while looking identical from outside, which is the worst kind of
+/// bug to chase.
+///
+/// So an ECU is stored under exactly one key — its CAN identifier if it has one, its logical
+/// address otherwise — and every other way of addressing it is an index pointing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EcuKey {
+    /// Stored under the request identifier a tester addresses it on.
+    Can(u32),
+    /// Stored under its DoIP logical address, for an ECU with no CAN addressing at all.
+    DoIp(u16),
+}
+
+impl EcuKey {
+    /// The CAN request identifier this ECU is stored under, if it is a CAN-addressed one.
+    ///
+    /// The HTTP API uses the CAN identifier as its handle for an ECU, so this is what tells it
+    /// which ECUs it can talk about. A DoIP-only ECU has no such handle.
+    pub fn RequestCanId(self) -> Option<u32> {
+        match self {
+            EcuKey::Can(u32RequestCanId) => Some(u32RequestCanId),
+            EcuKey::DoIp(_) => None,
+        }
+    }
+}
+
 /// Errors from loading or driving a simulation.
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
@@ -69,6 +100,19 @@ pub enum SimulationError {
         /// The contested request identifier.
         u32RequestCanId: u32,
         /// ECU that claimed the identifier first.
+        strFirstEcu: String,
+        /// ECU that claimed it second.
+        strSecondEcu: String,
+    },
+
+    /// Two ECUs claim the same DoIP logical address, so a routed request could reach either.
+    #[error(
+        "DoIP logical address 0x{u16LogicalAddress:04X} is claimed by both '{strFirstEcu}' and '{strSecondEcu}'"
+    )]
+    DuplicateLogicalAddress {
+        /// The contested logical address.
+        u16LogicalAddress: u16,
+        /// ECU that claimed it first.
         strFirstEcu: String,
         /// ECU that claimed it second.
         strSecondEcu: String,
@@ -211,7 +255,12 @@ pub struct SimulationService {
     m_optVehicle: Option<Vehicle>,
     /// Live ECUs keyed by the CAN identifier a tester addresses them on. A `BTreeMap` keeps
     /// listing order stable and makes routing an O(log n) lookup.
-    m_mapEcusByRequestId: BTreeMap<u32, VirtualEcu>,
+    m_mapEcus: BTreeMap<EcuKey, VirtualEcu>,
+    /// Which stored ECU answers a given DoIP logical address.
+    ///
+    /// An index, not storage: for an ECU that is reachable both ways this points at its
+    /// `EcuKey::Can` entry, so both transports drive the same object and the same state.
+    m_mapKeyByLogicalAddress: BTreeMap<u16, EcuKey>,
     /// For each functional (broadcast) identifier, the physical request identifiers of the
     /// ECUs that listen on it, in ascending response-identifier order.
     m_mapFunctionalTargets: BTreeMap<u32, Vec<u32>>,
@@ -232,7 +281,8 @@ impl SimulationService {
     pub fn New() -> Self {
         SimulationService {
             m_optVehicle: None,
-            m_mapEcusByRequestId: BTreeMap::new(),
+            m_mapEcus: BTreeMap::new(),
+            m_mapKeyByLogicalAddress: BTreeMap::new(),
             m_mapFunctionalTargets: BTreeMap::new(),
             m_bIsRunning: true,
         }
@@ -241,7 +291,7 @@ impl SimulationService {
     /// Put the ECUs on the bus.
     pub fn Start(&mut self) {
         if !self.m_bIsRunning {
-            tracing::info!(ecus = self.m_mapEcusByRequestId.len(), "simulation started");
+            tracing::info!(ecus = self.m_mapEcus.len(), "simulation started");
         }
         self.m_bIsRunning = true;
     }
@@ -250,7 +300,7 @@ impl SimulationService {
     pub fn Stop(&mut self) {
         if self.m_bIsRunning {
             tracing::info!(
-                ecus = self.m_mapEcusByRequestId.len(),
+                ecus = self.m_mapEcus.len(),
                 "simulation stopped; ECUs keep their state and will resume where they left off"
             );
         }
@@ -282,15 +332,17 @@ impl SimulationService {
             ecus = mapEcus.len(),
             "simulation loaded"
         );
-        for (u32RequestCanId, runningEcu) in &mapEcus {
+        for (key, runningEcu) in &mapEcus {
             tracing::info!(
                 ecu = %runningEcu.Config().m_strName,
-                requestCanId = format!("{u32RequestCanId:03X}"),
+                addressedOn = %DescribeKey(*key),
                 "ECU started"
             );
         }
 
-        self.m_mapEcusByRequestId = mapEcus;
+        let mapKeyByLogicalAddress = BuildLogicalAddressIndex(&mapEcus)?;
+        self.m_mapEcus = mapEcus;
+        self.m_mapKeyByLogicalAddress = mapKeyByLogicalAddress;
         self.m_mapFunctionalTargets = mapFunctionalTargets;
         self.m_optVehicle = Some(vehicle);
         Ok(self
@@ -302,7 +354,7 @@ impl SimulationService {
     /// Discard the loaded vehicle and stop all ECUs.
     pub fn Clear(&mut self) {
         self.m_optVehicle = None;
-        self.m_mapEcusByRequestId.clear();
+        self.m_mapEcus.clear();
         self.m_mapFunctionalTargets.clear();
         tracing::info!("simulation cleared");
     }
@@ -319,9 +371,13 @@ impl SimulationService {
 
     /// Every running ECU, in request-identifier order, as (requestCanId, ECU) pairs.
     pub fn RunningEcus(&self) -> impl Iterator<Item = (u32, &VirtualEcu)> {
-        self.m_mapEcusByRequestId
-            .iter()
-            .map(|(u32RequestCanId, runningEcu)| (*u32RequestCanId, runningEcu))
+        self.m_mapEcus.iter().filter_map(|(key, runningEcu)| {
+            // Keyed by CAN identifier, because that is the handle the HTTP API addresses an
+            // ECU by. A DoIP-only ECU has no such handle; the topology reads it from the
+            // vehicle model instead, which is where it is fully described anyway.
+            key.RequestCanId()
+                .map(|u32RequestCanId| (u32RequestCanId, runningEcu))
+        })
     }
 
     /// True when the identifier is a functional (broadcast) address some running ECU listens
@@ -332,7 +388,7 @@ impl SimulationService {
 
     /// Look up one running ECU by the identifier it is addressed on.
     pub fn FindEcuByRequestCanId(&self, u32RequestCanId: u32) -> Option<&VirtualEcu> {
-        self.m_mapEcusByRequestId.get(&u32RequestCanId)
+        self.m_mapEcus.get(&EcuKey::Can(u32RequestCanId))
     }
 
     /// Load a vehicle described in a simulation file.
@@ -349,7 +405,7 @@ impl SimulationService {
     /// Unlike a reconstruction, an empty vehicle is a legitimate starting point: the user is
     /// about to add ECUs one at a time. Any previously loaded vehicle is replaced.
     pub fn CreateEmptyVehicle(&mut self, strName: &str) -> &Vehicle {
-        self.m_mapEcusByRequestId.clear();
+        self.m_mapEcus.clear();
         self.m_mapFunctionalTargets.clear();
         self.m_optVehicle = Some(Vehicle {
             m_strName: strName.to_string(),
@@ -380,7 +436,7 @@ impl SimulationService {
                 strEcuName: config.m_strName.clone(),
             })?;
 
-        RejectDuplicateIdentifiers(&self.m_mapEcusByRequestId, &config, &address)?;
+        RejectDuplicateIdentifiers(&self.m_mapEcus, &config, &address)?;
 
         tracing::info!(
             ecu = %config.m_strName,
@@ -389,8 +445,10 @@ impl SimulationService {
             "ECU added"
         );
 
-        self.m_mapEcusByRequestId
-            .insert(address.m_u32RequestCanId, VirtualEcu::New(config.clone()));
+        self.m_mapEcus.insert(
+            EcuKey::Can(address.m_u32RequestCanId),
+            VirtualEcu::New(config.clone()),
+        );
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             vehicle.m_vecEcus.push(config);
         }
@@ -401,8 +459,8 @@ impl SimulationService {
     /// Remove one ECU and stop it.
     pub fn RemoveEcu(&mut self, u32RequestCanId: u32) -> Result<(), SimulationError> {
         let removed = self
-            .m_mapEcusByRequestId
-            .remove(&u32RequestCanId)
+            .m_mapEcus
+            .remove(&EcuKey::Can(u32RequestCanId))
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
 
         tracing::info!(ecu = %removed.Config().m_strName, "ECU removed");
@@ -427,8 +485,8 @@ impl SimulationService {
         strName: &str,
     ) -> Result<(), SimulationError> {
         let runningEcu = self
-            .m_mapEcusByRequestId
-            .get_mut(&u32RequestCanId)
+            .m_mapEcus
+            .get_mut(&EcuKey::Can(u32RequestCanId))
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
         runningEcu.SetName(strName);
 
@@ -453,8 +511,8 @@ impl SimulationService {
         vecOverrides: Vec<ResponseOverride>,
     ) -> Result<(), SimulationError> {
         let runningEcu = self
-            .m_mapEcusByRequestId
-            .get_mut(&u32RequestCanId)
+            .m_mapEcus
+            .get_mut(&EcuKey::Can(u32RequestCanId))
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
         runningEcu.SetResponseOverrides(vecOverrides.clone());
 
@@ -475,8 +533,8 @@ impl SimulationService {
         &self,
         u32RequestCanId: u32,
     ) -> Result<&[ResponseOverride], SimulationError> {
-        self.m_mapEcusByRequestId
-            .get(&u32RequestCanId)
+        self.m_mapEcus
+            .get(&EcuKey::Can(u32RequestCanId))
             .map(|runningEcu| runningEcu.Config().m_vecResponseOverrides.as_slice())
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })
     }
@@ -484,7 +542,11 @@ impl SimulationService {
     /// Recompute which ECUs listen on each broadcast identifier, after the set of running ECUs
     /// has changed.
     fn RebuildFunctionalTargets(&mut self) -> Result<(), SimulationError> {
-        self.m_mapFunctionalTargets = BuildFunctionalTargetMap(&self.m_mapEcusByRequestId)?;
+        self.m_mapFunctionalTargets = BuildFunctionalTargetMap(&self.m_mapEcus)?;
+        // Both indexes are derived from the same ECU map, so they are rebuilt together — an
+        // ECU added or removed changes what a broadcast reaches *and* what a logical address
+        // resolves to, and letting one go stale would be a silent routing bug.
+        self.m_mapKeyByLogicalAddress = BuildLogicalAddressIndex(&self.m_mapEcus)?;
         Ok(())
     }
 
@@ -502,8 +564,8 @@ impl SimulationService {
         timing: EcuTiming,
     ) -> Result<(), SimulationError> {
         let runningEcu = self
-            .m_mapEcusByRequestId
-            .get_mut(&u32RequestCanId)
+            .m_mapEcus
+            .get_mut(&EcuKey::Can(u32RequestCanId))
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
         runningEcu.SetTiming(timing);
 
@@ -513,8 +575,8 @@ impl SimulationService {
 
     /// One ECU's current timing parameters.
     pub fn EcuTimingOf(&self, u32RequestCanId: u32) -> Result<EcuTiming, SimulationError> {
-        self.m_mapEcusByRequestId
-            .get(&u32RequestCanId)
+        self.m_mapEcus
+            .get(&EcuKey::Can(u32RequestCanId))
             .map(|runningEcu| runningEcu.Timing())
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })
     }
@@ -525,11 +587,11 @@ impl SimulationService {
     /// the ECU's own config carries operator-set timing across unchanged, which is what an
     /// operator who set up a fault and then reset the session expects.
     pub fn ResetAllEcus(&mut self) {
-        for runningEcu in self.m_mapEcusByRequestId.values_mut() {
+        for runningEcu in self.m_mapEcus.values_mut() {
             *runningEcu = VirtualEcu::New(runningEcu.Config().clone());
         }
         tracing::info!(
-            ecus = self.m_mapEcusByRequestId.len(),
+            ecus = self.m_mapEcus.len(),
             "all ECUs reset to default session"
         );
     }
@@ -619,7 +681,7 @@ impl SimulationService {
 
         // The running ECU carries its own copy of the configuration; leaving it stale would
         // make the diagram and the simulation disagree about the same ECU.
-        if let Some(runningEcu) = self.m_mapEcusByRequestId.get_mut(&u32RequestCanId) {
+        if let Some(runningEcu) = self.m_mapEcus.get_mut(&EcuKey::Can(u32RequestCanId)) {
             runningEcu.SetPlacement(optStrNetworkId.clone(), vecGatewayForNetworkIds.clone());
         }
 
@@ -642,8 +704,8 @@ impl SimulationService {
         bIsEnabled: bool,
     ) -> Result<(), SimulationError> {
         let runningEcu = self
-            .m_mapEcusByRequestId
-            .get_mut(&u32RequestCanId)
+            .m_mapEcus
+            .get_mut(&EcuKey::Can(u32RequestCanId))
             .ok_or(SimulationError::EcuNotFound { u32RequestCanId })?;
         runningEcu.SetEnabled(bIsEnabled);
 
@@ -699,7 +761,7 @@ impl SimulationService {
             return RoutingOutcome::Stopped;
         }
 
-        if self.m_mapEcusByRequestId.contains_key(&u32RequestCanId) {
+        if self.m_mapEcus.contains_key(&EcuKey::Can(u32RequestCanId)) {
             return self.ProcessPhysical(u32RequestCanId, vecRequest, protocol);
         }
 
@@ -723,16 +785,30 @@ impl SimulationService {
         vecRequest: &[u8],
         protocol: &dyn ProtocolHandler,
     ) -> RoutingOutcome {
-        if let Some(strReason) = self.DescribeWhySilent(u32RequestCanId) {
+        self.ProcessOnKey(EcuKey::Can(u32RequestCanId), vecRequest, protocol)
+    }
+
+    /// Drive one stored ECU, whichever transport found it.
+    ///
+    /// The single place a request meets an ECU. Both `ProcessByCanId` and
+    /// `ProcessByLogicalAddress` end here, which is what guarantees the two transports cannot
+    /// drift apart in how they gate sessions, apply overrides or honour the on/off switch.
+    fn ProcessOnKey(
+        &mut self,
+        key: EcuKey,
+        vecRequest: &[u8],
+        protocol: &dyn ProtocolHandler,
+    ) -> RoutingOutcome {
+        if let Some(strReason) = self.DescribeWhySilent(key) {
             let strEcuName = self
-                .m_mapEcusByRequestId
-                .get(&u32RequestCanId)
+                .m_mapEcus
+                .get(&key)
                 .map(|runningEcu| runningEcu.Config().m_strName.clone())
                 .unwrap_or_default();
 
             tracing::info!(
                 ecu = %strEcuName,
-                requestCanId = format!("{u32RequestCanId:03X}"),
+                addressedOn = %DescribeKey(key),
                 reason = %strReason,
                 "request reached an ECU that is off the air; staying silent"
             );
@@ -742,13 +818,65 @@ impl SimulationService {
             };
         }
 
-        let runningEcu = match self.m_mapEcusByRequestId.get_mut(&u32RequestCanId) {
+        let runningEcu = match self.m_mapEcus.get_mut(&key) {
             Some(runningEcu) => runningEcu,
             None => return RoutingOutcome::NoTarget,
         };
 
-        let response = ProcessOnEcu(runningEcu, u32RequestCanId, vecRequest, protocol);
+        // The identifier the answer is *reported* as coming in on. A DoIP-only ECU has no CAN
+        // identifier at all; 0 stands for "not addressed on CAN", and only the CAN paths read
+        // this field.
+        let u32AddressedOn = key.RequestCanId().unwrap_or(0);
+        let response = ProcessOnEcu(runningEcu, u32AddressedOn, vecRequest, protocol);
         RoutingOutcome::Handled(vec![response])
+    }
+
+    /// Route one request to the ECU that owns a DoIP logical address.
+    ///
+    /// The sibling of `ProcessByCanId`, and deliberately the *only* difference between the two
+    /// transports: how the target is found. Everything past that point — the session gate, the
+    /// overrides, the timing plan, whether the ECU is switched off — is the same code and the
+    /// same ECU object, so a tester cannot observe a difference in behaviour between reaching
+    /// an ECU over DoIP and reaching it over CAN.
+    pub fn ProcessByLogicalAddress(
+        &mut self,
+        u16TargetAddress: u16,
+        vecRequest: &[u8],
+        protocol: &dyn ProtocolHandler,
+    ) -> RoutingOutcome {
+        if !self.m_bIsRunning {
+            tracing::debug!(
+                targetAddress = format!("{u16TargetAddress:04X}"),
+                "simulation is stopped; nothing answers"
+            );
+            return RoutingOutcome::Stopped;
+        }
+
+        let key = match self.m_mapKeyByLogicalAddress.get(&u16TargetAddress) {
+            Some(key) => *key,
+            None => {
+                // The DoIP layer turns this into a diagnostic message NACK 0x03, unknown
+                // target address (ISO 13400-2 REQ 7.DoIP-071 AL).
+                tracing::debug!(
+                    targetAddress = format!("{u16TargetAddress:04X}"),
+                    "no ECU carries this DoIP logical address"
+                );
+                return RoutingOutcome::NoTarget;
+            }
+        };
+
+        self.ProcessOnKey(key, vecRequest, protocol)
+    }
+
+    /// True when some running ECU answers to this DoIP logical address.
+    pub fn IsKnownLogicalAddress(&self, u16TargetAddress: u16) -> bool {
+        self.m_mapKeyByLogicalAddress
+            .contains_key(&u16TargetAddress)
+    }
+
+    /// Every DoIP logical address the loaded vehicle answers on, in order.
+    pub fn LogicalAddresses(&self) -> impl Iterator<Item = u16> + '_ {
+        self.m_mapKeyByLogicalAddress.keys().copied()
     }
 
     /// Say why an ECU would not answer right now, or `None` when it would.
@@ -757,8 +885,8 @@ impl SimulationService {
     /// off, or a gateway between it and the tester is. The second is the first thing the
     /// declared architecture actually enforces — an unpowered gateway takes everything behind
     /// it off the air on a real vehicle, and a switch that did not do that would be decorative.
-    fn DescribeWhySilent(&self, u32RequestCanId: u32) -> Option<String> {
-        let runningEcu = self.m_mapEcusByRequestId.get(&u32RequestCanId)?;
+    fn DescribeWhySilent(&self, key: EcuKey) -> Option<String> {
+        let runningEcu = self.m_mapEcus.get(&key)?;
         let config = runningEcu.Config();
 
         if !config.m_bIsEnabled {
@@ -802,7 +930,7 @@ impl SimulationService {
         for u32TargetRequestId in vecTargetRequestIds {
             // A broadcast reaches whoever is listening. An ECU that is off, or behind a
             // gateway that is off, simply is not.
-            if let Some(strReason) = self.DescribeWhySilent(u32TargetRequestId) {
+            if let Some(strReason) = self.DescribeWhySilent(EcuKey::Can(u32TargetRequestId)) {
                 tracing::debug!(
                     requestCanId = format!("{u32FunctionalCanId:03X}"),
                     reason = %strReason,
@@ -811,7 +939,7 @@ impl SimulationService {
                 continue;
             }
 
-            let runningEcu = match self.m_mapEcusByRequestId.get_mut(&u32TargetRequestId) {
+            let runningEcu = match self.m_mapEcus.get_mut(&EcuKey::Can(u32TargetRequestId)) {
                 Some(runningEcu) => runningEcu,
                 None => continue,
             };
@@ -859,14 +987,16 @@ fn ProcessOnEcu(
     vecRequest: &[u8],
     protocol: &dyn ProtocolHandler,
 ) -> RoutedResponse {
-    // Only ECUs that carry a CAN address are ever started, so reading it back here cannot
-    // fail: `BuildEcuMap` skips the rest.
-    let address = runningEcu
-        .Config()
-        .m_optCanAddress
-        .expect("a started ECU always has a CAN address; BuildEcuMap only starts those");
-    let u32ResponseCanId = address.m_u32ResponseCanId;
-    let u32EcuRequestCanId = address.m_u32RequestCanId;
+    // A DoIP-addressed ECU is started without any CAN identifiers at all, so these are absent
+    // rather than unreadable. Zero stands for "not addressed on CAN" — only the CAN transport
+    // reads them back, and it never reaches an ECU that has none.
+    let optAddress = runningEcu.Config().m_optCanAddress;
+    let u32ResponseCanId = optAddress
+        .map(|address| address.m_u32ResponseCanId)
+        .unwrap_or(0);
+    let u32EcuRequestCanId = optAddress
+        .map(|address| address.m_u32RequestCanId)
+        .unwrap_or(0);
     let strEcuName = runningEcu.Config().m_strName.clone();
 
     let plan = runningEcu.ProcessRequestWithTiming(protocol, vecRequest);
@@ -917,26 +1047,45 @@ fn ProcessOnEcu(
 /// An ECU without CAN addressing is skipped rather than failing the whole load: a model can
 /// legitimately hold ECUs from a source that carries no CAN addressing, and a partial vehicle
 /// is more useful than none (README §7). Only a model with nothing routable at all is refused.
-fn BuildEcuMap(vehicle: &Vehicle) -> Result<BTreeMap<u32, VirtualEcu>, SimulationError> {
+fn BuildEcuMap(vehicle: &Vehicle) -> Result<BTreeMap<EcuKey, VirtualEcu>, SimulationError> {
     if vehicle.m_vecEcus.is_empty() {
         return Err(SimulationError::NoEcusFound);
     }
 
-    let mut mapEcus: BTreeMap<u32, VirtualEcu> = BTreeMap::new();
+    let mut mapEcus: BTreeMap<EcuKey, VirtualEcu> = BTreeMap::new();
+
     for config in &vehicle.m_vecEcus {
-        let address = match config.m_optCanAddress {
-            Some(address) => address,
+        // The key is the CAN identifier when there is one, so everything that already
+        // addresses ECUs that way keeps working untouched. An ECU with only a DoIP address is
+        // stored under that instead — it is a perfectly reachable ECU, just not over CAN.
+        let optKey = match (config.m_optCanAddress, config.m_bHasDoIpAddress) {
+            (Some(address), _) => {
+                RejectDuplicateIdentifiers(&mapEcus, config, &address)?;
+                Some(EcuKey::Can(address.m_u32RequestCanId))
+            }
+            (None, true) => Some(EcuKey::DoIp(config.m_u16LogicalAddress)),
+            (None, false) => None,
+        };
+
+        let key = match optKey {
+            Some(key) => key,
             None => {
                 tracing::warn!(
                     ecu = %config.m_strName,
-                    "ECU has no CAN address and cannot be reached on CAN; it is loaded but not started"
+                    "ECU carries neither CAN identifiers nor a DoIP logical address; it is loaded but not started"
                 );
                 continue;
             }
         };
 
-        RejectDuplicateIdentifiers(&mapEcus, config, &address)?;
-        mapEcus.insert(address.m_u32RequestCanId, VirtualEcu::New(config.clone()));
+        if let Some(existing) = mapEcus.get(&key) {
+            return Err(SimulationError::DuplicateLogicalAddress {
+                u16LogicalAddress: config.m_u16LogicalAddress,
+                strFirstEcu: existing.Config().m_strName.clone(),
+                strSecondEcu: config.m_strName.clone(),
+            });
+        }
+        mapEcus.insert(key, VirtualEcu::New(config.clone()));
     }
 
     if mapEcus.is_empty() {
@@ -946,15 +1095,48 @@ fn BuildEcuMap(vehicle: &Vehicle) -> Result<BTreeMap<u32, VirtualEcu>, Simulatio
     Ok(mapEcus)
 }
 
+/// Index every ECU that carries a DoIP logical address, whatever it is stored under.
+///
+/// An ECU reachable both ways is indexed to its `EcuKey::Can` entry, so a request arriving over
+/// DoIP and one arriving over CAN drive the same object — and therefore the same session,
+/// security state and overrides.
+fn BuildLogicalAddressIndex(
+    mapEcus: &BTreeMap<EcuKey, VirtualEcu>,
+) -> Result<BTreeMap<u16, EcuKey>, SimulationError> {
+    let mut mapIndex: BTreeMap<u16, EcuKey> = BTreeMap::new();
+
+    for (key, runningEcu) in mapEcus {
+        let config = runningEcu.Config();
+        if !config.m_bHasDoIpAddress {
+            continue;
+        }
+
+        if let Some(existingKey) = mapIndex.get(&config.m_u16LogicalAddress) {
+            let strFirstEcu = mapEcus
+                .get(existingKey)
+                .map(|existing| existing.Config().m_strName.clone())
+                .unwrap_or_default();
+            return Err(SimulationError::DuplicateLogicalAddress {
+                u16LogicalAddress: config.m_u16LogicalAddress,
+                strFirstEcu,
+                strSecondEcu: config.m_strName.clone(),
+            });
+        }
+        mapIndex.insert(config.m_u16LogicalAddress, *key);
+    }
+
+    Ok(mapIndex)
+}
+
 /// Refuse an ECU whose identifiers collide with one already started: two ECUs on one request
 /// identifier make routing ambiguous, and two on one response identifier make their answers
 /// indistinguishable on the wire.
 fn RejectDuplicateIdentifiers(
-    mapEcus: &BTreeMap<u32, VirtualEcu>,
+    mapEcus: &BTreeMap<EcuKey, VirtualEcu>,
     config: &Ecu,
     address: &CanAddress,
 ) -> Result<(), SimulationError> {
-    if let Some(existing) = mapEcus.get(&address.m_u32RequestCanId) {
+    if let Some(existing) = mapEcus.get(&EcuKey::Can(address.m_u32RequestCanId)) {
         return Err(SimulationError::DuplicateRequestCanId {
             u32RequestCanId: address.m_u32RequestCanId,
             strFirstEcu: existing.Config().m_strName.clone(),
@@ -986,11 +1168,16 @@ fn RejectDuplicateIdentifiers(
 /// The targets are ordered by response identifier so a broadcast produces answers in the order
 /// CAN arbitration would.
 fn BuildFunctionalTargetMap(
-    mapEcus: &BTreeMap<u32, VirtualEcu>,
+    mapEcus: &BTreeMap<EcuKey, VirtualEcu>,
 ) -> Result<BTreeMap<u32, Vec<u32>>, SimulationError> {
     let mut mapTargets: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
 
-    for (u32RequestCanId, runningEcu) in mapEcus {
+    for (key, runningEcu) in mapEcus {
+        let u32RequestCanId = match key.RequestCanId() {
+            Some(u32RequestCanId) => u32RequestCanId,
+            // A DoIP-only ECU has no CAN identifier to be broadcast to.
+            None => continue,
+        };
         let address = match runningEcu.Config().m_optCanAddress {
             Some(address) => address,
             None => continue,
@@ -1002,7 +1189,7 @@ fn BuildFunctionalTargetMap(
 
         // A broadcast identifier that is also some ECU's own request identifier would make
         // routing ambiguous — the physical branch would always win and shadow the broadcast.
-        if let Some(shadowed) = mapEcus.get(&u32FunctionalCanId) {
+        if let Some(shadowed) = mapEcus.get(&EcuKey::Can(u32FunctionalCanId)) {
             return Err(SimulationError::FunctionalIdCollidesWithPhysical {
                 u32CanId: u32FunctionalCanId,
                 strEcuName: shadowed.Config().m_strName.clone(),
@@ -1012,7 +1199,7 @@ fn BuildFunctionalTargetMap(
         mapTargets
             .entry(u32FunctionalCanId)
             .or_default()
-            .push((address.m_u32ResponseCanId, *u32RequestCanId));
+            .push((address.m_u32ResponseCanId, u32RequestCanId));
     }
 
     let mut mapOrdered: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -1084,4 +1271,12 @@ fn IsOnOrBehindNetwork(ecu: &Ecu, strNetworkId: &str) -> bool {
     ecu.m_vecGatewayForNetworkIds
         .iter()
         .any(|strBehindId| strBehindId == strNetworkId)
+}
+
+/// How an ECU is addressed, for a log line.
+fn DescribeKey(key: EcuKey) -> String {
+    match key {
+        EcuKey::Can(u32RequestCanId) => format!("CAN {u32RequestCanId:03X}"),
+        EcuKey::DoIp(u16LogicalAddress) => format!("DoIP 0x{u16LogicalAddress:04X}"),
+    }
 }
