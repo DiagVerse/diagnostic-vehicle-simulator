@@ -1,7 +1,13 @@
 {
   "simfileVersion": 2,
   "vehicle": "Gatewayed demo vehicle",
-
+  "identity": {
+    "vin": "SIMGATEWAYVIN0001",
+    "eid": "02 00 5E 10 00 01",
+    "gid": "02 00 5E 10 00 02",
+    "furtherAction": "00",
+    "vinGidSyncStatus": "00"
+  },
   "networks": [
     {
       "id": "diag-ethernet",
@@ -29,33 +35,71 @@
       "dataBitrateBps": 2000000
     }
   ],
-
   "ecus": [
     {
       "name": "Central Gateway",
       "network": "diag-ethernet",
-      "gatewayFor": ["powertrain", "body"],
-      "doip": { "logicalAddress": "0x0010" },
+      "gatewayFor": [
+        "powertrain",
+        "body"
+      ],
+      "doip": {
+        "logicalAddress": "0x0010"
+      },
       "can": {
         "request": "0x7E7",
         "response": "0x7EF",
         "addressing": "Normal11Bit"
       },
-      "sessions": ["default", "extended", "programming"],
-      "services": ["10", "11", "19", "22", "27", "31", "3E"],
+      "sessions": [
+        "default",
+        "extended",
+        "programming"
+      ],
+      "services": [
+        "10",
+        "11",
+        "19",
+        "22",
+        "27",
+        "31",
+        "3E"
+      ],
       "sessionServices": {
-        "default": ["10", "22", "3E"],
-        "programming": ["10", "11", "22", "27", "31", "3E"]
+        "default": [
+          "10",
+          "22",
+          "3E"
+        ],
+        "programming": [
+          "10",
+          "11",
+          "22",
+          "27",
+          "31",
+          "3E"
+        ]
       },
       "dids": {
-        "F190": { "text": "SIMGATEWAYVIN0001" },
-        "F18C": { "text": "SIM-GW-0001" },
+        "F190": {
+          "text": "SIMGATEWAYVIN0001"
+        },
+        "F18C": {
+          "text": "SIM-GW-0001"
+        },
         "F186": "03"
       },
       "security": [
-        { "requestSeed": "01", "seed": "11 22 33 44", "key": "AA BB CC DD" }
+        {
+          "requestSeed": "01",
+          "seed": "11 22 33 44",
+          "key": "AA BB CC DD"
+        }
       ],
-      "timing": { "p2Ms": 50, "p2StarMs": 5000 },
+      "timing": {
+        "p2Ms": 50,
+        "p2StarMs": 5000
+      },
       "responses": [
         {
           "request": "22 F1 A0",
@@ -64,35 +108,66 @@
         }
       ]
     },
-
     {
       "name": "Engine",
       "network": "powertrain",
-      "doip": { "logicalAddress": "0x1001" },
+      "doip": {
+        "logicalAddress": "0x1001"
+      },
       "can": {
         "request": "0x7E0",
         "response": "0x7E8",
         "functional": "0x7DF"
       },
-      "sessions": ["default", "extended", "programming"],
-      "services": ["10", "11", "19", "22", "27", "31", "3E"],
+      "sessions": [
+        "default",
+        "extended",
+        "programming"
+      ],
+      "services": [
+        "10",
+        "11",
+        "19",
+        "22",
+        "27",
+        "31",
+        "3E"
+      ],
       "sessionServices": {
-        "default": ["10", "22", "19", "3E"]
+        "default": [
+          "10",
+          "22",
+          "19",
+          "3E"
+        ]
       },
       "dids": {
-        "F190": { "text": "SIMGATEWAYVIN0001" },
-        "F18C": { "text": "SIM-ENGINE-0001" },
+        "F190": {
+          "text": "SIMGATEWAYVIN0001"
+        },
+        "F18C": {
+          "text": "SIM-ENGINE-0001"
+        },
         "F195": "01 02"
       },
       "dtcs": [
-        { "code": "P0300-00", "status": "activeConfirmedWithLamp" },
-        { "code": "P0171-00", "status": "historyConfirmed" }
+        {
+          "code": "P0300-00",
+          "status": "activeConfirmedWithLamp"
+        },
+        {
+          "code": "P0171-00",
+          "status": "historyConfirmed"
+        }
       ],
       "security": [
-        { "requestSeed": "01", "seed": "AB CD EF 01", "key": "12 34 56 78" }
+        {
+          "requestSeed": "01",
+          "seed": "AB CD EF 01",
+          "key": "12 34 56 78"
+        }
       ]
     },
-
     {
       "name": "Transmission",
       "network": "powertrain",
@@ -101,26 +176,50 @@
         "response": "0x7E9",
         "functional": "0x7DF"
       },
-      "sessions": ["default", "extended"],
+      "sessions": [
+        "default",
+        "extended"
+      ],
       "dids": {
-        "F18C": { "text": "SIM-TCM-0001" },
-        "F191": { "text": "SIM-TCM-HW-01" }
+        "F18C": {
+          "text": "SIM-TCM-0001"
+        },
+        "F191": {
+          "text": "SIM-TCM-HW-01"
+        }
       },
-      "dtcs": [{ "code": "P0700-00", "status": "pendingOnly" }]
+      "dtcs": [
+        {
+          "code": "P0700-00",
+          "status": "pendingOnly"
+        }
+      ]
     },
-
     {
       "name": "Body Control Module",
       "network": "body",
-      "doip": { "logicalAddress": "0x1020" },
+      "doip": {
+        "logicalAddress": "0x1020"
+      },
       "can": {
         "request": "0x7A0",
         "response": "0x7A8"
       },
-      "sessions": ["default", "extended"],
-      "services": ["10", "19", "22", "2E", "3E"],
+      "sessions": [
+        "default",
+        "extended"
+      ],
+      "services": [
+        "10",
+        "19",
+        "22",
+        "2E",
+        "3E"
+      ],
       "dids": {
-        "F18C": { "text": "SIM-BCM-0001" },
+        "F18C": {
+          "text": "SIM-BCM-0001"
+        },
         "F110": "00 01"
       },
       "responses": [
@@ -130,9 +229,10 @@
           "note": "Accept any two-byte write to the configuration block; service 0x2E is not one the engine implements."
         }
       ],
-      "timing": { "responseDelayMs": 30 }
+      "timing": {
+        "responseDelayMs": 30
+      }
     },
-
     {
       "name": "Body Zone Controller",
       "network": "body",
@@ -140,22 +240,37 @@
         "request": "0x7A1",
         "response": "0x7A9"
       },
-      "sessions": ["default", "extended"],
-      "dids": { "F18C": { "text": "SIM-BZC-0001" } }
+      "sessions": [
+        "default",
+        "extended"
+      ],
+      "dids": {
+        "F18C": {
+          "text": "SIM-BZC-0001"
+        }
+      }
     },
-
     {
       "name": "Chassis Domain Controller",
       "network": "body",
-      "gatewayFor": ["chassis"],
+      "gatewayFor": [
+        "chassis"
+      ],
       "can": {
         "request": "0x7A2",
         "response": "0x7AA"
       },
-      "sessions": ["default", "extended", "programming"],
-      "dids": { "F18C": { "text": "SIM-CDC-0001" } }
+      "sessions": [
+        "default",
+        "extended",
+        "programming"
+      ],
+      "dids": {
+        "F18C": {
+          "text": "SIM-CDC-0001"
+        }
+      }
     },
-
     {
       "name": "ABS",
       "network": "chassis",
@@ -164,17 +279,37 @@
         "response": "0x18DAF128",
         "addressing": "NormalFixed29Bit"
       },
-      "sessions": ["default", "extended"],
-      "dids": { "F18C": { "text": "SIM-ABS-00001" } },
-      "dtcs": [{ "code": "C0031-11", "status": "activeConfirmed" }]
+      "sessions": [
+        "default",
+        "extended"
+      ],
+      "dids": {
+        "F18C": {
+          "text": "SIM-ABS-00001"
+        }
+      },
+      "dtcs": [
+        {
+          "code": "C0031-11",
+          "status": "activeConfirmed"
+        }
+      ]
     },
-
     {
       "name": "Airbag",
       "network": "diag-ethernet",
-      "doip": { "logicalAddress": "0x1030" },
-      "sessions": ["default", "extended"],
-      "dids": { "F18C": { "text": "SIM-SRS-0001" } }
+      "doip": {
+        "logicalAddress": "0x1030"
+      },
+      "sessions": [
+        "default",
+        "extended"
+      ],
+      "dids": {
+        "F18C": {
+          "text": "SIM-SRS-0001"
+        }
+      }
     }
   ]
 }

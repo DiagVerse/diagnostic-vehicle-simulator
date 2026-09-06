@@ -17,12 +17,13 @@ pub mod encode;
 use core_domain::model::{
     CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode, EchoSpan, Ecu, EcuTiming,
     Network, NetworkKind, OverrideAction, ResponseOverride, SecurityLevel, SessionType, Vehicle,
+    VehicleIdentity,
 };
 use core_domain::Confidence;
 
 use crate::dto::{
-    c_uCurrentVersion, c_uMinSupportedVersion, CanAddressDto, EcuDto, NetworkDto, ResponseDto,
-    SimFileDto, TimingDto, ValueDto,
+    c_uCurrentVersion, c_uMinSupportedVersion, CanAddressDto, EcuDto, IdentityDto, NetworkDto,
+    ResponseDto, SimFileDto, TimingDto, ValueDto,
 };
 use crate::encode::{ParseDtcCode, ParseHexByte, ParseHexBytes, ParseHexPattern, ParseStatusByte};
 
@@ -102,6 +103,7 @@ pub fn LoadFromText(strContent: &str) -> Result<Vehicle, SimFileError> {
         m_strName: file.vehicle,
         m_vecEcus: vecEcus,
         m_vecNetworks: vecNetworks,
+        m_identity: BuildIdentity(file.identity.as_ref())?,
     };
 
     // Order matters: entry points are decided first, because whether the wiring makes sense
@@ -123,6 +125,78 @@ pub fn LoadFromText(strContent: &str) -> Result<Vehicle, SimFileError> {
     );
 
     Ok(vehicle)
+}
+
+/// Read what the vehicle announces about itself.
+///
+/// A VIN is seventeen characters (ISO 3779) and an EID and GID are six bytes each; a file that
+/// gets one of those wrong is refused rather than padded, because a truncated VIN announced
+/// confidently is worse than an absent one.
+fn BuildIdentity(optDto: Option<&IdentityDto>) -> Result<VehicleIdentity, SimFileError> {
+    let dto = match optDto {
+        Some(dto) => dto,
+        None => return Ok(VehicleIdentity::default()),
+    };
+
+    let optVecVin = match &dto.vin {
+        Some(strVin) => {
+            if strVin.len() != 17 {
+                return Err(SimFileError::BadField {
+                    strWhere: "identity".to_string(),
+                    strReason: format!(
+                        "a VIN is 17 characters (ISO 3779); '{strVin}' is {}",
+                        strVin.len()
+                    ),
+                });
+            }
+            Some(strVin.as_bytes().to_vec())
+        }
+        None => None,
+    };
+
+    Ok(VehicleIdentity {
+        m_optVecVin: optVecVin,
+        m_optArrEid: ReadSixBytes(dto.eid.as_deref(), "eid")?,
+        m_optArrGid: ReadSixBytes(dto.gid.as_deref(), "gid")?,
+        m_byFurtherActionRequired: ReadOptionalByte(
+            dto.further_action.as_deref(),
+            "furtherAction",
+        )?,
+        m_byVinGidSyncStatus: ReadOptionalByte(
+            dto.vin_gid_sync_status.as_deref(),
+            "vinGidSyncStatus",
+        )?,
+    })
+}
+
+/// Read exactly six hex bytes, for an EID or a GID.
+fn ReadSixBytes(optStrHex: Option<&str>, strField: &str) -> Result<Option<[u8; 6]>, SimFileError> {
+    let strHex = match optStrHex {
+        Some(strHex) => strHex,
+        None => return Ok(None),
+    };
+
+    let vecBytes = ParseHexBytes(strHex).map_err(|strReason| SimFileError::BadField {
+        strWhere: "identity".to_string(),
+        strReason: format!("{strField}: {strReason}"),
+    })?;
+
+    let arrBytes: [u8; 6] = vecBytes.try_into().map_err(|_| SimFileError::BadField {
+        strWhere: "identity".to_string(),
+        strReason: format!("{strField} is six bytes; '{strHex}' is not"),
+    })?;
+    Ok(Some(arrBytes))
+}
+
+/// Read one optional hex byte, defaulting to zero.
+fn ReadOptionalByte(optStrHex: Option<&str>, strField: &str) -> Result<u8, SimFileError> {
+    match optStrHex {
+        Some(strHex) => ParseHexByte(strHex).map_err(|strReason| SimFileError::BadField {
+            strWhere: "identity".to_string(),
+            strReason: format!("{strField}: {strReason}"),
+        }),
+        None => Ok(0x00),
+    }
 }
 
 /// Turn the file's buses into model networks, refusing two that share an id.

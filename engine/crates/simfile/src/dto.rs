@@ -38,6 +38,32 @@ pub struct SimFileDto {
     pub networks: Vec<NetworkDto>,
     /// The ECUs.
     pub ecus: Vec<EcuDto>,
+    /// What the vehicle tells a DoIP tester about itself. Left out, nothing is programmed —
+    /// which is a real state, and announced as such rather than as a plausible-looking VIN.
+    #[serde(default)]
+    pub identity: Option<IdentityDto>,
+}
+
+/// How a vehicle identifies itself over DoIP (ISO 13400-2 Table 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdentityDto {
+    /// The 17-character VIN, as text.
+    #[serde(default)]
+    pub vin: Option<String>,
+    /// The entity identification: six bytes in hex, conventionally a MAC address.
+    #[serde(default)]
+    pub eid: Option<String>,
+    /// The group identification: six bytes in hex, shared by every entity of one vehicle.
+    #[serde(default)]
+    pub gid: Option<String>,
+    /// ISO 13400-2 Table 6, in hex. `00` no further action; `10` central security required.
+    #[serde(default)]
+    pub further_action: Option<String>,
+    /// ISO 13400-2 Table 7, in hex. `00` synchronized; `10` not — which tells a tester to wait
+    /// and ask again, and is worth being able to inject.
+    #[serde(default)]
+    pub vin_gid_sync_status: Option<String>,
 }
 
 /// One bus.

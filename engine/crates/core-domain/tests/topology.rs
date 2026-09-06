@@ -45,6 +45,7 @@ fn BuildGatewayedVehicle() -> Vehicle {
             BuildNetwork("backbone", true),
             BuildNetwork("powertrain", false),
         ],
+        m_identity: Default::default(),
     }
 }
 

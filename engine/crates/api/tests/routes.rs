@@ -25,6 +25,7 @@ fn EmptyState() -> Arc<AppState> {
         busy_ecus: Mutex::new(BTreeSet::new()),
         hardware: Mutex::new(api::hardware::HardwareState::default()),
         traffic: api::traffic::TrafficChannel::New(),
+        doip: Default::default(),
     })
 }
 
@@ -53,6 +54,9 @@ async fn every_simulation_route_is_reachable() {
         ("GET", "/simulation/state", ""),
         ("GET", "/hw/ports", ""),
         ("GET", "/hw/status", ""),
+        ("GET", "/doip/status", ""),
+        ("POST", "/doip/stop", "{}"),
+        ("POST", "/doip/start", r#"{"bind":"127.0.0.1:0"}"#),
         ("POST", "/hw/stop", "{}"),
         ("GET", "/simulation/topology", ""),
         ("POST", "/simulation/reset", "{}"),

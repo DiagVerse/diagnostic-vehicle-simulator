@@ -13,6 +13,7 @@ members = [
     "crates/can",
     "crates/isotp",
     "crates/doip",
+    "crates/doip-server",
     "crates/reconstruct",
     "crates/simulation",
     "crates/serial-can",
@@ -56,6 +57,7 @@ ecu = { path = "crates/ecu" }
 can = { path = "crates/can" }
 isotp = { path = "crates/isotp" }
 doip = { path = "crates/doip" }
+doip-server = { path = "crates/doip-server" }
 reconstruct = { path = "crates/reconstruct" }
 simulation = { path = "crates/simulation" }
 serial-can = { path = "crates/serial-can" }

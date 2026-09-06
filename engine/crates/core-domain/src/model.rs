@@ -1159,6 +1159,13 @@ pub struct Vehicle {
     /// rendered as "unknown" rather than filled in with a default bus.
     #[serde(default)]
     pub m_vecNetworks: Vec<Network>,
+
+    /// How this vehicle identifies itself to a DoIP tester.
+    ///
+    /// Defaulted on deserialization so every model written before DoIP existed still loads — as
+    /// a vehicle with nothing programmed, which is exactly what it is.
+    #[serde(default)]
+    pub m_identity: VehicleIdentity,
 }
 
 impl Vehicle {
@@ -1373,6 +1380,7 @@ mod tests {
             m_strName: "TestVehicle".to_string(),
             m_vecEcus: Vec::new(),
             m_vecNetworks: Vec::new(),
+            m_identity: Default::default(),
         };
         vehicle.m_vecEcus.push(Ecu::New("Engine_ECU", 0x1001));
 

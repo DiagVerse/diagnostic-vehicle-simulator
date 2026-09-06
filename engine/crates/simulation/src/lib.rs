@@ -413,6 +413,7 @@ impl SimulationService {
             // A hand-built vehicle has no buses until someone says so, the same way a
             // reconstructed one never does.
             m_vecNetworks: Vec::new(),
+            m_identity: Default::default(),
         });
 
         tracing::info!(vehicle = %strName, "empty vehicle created");

@@ -1,0 +1,21 @@
+[package]
+name = "doip-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The DoIP entity: UDP discovery and a TCP diagnostic server over the loaded simulation."
+
+[dependencies]
+doip.workspace = true
+simulation.workspace = true
+application.workspace = true
+core-domain.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uds-plugin.workspace = true
+plugin-contract.workspace = true
+abi_stable.workspace = true
