@@ -1,0 +1,11 @@
+[package]
+name = "doip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DoIP (ISO 13400-2:2019) message codec — the OSI L5/L6 framing that replaces ISO-TP on Ethernet."
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
