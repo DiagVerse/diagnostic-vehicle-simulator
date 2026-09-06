@@ -56,6 +56,14 @@ pub struct ResponsePlan {
     pub m_vecConformanceWarnings: Vec<String>,
     /// How many ResponsePending messages this plan contains.
     pub m_u8ResponsePendingCount: u8,
+
+    /// True when a user-defined response override produced these bytes rather than the
+    /// protocol plugin.
+    ///
+    /// Recorded so a monitor can say so. "Did my override actually take effect?" is otherwise
+    /// answerable only by knowing what the plugin would have said and noticing the difference,
+    /// which is a lot to ask of someone watching a live bus.
+    pub m_bIsOverridden: bool,
 }
 
 impl ResponsePlan {
@@ -168,6 +176,8 @@ pub fn BuildResponsePlan(
     );
 
     ResponsePlan {
+        // Set by the caller, which is the only thing that knows whether an override matched.
+        m_bIsOverridden: false,
         m_vecSteps: vecSteps,
         m_bIsFinalResponseDropped: bIsFinalResponseDropped,
         m_bIsIsoConformant: vecWarnings.is_empty(),

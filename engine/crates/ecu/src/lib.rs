@@ -259,17 +259,20 @@ impl VirtualEcu {
         // engine manufactured, and vice versa.
         let bWasSuppressedByProtocol = vecResponse.is_empty();
         let optOverridden = self.ApplyResponseOverride(vecRequest, bWasSuppressedByProtocol);
+        let bIsOverridden = optOverridden.is_some();
         if let Some(vecOverridden) = optOverridden {
             self.DiscardStateChangesOnRefusal(byRequestSid, &vecResponse, &vecOverridden);
             vecResponse = vecOverridden;
         }
 
-        BuildResponsePlan(
+        let mut plan = BuildResponsePlan(
             &self.m_config.m_timing,
             byRequestSid,
             &vecResponse,
             u8PendingCount,
-        )
+        );
+        plan.m_bIsOverridden = bIsOverridden;
+        plan
     }
 
     /// Apply the user's answer for this request, if one matches.

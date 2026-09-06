@@ -397,7 +397,10 @@ function EventBody({ event }: { event: TrafficEvent }) {
                   IsNegative(response.responseHex) ? 'text-amber-400' : 'text-emerald-400'
                 }
               >
-                {response.ecuName}: {response.responseHex}{' '}
+                {response.ecuName}: {response.responseHex}
+                {/* Marked so "did my override take effect?" is answerable from the log, rather
+                    than needing you to know what the plugin would otherwise have said. */}
+                {response.overridden && <span className="text-sky-400"> ⟵override</span>}{' '}
               </span>
             ))
           ) : (

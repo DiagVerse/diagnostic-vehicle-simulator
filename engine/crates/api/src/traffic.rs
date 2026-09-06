@@ -131,6 +131,8 @@ pub struct ExchangeResponse {
     pub response_can_id_hex: String,
     pub response_hex: String,
     pub suppressed: bool,
+    /// True when a user-defined override produced this answer rather than the UDS plugin.
+    pub overridden: bool,
 }
 
 /// Wall-clock milliseconds. Falls back to zero rather than panicking if the clock is before the
@@ -303,6 +305,7 @@ fn DescribeOutcome(
                     response_can_id_hex: FormatCanId(routed.m_u32ResponseCanId),
                     response_hex: FormatHexBytes(&routed.m_vecResponse),
                     suppressed: routed.IsSuppressed(),
+                    overridden: routed.m_plan.m_bIsOverridden,
                 })
                 .collect();
 

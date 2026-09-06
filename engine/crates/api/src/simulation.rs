@@ -223,6 +223,8 @@ pub struct SimulationResponseDto {
     pub final_at_ms: Option<u32>,
     pub response_pending_count: u8,
     pub final_response_dropped: bool,
+    /// True when a user-defined override produced this answer rather than the UDS plugin.
+    pub overridden: bool,
     /// False when the schedule knowingly breaks an ISO 14229-2 timing rule; the messages are
     /// still sent, but the engine does not present them as conformant.
     pub iso_conformant: bool,
@@ -1395,6 +1397,7 @@ fn BuildResponseDto(response: &RoutedResponse) -> SimulationResponseDto {
         final_at_ms: response.m_plan.FinalAtMs(),
         response_pending_count: response.m_plan.m_u8ResponsePendingCount,
         final_response_dropped: response.m_plan.m_bIsFinalResponseDropped,
+        overridden: response.m_plan.m_bIsOverridden,
         iso_conformant: response.m_plan.m_bIsIsoConformant,
         conformance_warnings: response.m_plan.m_vecConformanceWarnings.clone(),
     }
@@ -1713,6 +1716,7 @@ mod emitter_tests {
                 m_bIsIsoConformant: true,
                 m_vecConformanceWarnings: Vec::new(),
                 m_u8ResponsePendingCount: 1,
+                m_bIsOverridden: false,
             },
         }
     }
@@ -1953,6 +1957,7 @@ fn PublishExchange(
             response_can_id_hex: response.response_can_id_hex.clone(),
             response_hex: response.response_hex.clone(),
             suppressed: response.suppressed,
+            overridden: response.overridden,
         })
         .collect();
 
