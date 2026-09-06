@@ -19,7 +19,9 @@ pub mod execute;
 use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
-use core_domain::model::{CanAddress, Ecu, EcuTiming, Network, ResponseOverride, Vehicle};
+use core_domain::model::{
+    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, Vehicle, VehicleIdentity,
+};
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
 
@@ -706,6 +708,29 @@ impl SimulationService {
             "ECU placement set"
         );
         Ok(())
+    }
+
+    /// Change what this vehicle tells a DoIP tester about itself.
+    ///
+    /// Written to the loaded model, which is what the DoIP entity reads when it builds a
+    /// vehicle announcement — so a change is visible to the next identification request without
+    /// restarting anything.
+    pub fn SetVehicleIdentity(&mut self, identity: VehicleIdentity) -> Result<(), SimulationError> {
+        let vehicle = self
+            .m_optVehicle
+            .as_mut()
+            .ok_or(SimulationError::NoVehicleLoaded)?;
+
+        vehicle.m_identity = identity;
+        tracing::info!("vehicle identity updated");
+        Ok(())
+    }
+
+    /// What this vehicle currently tells a tester about itself.
+    pub fn VehicleIdentity(&self) -> Option<&VehicleIdentity> {
+        self.m_optVehicle
+            .as_ref()
+            .map(|vehicle| &vehicle.m_identity)
     }
 
     /// Switch one ECU on or off.

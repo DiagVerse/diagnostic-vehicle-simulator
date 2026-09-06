@@ -15,6 +15,8 @@ use doip::messages::*;
 use doip::payload::PayloadType;
 use simulation::{RoutingOutcome, SimulationService};
 
+use crate::settings::DoIpSettings;
+
 /// How many concurrent TCP data sockets this entity serves.
 ///
 /// The standard names no value — it is manufacturer discretion — and requires `<n+1>` resources
@@ -63,19 +65,49 @@ pub struct DoIpEntity {
     m_arcSimulation: Arc<Mutex<SimulationService>>,
     /// The logical address this entity answers vehicle identification on, and reports as its own.
     m_u16EntityAddress: u16,
-    m_limits: HeaderLimits,
+    /// What this entity says about itself, and what it has been told to say instead.
+    ///
+    /// Shared rather than owned so a change takes effect on a running entity: being able to
+    /// inject a fault only by restarting the server would make it useless for reproducing one
+    /// mid-session, which is exactly when a fault matters.
+    m_arcMtxSettings: Arc<Mutex<DoIpSettings>>,
     /// The connection table, keyed by whatever the transport calls a socket.
     m_mapConnections: BTreeMap<u64, Connection>,
 }
 
 impl DoIpEntity {
-    /// Build an entity over a loaded simulation.
-    pub fn New(arcSimulation: Arc<Mutex<SimulationService>>, u16EntityAddress: u16) -> Self {
+    /// Build an entity over a loaded simulation, with settings it shares with its caller.
+    pub fn New(
+        arcSimulation: Arc<Mutex<SimulationService>>,
+        u16EntityAddress: u16,
+        arcMtxSettings: Arc<Mutex<DoIpSettings>>,
+    ) -> Self {
         DoIpEntity {
             m_arcSimulation: arcSimulation,
             m_u16EntityAddress: u16EntityAddress,
-            m_limits: HeaderLimits::default(),
+            m_arcMtxSettings: arcMtxSettings,
             m_mapConnections: BTreeMap::new(),
+        }
+    }
+
+    /// A snapshot of the settings, taken once per message so one answer cannot be built from
+    /// two different configurations.
+    fn Settings(&self) -> DoIpSettings {
+        self.m_arcMtxSettings
+            .lock()
+            .expect("DoIP settings mutex poisoned")
+            .clone()
+    }
+
+    /// The header limits this entity currently enforces.
+    ///
+    /// Derived from the settings rather than fixed, so the maximum data size a tester is *told*
+    /// and the one actually enforced cannot disagree — a conformance test cross-checks them.
+    fn Limits(&self) -> HeaderLimits {
+        let u32MaxDataSize = self.Settings().m_u32MaxDataSize;
+        HeaderLimits {
+            m_u32MaxDataSize: u32MaxDataSize,
+            m_u32AvailableMemory: u32MaxDataSize,
         }
     }
 
@@ -118,7 +150,12 @@ impl DoIpEntity {
     /// The vehicle identification requests are the reason the header's version byte cannot be
     /// enforced here: a tester that has not yet found the vehicle has nothing to base it on.
     pub fn HandleUdp(&self, arrDatagram: &[u8]) -> Reaction {
-        let header = match header::ReadHeader(arrDatagram, self.m_limits) {
+        let settings = self.Settings();
+        if let Some(byForced) = settings.m_optByForcedHeaderNack {
+            return self.ForcedHeaderNackReaction(0x03, byForced);
+        }
+
+        let header = match header::ReadHeader(arrDatagram, self.Limits()) {
             Ok(header) => header,
             Err(nack) => return self.NackReaction(0x03, nack),
         };
@@ -128,6 +165,11 @@ impl DoIpEntity {
 
         match header.m_payloadType {
             PayloadType::VehicleIdentificationRequest => {
+                // A vehicle that cannot be discovered is a real failure to reproduce: an entity
+                // still booting, or one the tester cannot reach.
+                if settings.m_bSuppressIdentificationResponse {
+                    return Reaction::Silence();
+                }
                 Reaction::Reply(self.BuildAnnouncement(byReplyVersion))
             }
 
@@ -135,7 +177,8 @@ impl DoIpEntity {
                 // A non-match is answered with silence, not a negative response: the tester is
                 // asking "is this you?" of every vehicle in range, and only the right one speaks.
                 let identity = self.Identity();
-                if vecPayload == identity.EidBytes() {
+                if vecPayload == identity.EidBytes() && !settings.m_bSuppressIdentificationResponse
+                {
                     Reaction::Reply(self.BuildAnnouncement(byReplyVersion))
                 } else {
                     Reaction::Silence()
@@ -144,7 +187,8 @@ impl DoIpEntity {
 
             PayloadType::VehicleIdentificationRequestByVin => {
                 let identity = self.Identity();
-                if vecPayload == identity.VinBytes() {
+                if vecPayload == identity.VinBytes() && !settings.m_bSuppressIdentificationResponse
+                {
                     Reaction::Reply(self.BuildAnnouncement(byReplyVersion))
                 } else {
                     Reaction::Silence()
@@ -154,16 +198,16 @@ impl DoIpEntity {
             PayloadType::PowerModeRequest => Reaction::Reply(header::WriteMessage(
                 byReplyVersion,
                 PayloadType::PowerModeResponse,
-                &[c_byPowerModeReady],
+                &[settings.m_byPowerMode],
             )),
 
             PayloadType::EntityStatusRequest => {
                 let status = EntityStatus {
-                    m_byNodeType: c_byNodeTypeGateway,
+                    m_byNodeType: settings.m_byNodeType,
                     // The count excludes the reserve socket kept for socket handling.
-                    m_byMaxSockets: c_uMaxConnections as u8,
+                    m_byMaxSockets: settings.m_byMaxSockets,
                     m_byOpenSockets: self.m_mapConnections.len() as u8,
-                    m_optU32MaxDataSize: Some(self.m_limits.m_u32MaxDataSize),
+                    m_optU32MaxDataSize: Some(settings.m_u32MaxDataSize),
                 };
                 Reaction::Reply(header::WriteMessage(
                     byReplyVersion,
@@ -190,7 +234,11 @@ impl DoIpEntity {
         arrMessage: &[u8],
         protocol: &dyn ProtocolHandler,
     ) -> Reaction {
-        let header = match header::ReadHeader(arrMessage, self.m_limits) {
+        if let Some(byForced) = self.Settings().m_optByForcedHeaderNack {
+            return self.ForcedHeaderNackReaction(0x03, byForced);
+        }
+
+        let header = match header::ReadHeader(arrMessage, self.Limits()) {
             Ok(header) => header,
             Err(nack) => return self.NackReaction(0x03, nack),
         };
@@ -268,17 +316,28 @@ impl DoIpEntity {
         });
         let bHasFreeSocket = self.m_mapConnections.len() <= c_uMaxConnections;
 
+        let optByForced = self
+            .m_arcMtxSettings
+            .lock()
+            .expect("DoIP settings mutex poisoned")
+            .m_optByForcedRoutingActivationCode;
+
         let connection = match self.m_mapConnections.get_mut(&u64Socket) {
             Some(connection) => connection,
             None => return Reaction::Silence(),
         };
 
-        let outcome = connection.DecideRoutingActivation(
-            &request,
-            IsAcceptableTesterAddress(request.m_u16SourceAddress),
-            bIsActiveElsewhere,
-            bHasFreeSocket,
-        );
+        let outcome = match optByForced.and_then(ForcedRoutingOutcome) {
+            // A forced denial is still applied to the connection, so the socket closes or is
+            // held exactly as the real decision would have made it.
+            Some(forced) => forced,
+            None => connection.DecideRoutingActivation(
+                &request,
+                IsAcceptableTesterAddress(request.m_u16SourceAddress),
+                bIsActiveElsewhere,
+                bHasFreeSocket,
+            ),
+        };
         connection.ApplyRoutingActivation(&request, outcome);
 
         tracing::info!(
@@ -342,6 +401,14 @@ impl DoIpEntity {
                 return Reaction::Silence();
             }
         };
+
+        // Injected before anything is routed, so the tester sees the refusal a real entity
+        // would give rather than an answer followed by one.
+        if let Some(byForced) = self.Settings().m_optByForcedDiagnosticNack {
+            if let Some(nack) = ForcedDiagnosticNack(byForced) {
+                return self.DiagnosticNackReaction(byReplyVersion, &request, nack);
+            }
+        }
 
         // The source address must be the one activated on this socket. This is the one
         // diagnostic rejection that resets the connection.
@@ -452,6 +519,22 @@ impl DoIpEntity {
         }
     }
 
+    /// An injected generic header negative acknowledgement.
+    ///
+    /// Built from the code directly rather than from a `HeaderNack`, because the point is to
+    /// send a refusal the entity has no genuine reason for — and the closing rule still has to
+    /// match the code, or a tester would see a combination the standard never produces.
+    fn ForcedHeaderNackReaction(&self, byReplyVersion: u8, byCode: u8) -> Reaction {
+        let vecMessage =
+            header::WriteMessage(byReplyVersion, PayloadType::GenericHeaderNack, &[byCode]);
+        // 0x00 and 0x04 close the socket; 0x01 through 0x03 discard the message and keep it.
+        if byCode == 0x00 || byCode == 0x04 {
+            Reaction::ReplyAndClose(vecMessage)
+        } else {
+            Reaction::Reply(vecMessage)
+        }
+    }
+
     /// A generic header negative acknowledgement, closing the socket if that code requires it.
     fn NackReaction(&self, byReplyVersion: u8, nack: HeaderNack) -> Reaction {
         let vecMessage = doip::BuildHeaderNack(byReplyVersion, nack);
@@ -489,6 +572,38 @@ impl DoIpEntity {
             .map(|vehicle| vehicle.m_identity.clone())
             .unwrap_or_default()
     }
+}
+
+/// Turn a forced routing activation code into the outcome that carries it.
+///
+/// Only the codes this entity can actually produce are accepted; a value it has no meaning for
+/// is ignored rather than sent, because putting an undefined response code on the wire tests a
+/// tester against something no vehicle would ever say.
+fn ForcedRoutingOutcome(byCode: u8) -> Option<RoutingActivationOutcome> {
+    let outcome = match byCode {
+        0x00 => RoutingActivationOutcome::DeniedUnknownSourceAddress,
+        0x01 => RoutingActivationOutcome::DeniedAllSocketsRegistered,
+        0x02 => RoutingActivationOutcome::DeniedSourceAddressMismatch,
+        0x03 => RoutingActivationOutcome::DeniedSourceAddressInUse,
+        0x04 => RoutingActivationOutcome::DeniedMissingAuthentication,
+        0x06 => RoutingActivationOutcome::DeniedUnsupportedActivationType,
+        0x10 => RoutingActivationOutcome::Activated,
+        _ => return None,
+    };
+    Some(outcome)
+}
+
+/// Turn a forced diagnostic NACK code into the one it names.
+fn ForcedDiagnosticNack(byCode: u8) -> Option<DiagnosticNack> {
+    let nack = match byCode {
+        0x02 => DiagnosticNack::InvalidSourceAddress,
+        0x03 => DiagnosticNack::UnknownTargetAddress,
+        0x04 => DiagnosticNack::MessageTooLarge,
+        0x05 => DiagnosticNack::OutOfMemory,
+        0x06 => DiagnosticNack::TargetUnreachable,
+        _ => return None,
+    };
+    Some(nack)
 }
 
 /// Whether this entity will talk to a tester at that address.

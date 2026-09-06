@@ -26,7 +26,7 @@ use axum::{
 };
 use core_domain::model::{
     CanAddress, CanAddressingMode, EchoSpan, Ecu, EcuTiming, Network, NetworkKind, OverrideAction,
-    ResponseOverride, SessionType, Vehicle,
+    ResponseOverride, SessionType, Vehicle, VehicleIdentity,
 };
 use core_domain::Confidence;
 use ecu::VirtualEcu;
@@ -2095,4 +2095,110 @@ pub fn FormatEcuHandle(key: EcuKey) -> String {
         EcuKey::Can(u32RequestCanId) => FormatCanId(u32RequestCanId),
         EcuKey::DoIp(u16LogicalAddress) => format!("doip-{u16LogicalAddress:04X}"),
     }
+}
+
+/// What a vehicle tells a DoIP tester about itself.
+///
+/// Hex strings rather than byte arrays, because that is how a VIN, an EID and a GID are written
+/// down everywhere else — and the VIN is text, so it is text here.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VehicleIdentityDto {
+    /// The 17-character VIN. Null means not programmed, which is a real state and is announced
+    /// with ISO 13400-2 Table 1's invalidity fill rather than as a plausible-looking wrong VIN.
+    pub vin: Option<String>,
+    /// Six bytes of entity identification, in hex.
+    pub eid_hex: Option<String>,
+    /// Six bytes of group identification, in hex.
+    pub gid_hex: Option<String>,
+    /// ISO 13400-2 Table 6: `0x00` no further action, `0x10` central security required.
+    pub further_action_required: u8,
+    /// ISO 13400-2 Table 7: `0x00` synchronized, `0x10` not — which tells a tester to wait and
+    /// ask again, and is worth being able to inject.
+    pub vin_gid_sync_status: u8,
+}
+
+/// GET /simulation/identity — what the loaded vehicle announces.
+pub async fn GetVehicleIdentity(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<VehicleIdentityDto>, ApiError> {
+    let simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    let identity = simulation
+        .VehicleIdentity()
+        .ok_or_else(|| ApiError::Conflict("no vehicle is loaded".to_string()))?;
+
+    Ok(Json(BuildIdentityDto(identity)))
+}
+
+/// PUT /simulation/identity — change what it announces.
+pub async fn PutVehicleIdentity(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<VehicleIdentityDto>,
+) -> Result<Json<VehicleIdentityDto>, ApiError> {
+    let identity = BuildIdentity(&body)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .SetVehicleIdentity(identity)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+
+    let stored = simulation
+        .VehicleIdentity()
+        .expect("the identity was just set");
+    Ok(Json(BuildIdentityDto(stored)))
+}
+
+fn BuildIdentityDto(identity: &VehicleIdentity) -> VehicleIdentityDto {
+    VehicleIdentityDto {
+        vin: identity
+            .m_optVecVin
+            .as_ref()
+            .map(|vecVin| String::from_utf8_lossy(vecVin).to_string()),
+        eid_hex: identity.m_optArrEid.map(|arrEid| FormatHex(&arrEid)),
+        gid_hex: identity.m_optArrGid.map(|arrGid| FormatHex(&arrGid)),
+        further_action_required: identity.m_byFurtherActionRequired,
+        vin_gid_sync_status: identity.m_byVinGidSyncStatus,
+    }
+}
+
+/// Read an identity, refusing anything that could not go on the wire.
+fn BuildIdentity(body: &VehicleIdentityDto) -> Result<VehicleIdentity, ApiError> {
+    let optVecVin = match &body.vin {
+        Some(strVin) if strVin.trim().is_empty() => None,
+        Some(strVin) => {
+            // A VIN is seventeen characters (ISO 3779). Padding a short one would announce a
+            // VIN that is not this vehicle's, which is worse than announcing none.
+            if strVin.len() != 17 {
+                return Err(ApiError::BadRequest(format!(
+                    "a VIN is 17 characters (ISO 3779); '{strVin}' is {}",
+                    strVin.len()
+                )));
+            }
+            Some(strVin.as_bytes().to_vec())
+        }
+        None => None,
+    };
+
+    Ok(VehicleIdentity {
+        m_optVecVin: optVecVin,
+        m_optArrEid: ReadSixBytes(body.eid_hex.as_deref(), "eid")?,
+        m_optArrGid: ReadSixBytes(body.gid_hex.as_deref(), "gid")?,
+        m_byFurtherActionRequired: body.further_action_required,
+        m_byVinGidSyncStatus: body.vin_gid_sync_status,
+    })
+}
+
+/// Read exactly six hex bytes, for an EID or a GID.
+fn ReadSixBytes(optStrHex: Option<&str>, strField: &str) -> Result<Option<[u8; 6]>, ApiError> {
+    let strHex = match optStrHex {
+        Some(strHex) if !strHex.trim().is_empty() => strHex,
+        _ => return Ok(None),
+    };
+
+    let vecBytes = ParseHex(strHex)
+        .map_err(|strReason| ApiError::BadRequest(format!("{strField}: {strReason}")))?;
+    let arrBytes: [u8; 6] = vecBytes
+        .try_into()
+        .map_err(|_| ApiError::BadRequest(format!("{strField} is six bytes; '{strHex}' is not")))?;
+    Ok(Some(arrBytes))
 }

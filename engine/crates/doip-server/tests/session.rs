@@ -101,7 +101,11 @@ async fn ConnectTester() -> (doip_server::ServerHandle, TcpStream) {
     simulation.Start();
 
     let arcSimulation = Arc::new(Mutex::new(simulation));
-    let arcEntity = Arc::new(Mutex::new(DoIpEntity::New(arcSimulation, c_u16Gateway)));
+    let arcEntity = Arc::new(Mutex::new(DoIpEntity::New(
+        arcSimulation,
+        c_u16Gateway,
+        Arc::new(Mutex::new(doip_server::DoIpSettings::default())),
+    )));
 
     // Port 0: the OS picks a free one, so the tests do not fight each other or whatever else is
     // on 13400 on this machine.
@@ -340,4 +344,137 @@ async fn an_unknown_payload_type_is_refused_without_closing_the_socket() {
     assert_eq!(ActivateRouting(&mut stream, c_u16Tester, 0x00).await, 0x10);
 
     handle.Stop();
+}
+
+// ==========================================================================================
+// The entity's settings, and the faults they inject.
+// ==========================================================================================
+
+use doip_server::DoIpSettings;
+
+/// Start a server whose settings this test can change while it runs.
+async fn ConnectWithSettings() -> (
+    doip_server::ServerHandle,
+    TcpStream,
+    Arc<Mutex<DoIpSettings>>,
+) {
+    let mut simulation = SimulationService::New();
+    simulation
+        .LoadFromSimFileText(c_strSimFile)
+        .expect("the test simfile should load");
+    simulation.Start();
+
+    let arcSettings = Arc::new(Mutex::new(DoIpSettings::default()));
+    let arcEntity = Arc::new(Mutex::new(DoIpEntity::New(
+        Arc::new(Mutex::new(simulation)),
+        c_u16Gateway,
+        Arc::clone(&arcSettings),
+    )));
+
+    let handle = DoIpServer::Start(
+        arcEntity,
+        "127.0.0.1:0".parse().expect("a valid address"),
+        Arc::new(UdsHandler),
+    )
+    .await
+    .expect("the server should bind");
+
+    let stream = TcpStream::connect(handle.TcpAddress())
+        .await
+        .expect("the tester should connect");
+    (handle, stream, arcSettings)
+}
+
+#[tokio::test]
+async fn a_forced_routing_activation_code_is_what_the_tester_gets() {
+    let (handle, mut stream, arcSettings) = ConnectWithSettings().await;
+
+    arcSettings
+        .lock()
+        .expect("settings mutex")
+        .m_optByForcedRoutingActivationCode = Some(0x06);
+
+    assert_eq!(
+        ActivateRouting(&mut stream, c_u16Tester, 0x00).await,
+        0x06,
+        "a request that would normally succeed is refused"
+    );
+
+    handle.Stop();
+}
+
+#[tokio::test]
+async fn a_forced_diagnostic_nack_replaces_the_answer() {
+    // Injected before anything is routed, so the tester sees the refusal a real entity would
+    // give rather than an answer followed by one.
+    let (handle, mut stream, arcSettings) = ConnectWithSettings().await;
+    ActivateRouting(&mut stream, c_u16Tester, 0x00).await;
+
+    arcSettings
+        .lock()
+        .expect("settings mutex")
+        .m_optByForcedDiagnosticNack = Some(0x03);
+
+    SendDiagnostic(&mut stream, c_u16Airbag, &[0x22, 0xF1, 0x90]).await;
+
+    let received = ReadMessage(&mut stream).await;
+    assert_eq!(received.m_payloadType, PayloadType::DiagnosticMessageNack);
+    assert_eq!(received.m_vecPayload[4], 0x03);
+
+    handle.Stop();
+}
+
+#[tokio::test]
+async fn a_forced_header_nack_refuses_a_message_before_it_is_dispatched() {
+    let (handle, mut stream, arcSettings) = ConnectWithSettings().await;
+
+    arcSettings
+        .lock()
+        .expect("settings mutex")
+        .m_optByForcedHeaderNack = Some(0x01);
+
+    let vecPayload = c_u16Tester.to_be_bytes().to_vec();
+    stream
+        .write_all(&header::WriteMessage(
+            0x03,
+            PayloadType::AliveCheckResponse,
+            &vecPayload,
+        ))
+        .await
+        .expect("write");
+
+    let received = ReadMessage(&mut stream).await;
+    assert_eq!(received.m_payloadType, PayloadType::GenericHeaderNack);
+    assert_eq!(received.m_vecPayload[0], 0x01);
+
+    handle.Stop();
+}
+
+#[tokio::test]
+async fn a_settings_change_takes_effect_without_restarting_the_entity() {
+    // The reason settings are shared rather than owned: being able to inject a fault only by
+    // restarting would make it useless for reproducing one mid-session, which is when a fault
+    // actually matters.
+    let (handle, mut stream, arcSettings) = ConnectWithSettings().await;
+
+    assert_eq!(ActivateRouting(&mut stream, c_u16Tester, 0x00).await, 0x10);
+
+    arcSettings
+        .lock()
+        .expect("settings mutex")
+        .m_optByForcedRoutingActivationCode = Some(0x00);
+
+    // The same socket, the same tester, mid-session.
+    assert_eq!(ActivateRouting(&mut stream, c_u16Tester, 0x00).await, 0x00);
+
+    handle.Stop();
+}
+
+#[tokio::test]
+async fn default_settings_inject_nothing() {
+    // An entity nobody has configured must behave exactly as it did before settings existed.
+    let settings = DoIpSettings::default();
+    assert!(!settings.IsInjectingFaults());
+    assert_eq!(settings.m_byPowerMode, 0x01);
+    assert_eq!(settings.m_byNodeType, 0x00);
 }

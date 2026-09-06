@@ -152,6 +152,52 @@ export interface SimulationRequestResult {
   silencedReason: string | null
 }
 
+/** Whether the simulation is reachable over Ethernet. */
+export interface DoIpStatus {
+  running: boolean
+  /** The address actually bound, which differs from the request when port 0 was asked for. */
+  boundAddress: string | null
+  entityAddressHex: string | null
+  /** Every logical address the loaded vehicle answers on, so you know what to target. */
+  logicalAddressesHex: string[]
+}
+
+/** What a vehicle tells a DoIP tester about itself (ISO 13400-2 Table 5). */
+export interface VehicleIdentity {
+  /** 17 characters. Null means not programmed, announced as such rather than as a wrong VIN. */
+  vin: string | null
+  /** Six bytes of entity identification, in hex. */
+  eidHex: string | null
+  /** Six bytes of group identification, in hex. */
+  gidHex: string | null
+  /** Table 6: 0x00 no further action, 0x10 central security required. */
+  furtherActionRequired: number
+  /** Table 7: 0x00 synchronized, 0x10 not — which tells a tester to wait and ask again. */
+  vinGidSyncStatus: number
+}
+
+/** What the DoIP entity says about itself, and what it has been told to say instead. */
+export interface DoIpSettings {
+  /** 0x00 not ready, 0x01 ready, 0x02 not supported. */
+  powerMode: number
+  /** 0x00 gateway, 0x01 node. */
+  nodeType: number
+  /** Sockets reported, excluding the reserve the standard requires. */
+  maxSockets: number
+  /** Reported and enforced — the two must agree. */
+  maxDataSize: number
+  /** Answer nothing to a vehicle identification request. */
+  suppressIdentificationResponse: boolean
+  /** Force this routing activation response code. Null to decide normally. */
+  forcedRoutingActivationCode: number | null
+  /** NACK every diagnostic message with this code. Null to route normally. */
+  forcedDiagnosticNack: number | null
+  /** Refuse every message with this header NACK code. Null to read them normally. */
+  forcedHeaderNack: number | null
+  /** True when any of the above makes the entity behave as a healthy one would not. */
+  isInjectingFaults: boolean
+}
+
 /** A serial port this machine offers. */
 export interface SerialPort {
   name: string
@@ -402,6 +448,14 @@ export const api = {
     putJson<Topology>(`/simulation/ecus/${handle}/placement`, placement),
   simulationSetEcuEnabled: (handle: string, enabled: boolean) =>
     putJson<SimulationState>(`/simulation/ecus/${handle}/enabled`, { enabled }),
+  doipStatus: () => getJson<DoIpStatus>('/doip/status'),
+  doipStart: (bind: string) => postJson<DoIpStatus>('/doip/start', { bind }),
+  doipStop: () => postJson<DoIpStatus>('/doip/stop', {}),
+  vehicleIdentity: () => getJson<VehicleIdentity>('/simulation/identity'),
+  setVehicleIdentity: (identity: VehicleIdentity) =>
+    putJson<VehicleIdentity>('/simulation/identity', identity),
+  doipSettings: () => getJson<DoIpSettings>('/doip/settings'),
+  setDoIpSettings: (settings: DoIpSettings) => putJson<DoIpSettings>('/doip/settings', settings),
   serialPorts: () => getJson<SerialPorts>('/hw/ports'),
   hardwareStatus: () => getJson<HardwareStatus>('/hw/status'),
   hardwareStart: (port: string, bitrateBps: number) =>
