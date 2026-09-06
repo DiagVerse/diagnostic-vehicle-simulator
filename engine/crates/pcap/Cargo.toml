@@ -1,0 +1,11 @@
+[package]
+name = "pcap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Capture file parsing: pcap and pcapng, Ethernet to TCP/UDP payloads."
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
