@@ -166,6 +166,7 @@ impl CanBridge {
             // Flow control is per ECU, not per link: each one declares how fast it is willing
             // to be sent a multi-frame request, exactly as a real ECU does.
             let paramsForEcu = self.ParametersFor(runningEcu.Timing());
+            WarnIfPacingCannotWork(runningEcu.Config().m_strName.as_str(), paramsForEcu);
 
             mapEndpoints.insert(
                 u32RequestCanId,
@@ -518,6 +519,26 @@ impl CanBridge {
             tracing::warn!(%error, canId = format!("{u32CanId:03X}"), "could not transmit a frame");
         }
     }
+}
+
+/// Say so when an ECU asks a tester for more than a serial link is likely to carry.
+///
+/// BlockSize 0 means "send every ConsecutiveFrame back to back". That is the fastest setting
+/// and the right one over a link with bandwidth to spare — but an SLCAN dongle on a 115200 baud
+/// line carries roughly an eighth of what a 500 kbit/s bus delivers, so the middle of every
+/// long request is lost and the message is abandoned with a sequence error. The engine honours
+/// the setting either way; this is the only warning that says the setting is the reason.
+fn WarnIfPacingCannotWork(strEcuName: &str, params: IsoTpParameters) {
+    if params.m_u8BlockSize != 0 || params.m_bySeparationTimeMin != 0 {
+        return;
+    }
+
+    tracing::warn!(
+        ecu = %strEcuName,
+        "BlockSize 0 asks the tester to send every frame without pausing; over a slow serial \
+         adapter that loses the middle of a long request. Raise BlockSize, or set STmin, if \
+         inbound messages are abandoned with a sequence error"
+    );
 }
 
 /// True for a flow-control frame: the PCI type is 3.

@@ -172,8 +172,13 @@ fn AskForVersion(transport: &mut dyn SerialTransport) -> Option<String> {
     }
     DrainFor(transport, Duration::from_millis(20));
 
-    if transport.Write(slcan::VersionCommand().as_bytes()).is_err() {
-        return None;
+    // Ask every way we know. A firmware that does not implement one of these often implements
+    // another, and one unanswered command is the difference between a measured line speed and
+    // an assumed one.
+    for strCommand in slcan::IdentityCommands() {
+        if transport.Write(strCommand.as_bytes()).is_err() {
+            return None;
+        }
     }
 
     // Accumulated across reads, not per read. An adapter's reply routinely arrives split in
@@ -211,7 +216,7 @@ fn AskForVersion(transport: &mut dyn SerialTransport) -> Option<String> {
 fn FindVersionReply(vecReceived: &[u8]) -> Option<String> {
     for vecLine in vecReceived.split(|byByte| *byByte == slcan::c_byTerminator) {
         let strLine = String::from_utf8_lossy(vecLine);
-        if slcan::IsVersionReply(&strLine) {
+        if slcan::IsIdentityReply(&strLine) {
             return Some(strLine.into_owned());
         }
     }
