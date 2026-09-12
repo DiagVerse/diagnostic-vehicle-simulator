@@ -16,8 +16,8 @@ pub mod encode;
 
 use core_domain::model::{
     CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode, EchoSpan, Ecu, EcuTiming,
-    Network, NetworkKind, OverrideAction, ResponseOverride, SecurityLevel, SessionType, Vehicle,
-    VehicleIdentity,
+    Network, NetworkKind, OverrideAction, ResponseOverride, SecurityKeyPolicy, SecurityLevel,
+    SessionType, Vehicle, VehicleIdentity,
 };
 use core_domain::Confidence;
 
@@ -652,6 +652,9 @@ fn BuildDtcs(dto: &EcuDto, strWhere: &str) -> Result<Vec<DiagnosticTroubleCode>,
     Ok(vecDtcs)
 }
 
+/// NRC 0x35 invalidKey — what a level refuses with unless the file names another code.
+const c_byNrcInvalidKey: u8 = 0x35;
+
 /// Read the security levels an ECU offers.
 fn BuildSecurityLevels(dto: &EcuDto, strWhere: &str) -> Result<Vec<SecurityLevel>, SimFileError> {
     let mut vecLevels = Vec::with_capacity(dto.security.len());
@@ -694,13 +697,57 @@ fn BuildSecurityLevels(dto: &EcuDto, strWhere: &str) -> Result<Vec<SecurityLevel
             strReason: format!("security key: {strReason}"),
         })?;
 
-        vecLevels.push(SecurityLevel {
+        let keyPolicy = BuildKeyPolicy(entry, strWhere)?;
+
+        let level = SecurityLevel {
             m_byRequestSeedSubFunction: bySubFunction,
             m_vecSeed: vecSeed,
             m_vecExpectedKey: vecKey,
-        });
+            m_keyPolicy: keyPolicy,
+        };
+        level.Validate().map_err(|error| SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!("security: {error}"),
+        })?;
+
+        vecLevels.push(level);
     }
     Ok(vecLevels)
+}
+
+/// Read one level's key policy, defaulting to the comparison a file written before this
+/// existed implied.
+fn BuildKeyPolicy(
+    entry: &crate::dto::SecurityDto,
+    strWhere: &str,
+) -> Result<SecurityKeyPolicy, SimFileError> {
+    let strPolicy = match entry.key_policy.as_deref() {
+        Some(strPolicy) => strPolicy.trim().to_ascii_lowercase(),
+        None => return Ok(SecurityKeyPolicy::CompareWithExpectedKey),
+    };
+
+    match strPolicy.as_str() {
+        "compare" => Ok(SecurityKeyPolicy::CompareWithExpectedKey),
+        "acceptany" => Ok(SecurityKeyPolicy::AcceptAnyKey),
+        "refuse" => {
+            let byNrc = match entry.refusal_nrc.as_deref() {
+                Some(strNrc) => {
+                    ParseHexByte(strNrc).map_err(|strReason| SimFileError::BadField {
+                        strWhere: strWhere.to_string(),
+                        strReason: format!("security refusalNrc: {strReason}"),
+                    })?
+                }
+                None => c_byNrcInvalidKey,
+            };
+            Ok(SecurityKeyPolicy::RefuseWith { m_byNrc: byNrc })
+        }
+        _ => Err(SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!(
+                "security keyPolicy '{strPolicy}' is not one of: compare, acceptAny, refuse"
+            ),
+        }),
+    }
 }
 
 /// Read timing overrides onto the defaults.

@@ -249,6 +249,31 @@ export interface EchoSpan {
  * Declaring a service supported does not implement it — the engine's UDS plugin answers seven
  * services, and an override is the only way to get a positive response out of the rest.
  */
+/**
+ * One SecurityAccess level.
+ *
+ * `keyPolicy` says what the ECU does with the key a tester sends:
+ * - `compare`   — check it against `expectedKeyHex`; NRC 0x35 on a mismatch. For a level whose
+ *                 key is genuinely known.
+ * - `acceptAny` — unlock whatever arrives. The honest choice for a level taken from a capture:
+ *                 the seed was observed, the key never usefully was, and a fresh session issues
+ *                 a fresh seed that any recorded key is wrong for.
+ * - `refuse`    — never unlock; answer every key with `refusalNrcHex`. Fault injection.
+ *
+ * A key that arrives with no preceding requestSeed is refused with NRC 0x24 under every policy:
+ * ISO 14229-1 makes that a sequence rule, not a key rule.
+ */
+export interface SecurityLevel {
+  /** requestSeed sub-function in hex, e.g. "01". Odd; the even value above it is sendKey. */
+  requestSeedHex: string
+  seedHex: string
+  /** Only meaningful under `compare`. */
+  expectedKeyHex: string
+  keyPolicy: 'compare' | 'acceptAny' | 'refuse'
+  /** The code `refuse` answers with, in hex. Defaults to 35 (invalidKey). */
+  refusalNrcHex: string | null
+}
+
 export interface ResponseOverride {
   /** Bytes to match; a byte written `**` is a wildcard, e.g. `22 ** **`. */
   requestHex: string
@@ -481,6 +506,10 @@ export const api = {
   hardwareStart: (port: string, bitrateBps: number, serialBaudBps?: number) =>
     postJson<HardwareStatus>('/hw/start', { port, bitrateBps, serialBaudBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
+  ecuSecurityLevels: (handle: string) =>
+    getJson<SecurityLevel[]>(`/simulation/ecus/${handle}/security`),
+  setEcuSecurityLevels: (handle: string, levels: SecurityLevel[]) =>
+    putJson<SecurityLevel[]>(`/simulation/ecus/${handle}/security`, { levels }),
   ecuOverrides: (handle: string) =>
     getJson<ResponseOverride[]>(`/simulation/ecus/${handle}/overrides`),
   setEcuOverrides: (handle: string, overrides: ResponseOverride[]) =>

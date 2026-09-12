@@ -7,6 +7,7 @@ import {
   type EcuTiming,
   type NewEcu,
   type ResponseOverride,
+  type SecurityLevel,
   type SimulationEcu,
   type SimulationRequestResult,
   type SimulationResponse,
@@ -210,6 +211,13 @@ export function Simulate() {
             <OverridePanel
               key={`ov-${strSelectedCanId}`}
               ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onError={setError}
+              busy={busy}
+            />
+            <SecurityPanel
+              key={`sec-${strSelectedCanId}`}
+              ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onSaved={refreshState}
               onError={setError}
               busy={busy}
             />
@@ -1486,6 +1494,237 @@ function OverrideRow({
 
 // ---------------------------------------------------------------------------------------
 // Timing controls
+// ---------------------------------------------------------------------------------------
+// SecurityAccess levels
+// ---------------------------------------------------------------------------------------
+
+const c_arrKeyPolicies: { value: SecurityLevel['keyPolicy']; label: string; hint: string }[] = [
+  {
+    value: 'acceptAny',
+    label: 'Accept any key',
+    hint: 'Unlock whatever the tester sends. The honest choice for a level taken from a capture — the seed was observed, the key never usefully was.',
+  },
+  {
+    value: 'compare',
+    label: 'Compare with the expected key',
+    hint: 'Unlock only on an exact match, NRC 0x35 otherwise. For a level whose key is genuinely known.',
+  },
+  {
+    value: 'refuse',
+    label: 'Always refuse',
+    hint: 'Never unlock; answer every key with the code below. Fault injection — the tester\u2019s rejected-key path on demand.',
+  },
+]
+
+function EmptySecurityLevel(): SecurityLevel {
+  return {
+    requestSeedHex: '01',
+    seedHex: '',
+    expectedKeyHex: '',
+    keyPolicy: 'acceptAny',
+    refusalNrcHex: null,
+  }
+}
+
+/**
+ * Edit an ECU's SecurityAccess levels.
+ *
+ * The whole list is replaced on save, matching the endpoint — what is on screen is what the
+ * ECU ends up with.
+ */
+function SecurityPanel({
+  ecu,
+  onSaved,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu | null
+  onSaved: () => Promise<void> | void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [levels, setLevels] = useState<SecurityLevel[] | null>(null)
+  const [draft, setDraft] = useState<SecurityLevel[] | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  const handle = ecu?.handle ?? null
+
+  useEffect(() => {
+    let cancelled = false
+    if (!handle) return
+    void (async () => {
+      try {
+        const loaded = await api.ecuSecurityLevels(handle)
+        if (!cancelled) setLevels(loaded)
+      } catch (e) {
+        if (!cancelled) onError(DescribeError(e))
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // onError is stable enough for this panel's lifetime; re-running on it would refetch on
+    // every parent render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handle])
+
+  if (!ecu) return null
+
+  const shown = draft ?? levels
+  if (shown === null) return null
+
+  function update(index: number, patch: Partial<SecurityLevel>) {
+    setNote(null)
+    setDraft(shown!.map((level, i) => (i === index ? { ...level, ...patch } : level)))
+  }
+
+  async function save() {
+    if (!handle) return
+    setSaving(true)
+    try {
+      const saved = await api.setEcuSecurityLevels(handle, shown!)
+      setLevels(saved)
+      setDraft(null)
+      onError(null)
+      setNote('Saved. The change applies to the next SecurityAccess request.')
+      await onSaved()
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const bIsDirty = draft !== null
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Security — {ecu.name}
+        </h3>
+        <span className="text-xs text-slate-500">ISO 14229-1 · 0x27</span>
+      </div>
+
+      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+        A simulator cannot compute a real key — the algorithm lives in the manufacturer&rsquo;s
+        tooling, and a capture yields at best a seed. Say what each level should do instead. A
+        key arriving with no preceding requestSeed is always refused with NRC 0x24, whichever
+        policy is set.
+      </p>
+
+      {shown.length === 0 && (
+        <p className="mt-3 rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">
+          No security levels. This ECU answers <span className="font-mono">27 02</span> with NRC
+          0x12 (subFunctionNotSupported), because there is no level to send a key to.
+        </p>
+      )}
+
+      <div className="mt-3 space-y-3">
+        {shown.map((level, index) => (
+          <div key={index} className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <TextField
+                label="requestSeed sub-function"
+                placeholder="01"
+                value={level.requestSeedHex}
+                onChange={(v) => update(index, { requestSeedHex: v })}
+                mono
+              />
+              <label className="block">
+                <span className="text-xs text-slate-400">On sendKey</span>
+                <select
+                  value={level.keyPolicy}
+                  onChange={(e) =>
+                    update(index, { keyPolicy: e.target.value as SecurityLevel['keyPolicy'] })
+                  }
+                  className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+                >
+                  {c_arrKeyPolicies.map((policy) => (
+                    <option key={policy.value} value={policy.value}>
+                      {policy.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <p className="mt-2 text-xs text-slate-500">
+              {c_arrKeyPolicies.find((p) => p.value === level.keyPolicy)?.hint}
+            </p>
+
+            <div className="mt-3">
+              <TextField
+                label="Seed returned on requestSeed"
+                placeholder="11 22 33 44"
+                value={level.seedHex}
+                onChange={(v) => update(index, { seedHex: v })}
+                mono
+              />
+            </div>
+
+            {level.keyPolicy === 'compare' && (
+              <div className="mt-3">
+                <TextField
+                  label="Expected key"
+                  placeholder="AA BB CC DD"
+                  value={level.expectedKeyHex}
+                  onChange={(v) => update(index, { expectedKeyHex: v })}
+                  mono
+                />
+              </div>
+            )}
+
+            {level.keyPolicy === 'refuse' && (
+              <div className="mt-3">
+                <TextField
+                  label="Refuse with NRC"
+                  placeholder="35"
+                  value={level.refusalNrcHex ?? ''}
+                  onChange={(v) => update(index, { refusalNrcHex: v })}
+                  mono
+                />
+              </div>
+            )}
+
+            <button
+              onClick={() => {
+                setNote(null)
+                setDraft(shown.filter((_, i) => i !== index))
+              }}
+              className="mt-3 text-xs text-rose-400 transition hover:text-rose-300"
+            >
+              Remove this level
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          onClick={() => {
+            setNote(null)
+            setDraft([...shown, EmptySecurityLevel()])
+          }}
+          className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-300 transition hover:border-slate-500"
+        >
+          Add a level
+        </button>
+        <button
+          onClick={save}
+          disabled={busy || saving || !bIsDirty}
+          className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-600 disabled:opacity-40"
+        >
+          Apply security
+        </button>
+        {bIsDirty && <span className="text-xs text-amber-400">unsaved</span>}
+        {note && <span className="text-xs text-slate-400">{note}</span>}
+      </div>
+    </section>
+  )
+}
+
 // ---------------------------------------------------------------------------------------
 
 /**

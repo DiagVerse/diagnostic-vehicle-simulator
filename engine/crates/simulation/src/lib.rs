@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
 use core_domain::model::{
-    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, Vehicle, VehicleIdentity,
+    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, Vehicle, VehicleIdentity,
 };
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
@@ -588,6 +588,53 @@ impl SimulationService {
         // resolves to, and letting one go stale would be a silent routing bug.
         self.m_mapKeyByLogicalAddress = BuildLogicalAddressIndex(&self.m_mapEcus)?;
         Ok(())
+    }
+
+    /// Replace one ECU's security levels.
+    ///
+    /// The whole list is replaced, matching how response overrides are set: the caller sends
+    /// what the ECU should end up with, rather than a patch to reconcile against a list the UI
+    /// may hold a stale copy of. Written to both the running ECU and the loaded model so the
+    /// two cannot drift. The caller validates the levels first.
+    pub fn SetEcuSecurityLevels(
+        &mut self,
+        key: EcuKey,
+        vecLevels: Vec<SecurityLevel>,
+    ) -> Result<(), SimulationError> {
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
+
+        tracing::info!(
+            ecu = %runningEcu.Config().m_strName,
+            levels = vecLevels.len(),
+            "security levels replaced"
+        );
+        runningEcu.SetSecurityLevels(vecLevels.clone());
+
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            for config in &mut vehicle.m_vecEcus {
+                if MatchesKey(config, key) {
+                    config.m_vecSecurityLevels = vecLevels;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// One ECU's security levels.
+    pub fn EcuSecurityLevelsOf(&self, key: EcuKey) -> Result<Vec<SecurityLevel>, SimulationError> {
+        self.m_mapEcus
+            .get(&key)
+            .map(|runningEcu| runningEcu.Config().m_vecSecurityLevels.clone())
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })
     }
 
     /// Replace one ECU's timing parameters.

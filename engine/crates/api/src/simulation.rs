@@ -26,7 +26,7 @@ use axum::{
 };
 use core_domain::model::{
     CanAddress, CanAddressingMode, EchoSpan, Ecu, EcuTiming, Network, NetworkKind, OverrideAction,
-    ResponseOverride, SessionType, Vehicle, VehicleIdentity,
+    ResponseOverride, SecurityKeyPolicy, SecurityLevel, SessionType, Vehicle, VehicleIdentity,
 };
 use core_domain::Confidence;
 use ecu::VirtualEcu;
@@ -314,6 +314,31 @@ fn TrueByDefault() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct SetOverridesBody {
     pub overrides: Vec<ResponseOverrideDto>,
+}
+
+/// One security level, as the UI reads and writes it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityLevelDto {
+    /// requestSeed sub-function in hex, e.g. `"01"`. Odd: the even value above it is sendKey.
+    pub request_seed_hex: String,
+    /// The seed this level hands out, as hex bytes.
+    pub seed_hex: String,
+    /// The key it compares against. Only meaningful under the `compare` policy.
+    #[serde(default)]
+    pub expected_key_hex: String,
+    /// `compare`, `acceptAny` or `refuse`.
+    pub key_policy: String,
+    /// The code `refuse` answers with, in hex. Ignored by the other policies.
+    #[serde(default)]
+    pub refusal_nrc_hex: Option<String>,
+}
+
+/// Request body for replacing an ECU's security levels.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSecurityLevelsBody {
+    pub levels: Vec<SecurityLevelDto>,
 }
 
 /// An ECU's timing parameters, as the UI reads and writes them.
@@ -1438,6 +1463,122 @@ fn ResolveAddressingMode(
     }
 }
 
+/// GET /simulation/ecus/{requestCanIdHex}/security — one ECU's security levels.
+pub async fn GetEcuSecurityLevels(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+) -> Result<Json<Vec<SecurityLevelDto>>, ApiError> {
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    let vecLevels = simulation
+        .EcuSecurityLevelsOf(key)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(vecLevels.iter().map(BuildSecurityLevelDto).collect()))
+}
+
+/// PUT /simulation/ecus/{requestCanIdHex}/security — replace them.
+///
+/// The whole list is replaced rather than patched, for the reason the override endpoint gives:
+/// what the caller sends is exactly what the ECU ends up with.
+pub async fn PutEcuSecurityLevels(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+    Json(body): Json<SetSecurityLevelsBody>,
+) -> Result<Json<Vec<SecurityLevelDto>>, ApiError> {
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let mut vecLevels = Vec::with_capacity(body.levels.len());
+    for (uIndex, dto) in body.levels.iter().enumerate() {
+        let level = BuildSecurityLevel(dto)
+            .map_err(|strError| ApiError::BadRequest(format!("level {uIndex}: {strError}")))?;
+        level
+            .Validate()
+            .map_err(|error| ApiError::BadRequest(format!("level {uIndex}: {error}")))?;
+        vecLevels.push(level);
+    }
+
+    RejectDuplicateSecurityLevels(&vecLevels)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .SetEcuSecurityLevels(key, vecLevels)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    let vecStored = simulation
+        .EcuSecurityLevelsOf(key)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+    Ok(Json(vecStored.iter().map(BuildSecurityLevelDto).collect()))
+}
+
+/// Two levels on the same sub-function would make the ECU's answer depend on list order.
+fn RejectDuplicateSecurityLevels(vecLevels: &[SecurityLevel]) -> Result<(), ApiError> {
+    let mut vecSeen: Vec<u8> = Vec::with_capacity(vecLevels.len());
+    for level in vecLevels {
+        if vecSeen.contains(&level.m_byRequestSeedSubFunction) {
+            return Err(ApiError::BadRequest(format!(
+                "requestSeed 0x{:02X} is configured twice; one level per sub-function",
+                level.m_byRequestSeedSubFunction
+            )));
+        }
+        vecSeen.push(level.m_byRequestSeedSubFunction);
+    }
+    Ok(())
+}
+
+/// Serialize one security level. The expected key is sent as written; it is configuration the
+/// operator typed, not a credential the engine holds on anyone's behalf.
+fn BuildSecurityLevelDto(level: &SecurityLevel) -> SecurityLevelDto {
+    let (strPolicy, optStrNrc) = match level.m_keyPolicy {
+        SecurityKeyPolicy::CompareWithExpectedKey => ("compare".to_string(), None),
+        SecurityKeyPolicy::AcceptAnyKey => ("acceptAny".to_string(), None),
+        SecurityKeyPolicy::RefuseWith { m_byNrc } => {
+            ("refuse".to_string(), Some(format!("{m_byNrc:02X}")))
+        }
+    };
+
+    SecurityLevelDto {
+        request_seed_hex: format!("{:02X}", level.m_byRequestSeedSubFunction),
+        seed_hex: FormatHexBytes(&level.m_vecSeed),
+        expected_key_hex: FormatHexBytes(&level.m_vecExpectedKey),
+        key_policy: strPolicy,
+        refusal_nrc_hex: optStrNrc,
+    }
+}
+
+/// Read one security level from a request body. Validation happens separately, on the domain
+/// type, so the same rules apply however the values arrive.
+fn BuildSecurityLevel(dto: &SecurityLevelDto) -> Result<SecurityLevel, String> {
+    let bySubFunction = ParseHexByteField(&dto.request_seed_hex, "requestSeedHex")?;
+    let vecSeed = ParseHexBytesField(&dto.seed_hex, "seedHex")?;
+    let vecExpectedKey = ParseHexBytesField(&dto.expected_key_hex, "expectedKeyHex")?;
+
+    let keyPolicy = match dto.key_policy.trim().to_ascii_lowercase().as_str() {
+        "compare" => SecurityKeyPolicy::CompareWithExpectedKey,
+        "acceptany" => SecurityKeyPolicy::AcceptAnyKey,
+        "refuse" => {
+            let byNrc = match dto.refusal_nrc_hex.as_deref() {
+                Some(strNrc) => ParseHexByteField(strNrc, "refusalNrcHex")?,
+                None => c_byNrcInvalidKey,
+            };
+            SecurityKeyPolicy::RefuseWith { m_byNrc: byNrc }
+        }
+        strOther => {
+            return Err(format!(
+                "keyPolicy '{strOther}' is not one of: compare, acceptAny, refuse"
+            ))
+        }
+    };
+
+    Ok(SecurityLevel {
+        m_byRequestSeedSubFunction: bySubFunction,
+        m_vecSeed: vecSeed,
+        m_vecExpectedKey: vecExpectedKey,
+        m_keyPolicy: keyPolicy,
+    })
+}
+
 /// GET /simulation/ecus/{requestCanIdHex}/timing — one ECU's timing parameters.
 pub async fn GetEcuTiming(
     State(state): State<Arc<AppState>>,
@@ -1701,6 +1842,43 @@ fn FormatHexPattern(vecPattern: &[u8], vecMask: &[u8]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// NRC 0x35 invalidKey — what a refusing level answers with unless another code is named.
+const c_byNrcInvalidKey: u8 = 0x35;
+
+/// Render bytes as spaced uppercase hex, the way every other hex field here is shown.
+fn FormatHexBytes(vecBytes: &[u8]) -> String {
+    vecBytes
+        .iter()
+        .map(|byByte| format!("{byByte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse a run of hex bytes, accepting both `AA BB CC` and `AABBCC`. An empty field is an empty
+/// run, not an error: a level that accepts any key legitimately has no expected key.
+fn ParseHexBytesField(strInput: &str, strField: &str) -> Result<Vec<u8>, String> {
+    if strInput.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut vecBytes = Vec::new();
+    for strToken in SplitPatternTokens(strInput) {
+        let byValue = u8::from_str_radix(&strToken, 16)
+            .map_err(|_| format!("{strField}: '{strToken}' is not a hex byte"))?;
+        vecBytes.push(byValue);
+    }
+    Ok(vecBytes)
+}
+
+/// Parse exactly one hex byte.
+fn ParseHexByteField(strInput: &str, strField: &str) -> Result<u8, String> {
+    let vecBytes = ParseHexBytesField(strInput, strField)?;
+    match vecBytes.len() {
+        1 => Ok(vecBytes[0]),
+        uOther => Err(format!("{strField}: expected one hex byte, got {uOther}")),
+    }
 }
 
 /// Parse a CAN identifier written as hex, with or without a `0x` prefix.

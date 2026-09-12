@@ -138,6 +138,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(simulation::GetEcuOverrides).put(simulation::PutEcuOverrides),
         )
         .route(
+            "/simulation/ecus/:requestCanIdHex/security",
+            get(simulation::GetEcuSecurityLevels).put(simulation::PutEcuSecurityLevels),
+        )
+        .route(
             "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
         )

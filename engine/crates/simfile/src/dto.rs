@@ -227,8 +227,20 @@ pub struct SecurityDto {
     pub request_seed: String,
     /// The seed this level hands out.
     pub seed: String,
-    /// The key it expects back.
+    /// The key it expects back. Only needed under the `compare` policy, which is the default.
+    #[serde(default)]
     pub key: String,
+    /// What to do with the key a tester sends: `compare` (the default), `acceptAny`, or
+    /// `refuse`.
+    ///
+    /// `acceptAny` is the honest choice for a level taken from a capture: the seed was
+    /// observed, the key never usefully was, and comparing against a key nobody has refuses
+    /// every tester.
+    #[serde(default)]
+    pub key_policy: Option<String>,
+    /// The code `refuse` answers with, in hex. Defaults to `35` (invalidKey).
+    #[serde(default)]
+    pub refusal_nrc: Option<String>,
 }
 
 /// Timing overrides.
