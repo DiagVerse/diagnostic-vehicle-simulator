@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Badge, DetailRow, PowerSwitch, type BadgeTone } from '../components/primitives'
-import { NEGATIVE_RESPONSES, UDS_CATALOGUE } from './udsCatalogue'
+import {
+  NEGATIVE_RESPONSES,
+  UDS_CATALOGUE,
+  type CatalogueService,
+  type CatalogueVariant,
+} from './udsCatalogue'
 import { TrafficMonitor } from './TrafficMonitor'
 import {
   api,
@@ -32,7 +37,7 @@ export function Simulate() {
   const [state, setState] = useState<SimulationState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [lastResult, setLastResult] = useState<SimulationRequestResult | null>(null)
-  const [canIdHex, setCanIdHex] = useState('')
+  const [canIdHex, setCanIdHex] = useState(RememberedEcu)
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
   const [source, setSource] = useState<VehicleSource>('log')
@@ -49,6 +54,19 @@ export function Simulate() {
   const strSelectedCanId = bIsSelectionValid
     ? canIdHex
     : (vecAddressOptions[0]?.canIdHex ?? '')
+
+  // Switching tabs unmounts this view, so without remembering the choice it comes back on the
+  // first ECU of the list. That reads as "my override disappeared" — the override is on the
+  // server, the panel is just describing a different ECU — and it is the same trap that makes
+  // a timing change look like it was ignored.
+  function selectEcu(strCanIdHex: string) {
+    setCanIdHex(strCanIdHex)
+    RememberEcu(strCanIdHex)
+  }
+
+  useEffect(() => {
+    if (strSelectedCanId) RememberEcu(strSelectedCanId)
+  }, [strSelectedCanId])
 
   async function refreshState() {
     try {
@@ -200,7 +218,7 @@ export function Simulate() {
             <RequestPanel
               options={vecAddressOptions}
               canIdHex={strSelectedCanId}
-              onCanIdChange={setCanIdHex}
+              onCanIdChange={selectEcu}
               hexInput={hexInput}
               onHexInputChange={setHexInput}
               onSend={send}
@@ -240,6 +258,34 @@ export function Simulate() {
 // ---------------------------------------------------------------------------------------
 // Where the vehicle comes from
 // ---------------------------------------------------------------------------------------
+
+const c_strRememberedEcuKey = 'dvsim.simulate.selectedEcu'
+
+/**
+ * The ECU this view was last pointed at.
+ *
+ * Session storage rather than component state because the tab strip unmounts the whole view;
+ * and rather than local storage because an ECU identifier is only meaningful for the vehicle
+ * currently loaded, which does not outlive the tab. A stale value is harmless: the selection is
+ * still validated against the loaded vehicle before use.
+ */
+function RememberedEcu(): string {
+  try {
+    return sessionStorage.getItem(c_strRememberedEcuKey) ?? ''
+  } catch {
+    // Private browsing and blocked site data both throw here. Losing the selection is a far
+    // better outcome than failing to render the tab.
+    return ''
+  }
+}
+
+function RememberEcu(strCanIdHex: string) {
+  try {
+    sessionStorage.setItem(c_strRememberedEcuKey, strCanIdHex)
+  } catch {
+    // Nothing to do, and nothing worth telling the operator about.
+  }
+}
 
 /** A vehicle is either reconstructed from a capture or stated by hand. */
 type VehicleSource = 'log' | 'simfile' | 'pcap' | 'build'
@@ -1125,7 +1171,11 @@ function OverridePanel({
   }
 
   const vecOverrides = overrides ?? []
-  const service = UDS_CATALOGUE.find((entry) => entry.sid === serviceSid) ?? UDS_CATALOGUE[0]
+  // The catalogue lists the well-known identifiers; this ECU's own come from the loaded
+  // vehicle. Without them a simfile that defines 0x0111 offers no way to select it, and the
+  // editor looks as though the engine only knows about VINs and part numbers.
+  const vecServices = ServicesForEcu(ecu)
+  const service = vecServices.find((entry) => entry.sid === serviceSid) ?? vecServices[0]
   const variant = service.variants[variantIndex] ?? service.variants[0]
 
   // Which existing response, if any, this request pattern is. Matching on the pattern is what
@@ -1247,7 +1297,7 @@ function OverridePanel({
             onChange={(e) => selectService(e.target.value)}
             className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-200 outline-none focus:border-slate-500"
           >
-            {UDS_CATALOGUE.map((entry) => (
+            {vecServices.map((entry) => (
               <option key={entry.sid} value={entry.sid}>
                 0x{entry.sid} {entry.name}
                 {entry.implemented ? '' : ' — override only'}
@@ -1630,6 +1680,42 @@ function ShadowingOverrideOf(
     (rule) => rule.enabled && rule.requestHex.trim().toUpperCase().startsWith(wanted),
   )
   return match ? match.requestHex : null
+}
+
+/**
+ * The response-editor catalogue with one ECU's configured data identifiers folded in.
+ *
+ * `UDS_CATALOGUE` carries the identifiers every vehicle shares — VIN, part numbers, the
+ * standard 0xFxxx range. An ECU's *own* identifiers come from whatever populated the model: a
+ * simulation file, a reconstruction, the builder. Those are the ones an operator actually wants
+ * to override, and offering only the well-known ones makes the editor look as if the engine
+ * knows nothing else.
+ *
+ * The ECU's own are listed first, because they are the reason someone opened this dropdown.
+ * Duplicates are dropped so a DID that is both well-known and configured appears once.
+ */
+function ServicesForEcu(ecu: SimulationEcu | null): CatalogueService[] {
+  if (!ecu || ecu.dids.length === 0) return UDS_CATALOGUE
+
+  return UDS_CATALOGUE.map((service) => {
+    if (service.sid !== '22' && service.sid !== '2E') return service
+
+    const bIsRead = service.sid === '22'
+    const vecOwn: CatalogueVariant[] = ecu.dids.map((u16Did) => {
+      const strDid = u16Did.toString(16).toUpperCase().padStart(4, '0')
+      const strRequestHex = `${bIsRead ? '22' : '2E'} ${strDid.slice(0, 2)} ${strDid.slice(2)}`
+      const strResponseHex = `${bIsRead ? '62' : '6E'} ${strDid.slice(0, 2)} ${strDid.slice(2)}${bIsRead ? ' 00' : ''}`
+      return {
+        label: `${FormatDid(u16Did)} — on this ECU`,
+        requestHex: strRequestHex,
+        responseHex: strResponseHex,
+      }
+    })
+
+    const setOwn = new Set(vecOwn.map((entry) => entry.requestHex))
+    const vecRest = service.variants.filter((entry) => !setOwn.has(entry.requestHex))
+    return { ...service, variants: [...vecOwn, ...vecRest] }
+  })
 }
 
 function EmptySecurityLevel(): SecurityLevel {
