@@ -140,6 +140,18 @@ export function Hardware() {
               <dd className="font-mono text-slate-300">{status.port}</dd>
             </div>
             <div>
+              <dt className="text-xs text-slate-500">Host link</dt>
+              <dd className="font-mono text-slate-300">
+                {status.serialBaudBps === null ? '—' : `${status.serialBaudBps} baud`}
+              </dd>
+              {status.serialBaudSource && (
+                <dd className="text-xs text-slate-500">
+                  {status.serialBaudSource}
+                  {status.adapterVersion ? ` · ${status.adapterVersion}` : ''}
+                </dd>
+              )}
+            </div>
+            <div>
               <dt className="text-xs text-slate-500">Frames in</dt>
               <dd className="font-mono text-slate-300">{status.framesReceived}</dd>
             </div>

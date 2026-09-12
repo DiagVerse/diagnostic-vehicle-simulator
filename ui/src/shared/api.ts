@@ -48,8 +48,12 @@ export interface RequestResult {
  * An ECU's UDS server timing (ISO 14229-2 clause 7), in milliseconds.
  *
  * `p2ServerMaxMs` / `p2StarServerMaxMs` / `p4ServerMaxMs` are the parameters the ECU
- * advertises and is judged against; the rest are fault-injection knobs that make the ECU
- * actually slow, actually send NRC 0x78 ResponsePending, or actually never finish.
+ * advertises and is judged against; the fault-injection knobs make the ECU actually slow,
+ * actually send NRC 0x78 ResponsePending, or actually never finish.
+ *
+ * `isoTpBlockSize` / `isoTpSeparationTimeMin` are different in kind: they belong to
+ * ISO 15765-2 rather than ISO 14229, and they govern the *request* direction — how fast this
+ * ECU lets a tester send it a multi-frame message.
  */
 export interface EcuTiming {
   p2ServerMaxMs: number
@@ -59,6 +63,10 @@ export interface EcuTiming {
   forceResponsePending: boolean
   forcedResponsePendingCount: number
   dropFinalResponse: boolean
+  /** ConsecutiveFrames accepted per FlowControl; 0 means "send them all without pausing". */
+  isoTpBlockSize: number
+  /** Raw STmin byte: 0x00-0x7F milliseconds, 0xF1-0xF9 hundreds of microseconds. */
+  isoTpSeparationTimeMin: number
 }
 
 /** The result of changing an ECU's timing. */
@@ -216,6 +224,14 @@ export interface HardwareStatus {
   running: boolean
   port: string | null
   bitrateBps: number | null
+  /**
+   * Host-to-adapter line speed, NOT the CAN bitrate. Determined when the link is opened, by
+   * asking the adapter what it runs at; `serialBaudSource` says whether that number was
+   * measured, chosen by the operator, or merely assumed.
+   */
+  serialBaudBps: number | null
+  serialBaudSource: string | null
+  adapterVersion: string | null
   framesReceived: number
   framesSent: number
 }
@@ -458,8 +474,12 @@ export const api = {
   setDoIpSettings: (settings: DoIpSettings) => putJson<DoIpSettings>('/doip/settings', settings),
   serialPorts: () => getJson<SerialPorts>('/hw/ports'),
   hardwareStatus: () => getJson<HardwareStatus>('/hw/status'),
-  hardwareStart: (port: string, bitrateBps: number) =>
-    postJson<HardwareStatus>('/hw/start', { port, bitrateBps }),
+  /**
+   * `serialBaudBps` is the host-to-adapter line speed. Leave it undefined and the engine asks
+   * the adapter what it runs at, which is right almost always.
+   */
+  hardwareStart: (port: string, bitrateBps: number, serialBaudBps?: number) =>
+    postJson<HardwareStatus>('/hw/start', { port, bitrateBps, serialBaudBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
   ecuOverrides: (handle: string) =>
     getJson<ResponseOverride[]>(`/simulation/ecus/${handle}/overrides`),
