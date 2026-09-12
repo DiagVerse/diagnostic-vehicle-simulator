@@ -273,6 +273,14 @@ pub struct SimulationService {
     /// power: nothing answers, but the model and every ECU's diagnostic state are kept, so
     /// starting again resumes exactly where it left off. Clearing state is what a reset is for.
     m_bIsRunning: bool,
+    /// Bumped whenever something changes that a transport has cached: which ECUs exist, the
+    /// identifiers they answer on, or the flow control they ask a tester to obey.
+    ///
+    /// A counter rather than a callback because the reader is a bridge running in its own
+    /// task: it compares the number once per poll and rebuilds when it has moved, which costs
+    /// one lock it was taking anyway. Diagnostic *state* — sessions, security — deliberately
+    /// does not bump it; that changes on every request and no transport caches it.
+    m_u64ConfigGeneration: u64,
 }
 
 impl Default for SimulationService {
@@ -290,7 +298,20 @@ impl SimulationService {
             m_mapKeyByLogicalAddress: BTreeMap::new(),
             m_mapFunctionalTargets: BTreeMap::new(),
             m_bIsRunning: true,
+            m_u64ConfigGeneration: 0,
         }
+    }
+
+    /// How many times the endpoint configuration has changed since this service was created.
+    ///
+    /// A transport caches one copy of it and rebuilds when the number moves. See the field.
+    pub fn ConfigGeneration(&self) -> u64 {
+        self.m_u64ConfigGeneration
+    }
+
+    /// Record that the endpoint configuration changed.
+    fn BumpConfigGeneration(&mut self) {
+        self.m_u64ConfigGeneration = self.m_u64ConfigGeneration.wrapping_add(1);
     }
 
     /// Put the ECUs on the bus.
@@ -350,6 +371,7 @@ impl SimulationService {
         self.m_mapKeyByLogicalAddress = mapKeyByLogicalAddress;
         self.m_mapFunctionalTargets = mapFunctionalTargets;
         self.m_optVehicle = Some(vehicle);
+        self.BumpConfigGeneration();
         Ok(self
             .m_optVehicle
             .as_ref()
@@ -361,6 +383,7 @@ impl SimulationService {
         self.m_optVehicle = None;
         self.m_mapEcus.clear();
         self.m_mapFunctionalTargets.clear();
+        self.BumpConfigGeneration();
         tracing::info!("simulation cleared");
     }
 
@@ -430,6 +453,7 @@ impl SimulationService {
             m_identity: Default::default(),
         });
 
+        self.BumpConfigGeneration();
         tracing::info!(vehicle = %strName, "empty vehicle created");
         self.m_optVehicle
             .as_ref()
@@ -468,6 +492,7 @@ impl SimulationService {
             vehicle.m_vecEcus.push(config);
         }
 
+        self.BumpConfigGeneration();
         self.RebuildFunctionalTargets()
     }
 
@@ -486,6 +511,7 @@ impl SimulationService {
             vehicle.m_vecEcus.retain(|config| !MatchesKey(config, key));
         }
 
+        self.BumpConfigGeneration();
         self.RebuildFunctionalTargets()
     }
 
@@ -582,6 +608,10 @@ impl SimulationService {
         runningEcu.SetTiming(timing);
 
         UpdateVehicleTiming(self.m_optVehicle.as_mut(), key, timing);
+        // BlockSize and STmin live in these parameters, and a bridge has already cached them
+        // in its receivers. Without this the operator's change would not reach the wire until
+        // the link was restarted.
+        self.BumpConfigGeneration();
         Ok(())
     }
 
