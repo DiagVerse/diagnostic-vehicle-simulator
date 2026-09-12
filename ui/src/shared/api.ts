@@ -4,6 +4,15 @@
 export interface Health {
   status: string
   engine_version: string
+  /**
+   * The commit the running engine was built from, with a `+` when the tree was dirty.
+   *
+   * Shown in the header because a fix that is not in the running binary looks exactly like a
+   * fix that does not work, and there was no way to tell those apart from the browser.
+   */
+  build_commit: string
+  /** When that binary was built, as seconds since the epoch. */
+  built_at_secs: number
   plugin_count: number
 }
 

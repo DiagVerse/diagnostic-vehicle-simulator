@@ -119,6 +119,14 @@ export function TrafficMonitor({ standalone = false }: { standalone?: boolean })
         </div>
       </div>
 
+      {status === 'offline' && (
+        <p className="rounded border border-rose-900/60 bg-rose-950/40 px-2 py-1.5 text-[11px] text-rose-300">
+          The feed is not connected, so nothing here is live. The browser retries on its own; if
+          it stays like this the engine or the dev server has stopped — restart with{' '}
+          <span className="font-mono">./scripts/dev.sh</span> and reload this page.
+        </p>
+      )}
+
       {uDropped > 0 && standalone && (
         <p className="rounded border border-amber-900/50 bg-amber-950/20 px-2 py-1 text-[11px] text-amber-400/90">
           This monitor is holding the most recent {entries.length} events; {uDropped} older
