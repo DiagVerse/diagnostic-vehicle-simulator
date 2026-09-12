@@ -107,4 +107,9 @@ impl SerialTransport for VirtualPortTransport {
             }),
         }
     }
+
+    /// There is no UART behind a pseudo-terminal, so no baud rate to set or to measure.
+    fn HasConfigurableBaudRate(&self) -> bool {
+        false
+    }
 }

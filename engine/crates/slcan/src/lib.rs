@@ -161,6 +161,35 @@ pub fn StatusCommand() -> String {
     "F\r".to_string()
 }
 
+/// The command that asks an adapter for its hardware and firmware version.
+///
+/// Used as an "are you there, and can I hear you?" probe. Safe to send at any time: it changes
+/// nothing, and an adapter that does not implement it answers with a rejection rather than
+/// acting on it.
+pub fn VersionCommand() -> String {
+    "V\r".to_string()
+}
+
+/// Whether a line is an adapter identifying itself in answer to [`VersionCommand`].
+///
+/// The point of the strictness is baud-rate probing. At the wrong line speed a UART delivers
+/// mangled bytes with stuck high bits, and those must not be mistaken for a reply — so the
+/// shape is checked exactly: `V` followed by four hexadecimal digits, which is what the
+/// Lawicel datasheet specifies and what every re-implementation copied.
+pub fn IsVersionReply(strLine: &str) -> bool {
+    let vecChars: Vec<char> = strLine.chars().collect();
+    if vecChars.len() != 5 {
+        return false;
+    }
+    if vecChars[0] != 'V' {
+        return false;
+    }
+
+    vecChars[1..]
+        .iter()
+        .all(|character| character.is_ascii_hexdigit())
+}
+
 /// Decode the status byte an adapter answers `F` with. Bit meanings are inherited from the
 /// SJA1000 controller the original adapters used.
 pub fn DescribeStatusFlags(byFlags: u8) -> Vec<&'static str> {

@@ -67,6 +67,13 @@ pub trait SerialTransport: Send {
     /// Read whatever has arrived, up to the buffer's size. Returns `Ok(0)` when nothing has,
     /// which is not an error — it is the normal state of an idle bus.
     fn Read(&mut self, vecBuffer: &mut [u8]) -> Result<usize, SerialError>;
+
+    /// Whether this transport has a real UART, so that its baud rate means something.
+    ///
+    /// A pseudo-terminal or an in-memory pipe moves bytes as fast as the two ends manage;
+    /// asking one to run at 115200 changes nothing. Callers that would otherwise measure or
+    /// negotiate a line speed use this to find out there is no line to speak of.
+    fn HasConfigurableBaudRate(&self) -> bool;
 }
 
 /// How long a read waits before reporting that nothing arrived. Short enough that a bridge

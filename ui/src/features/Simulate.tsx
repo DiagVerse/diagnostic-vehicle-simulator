@@ -1604,6 +1604,36 @@ function TimingPanel({
         />
       </div>
 
+      <div className="mt-4 border-t border-slate-800 pt-3">
+        <div className="flex items-baseline justify-between">
+          <h4 className="text-xs font-medium uppercase tracking-wider text-slate-400">
+            Flow control — incoming requests
+          </h4>
+          <span className="text-xs text-slate-500">ISO 15765-2</span>
+        </div>
+        <p className="mt-1 text-xs text-slate-500">
+          What this ECU puts in the FlowControl frame when a tester sends it a multi-frame
+          request. Leave both at 0 on a fast link. Raise them if long requests arrive
+          incomplete over a serial CAN adapter: at 115200 baud a dongle forwards roughly 427
+          frames per second while a 500 kbit/s bus delivers about 3600, so a tester told to
+          send 55 frames back to back will overrun it.
+        </p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <NumberField
+            label="BlockSize"
+            hint="Frames per FlowControl; 0 = send them all"
+            value={timing.isoTpBlockSize}
+            onChange={(v) => update({ isoTpBlockSize: v })}
+          />
+          <NumberField
+            label="STmin (raw byte)"
+            hint="0-127 = ms; 241-249 = 100-900 us"
+            value={timing.isoTpSeparationTimeMin}
+            onChange={(v) => update({ isoTpSeparationTimeMin: v })}
+          />
+        </div>
+      </div>
+
       <div className="mt-4 flex items-center gap-3">
         <button
           onClick={save}

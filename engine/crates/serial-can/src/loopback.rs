@@ -70,6 +70,11 @@ impl SerialTransport for LoopbackTransport {
         }
         Ok(uCount)
     }
+
+    /// An in-memory pipe has no line speed at all.
+    fn HasConfigurableBaudRate(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,10 @@ impl SerialTransport for SerialPortTransport {
             }),
         }
     }
+
+    fn HasConfigurableBaudRate(&self) -> bool {
+        true
+    }
 }
 
 /// Enumerate the serial ports the operating system reports.

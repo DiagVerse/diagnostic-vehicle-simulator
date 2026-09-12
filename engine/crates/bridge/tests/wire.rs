@@ -19,7 +19,7 @@ use core_domain::model::{
 use core_domain::Confidence;
 use isotp::params::{c_byDefaultPaddingByte, IsoTpParameters};
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
-use simulation::SimulationService;
+use simulation::{EcuKey, SimulationService};
 
 struct UdsHandler;
 
@@ -294,4 +294,117 @@ async fn a_multi_frame_request_on_a_broadcast_is_dropped_without_flow_control() 
     bridge.PumpOnce(&UdsHandler).await;
 
     assert!(Sent(&handle).is_empty());
+}
+
+/// A 20-byte WriteDataByIdentifier, segmented: a FirstFrame carrying six payload bytes and two
+/// ConsecutiveFrames of seven. Long enough that a BlockSize of 1 is felt twice.
+fn LongWriteRequestFrames() -> (CanFrame, CanFrame, CanFrame) {
+    let first = Frame(0x7E0, vec![0x10, 0x14, 0x2E, 0xF1, 0x90, b'1', b'H', b'G']);
+    let second = Frame(0x7E0, vec![0x21, b'C', b'M', b'8', b'2', b'6', b'3', b'3']);
+    let third = Frame(0x7E0, vec![0x22, b'A', b'0', b'0', b'4', b'3', b'5', b'2']);
+    (first, second, third)
+}
+
+#[tokio::test]
+async fn an_ecus_block_size_and_separation_time_reach_the_wire() {
+    // The bug this guards: with BlockSize 0 the tester is told to send every ConsecutiveFrame
+    // back to back. Over an SLCAN dongle on a 115200 baud line that is roughly eight times
+    // what the link carries, so the middle of a long request is lost and the message is
+    // abandoned. A BlockSize of 1 paces the tester to what the link can actually take.
+    let arcSimulation = BuildSimulation();
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let timing = EcuTiming {
+            m_u8IsoTpBlockSize: 1,
+            m_byIsoTpSeparationTimeMin: 3,
+            ..EcuTiming::default()
+        };
+        timing
+            .Validate()
+            .expect("one frame per block, spaced 3 ms, is a legal thing to ask for");
+        simulation
+            .SetEcuTiming(EcuKey::Can(0x7E0), timing)
+            .expect("the ECU");
+    }
+
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, arcSimulation);
+    let (first, second, third) = LongWriteRequestFrames();
+
+    handle.InjectFrame(first);
+    bridge.PumpOnce(&UdsHandler).await;
+    let vecAfterFirst = Sent(&handle);
+    assert_eq!(
+        vecAfterFirst.len(),
+        1,
+        "the FirstFrame is owed a flow control"
+    );
+    assert_eq!(
+        &vecAfterFirst[0].1[0..3],
+        &[0x30, 0x01, 0x03],
+        "the flow control must carry this ECU's BlockSize and STmin, not the link default"
+    );
+
+    // The part that matters: one frame per block means another flow control is owed after
+    // every single ConsecutiveFrame, which is what stops the tester flooding the link.
+    handle.InjectFrame(second);
+    bridge.PumpOnce(&UdsHandler).await;
+    let vecAfterSecond = Sent(&handle);
+    assert_eq!(
+        vecAfterSecond.len(),
+        1,
+        "the block is used up after one frame"
+    );
+    assert_eq!(&vecAfterSecond[0].1[0..3], &[0x30, 0x01, 0x03]);
+
+    // And the paced message still arrives whole.
+    handle.InjectFrame(third);
+    bridge.PumpOnce(&UdsHandler).await;
+    let vecAnswer = Sent(&handle);
+    assert_eq!(vecAnswer.len(), 1);
+    assert_eq!(
+        &vecAnswer[0].1[0..4],
+        &[0x03, 0x7F, 0x2E, 0x11],
+        "0x2E is unimplemented, so a refusal here proves the 20 bytes reassembled intact"
+    );
+}
+
+#[tokio::test]
+async fn changing_an_ecus_flow_control_reaches_a_bridge_that_is_already_running() {
+    // An operator raising BlockSize is doing it *because* the link is dropping frames. Making
+    // them stop and restart the link to apply it would be a poor answer.
+    let arcSimulation = BuildSimulation();
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, Arc::clone(&arcSimulation));
+    let (first, _, _) = LongWriteRequestFrames();
+
+    handle.InjectFrame(first.clone());
+    bridge.PumpOnce(&UdsHandler).await;
+    let vecBefore = Sent(&handle);
+    assert_eq!(
+        &vecBefore[0].1[0..3],
+        &[0x30, 0x00, 0x00],
+        "the default is still send-it-all"
+    );
+
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let timing = EcuTiming {
+            m_u8IsoTpBlockSize: 4,
+            ..EcuTiming::default()
+        };
+        simulation
+            .SetEcuTiming(EcuKey::Can(0x7E0), timing)
+            .expect("the ECU");
+    }
+
+    handle.InjectFrame(first);
+    bridge.PumpOnce(&UdsHandler).await;
+    let vecAfter = Sent(&handle);
+    assert_eq!(vecAfter.len(), 1);
+    assert_eq!(
+        &vecAfter[0].1[0..3],
+        &[0x30, 0x04, 0x00],
+        "the change must reach the wire without the link being restarted"
+    );
 }

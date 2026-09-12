@@ -14,6 +14,7 @@
 pub mod bus;
 pub mod mock;
 pub mod observer;
+pub mod probe;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,6 +84,10 @@ pub struct CanBridge {
     m_queueInbound: VecDeque<CanFrame>,
     m_arcStats: Arc<BridgeStats>,
     m_startedAt: Instant,
+    /// The simulation's configuration generation these endpoints were built from. Compared
+    /// once per poll so an ECU added, removed or re-timed while the link is up reaches the
+    /// wire without the operator having to stop and restart it.
+    m_u64EndpointGeneration: u64,
 }
 
 impl CanBridge {
@@ -101,6 +106,7 @@ impl CanBridge {
             m_queueInbound: VecDeque::new(),
             m_arcStats: Arc::new(BridgeStats::default()),
             m_startedAt: Instant::now(),
+            m_u64EndpointGeneration: 0,
         };
         bridge.RebuildEndpoints();
         bridge
@@ -149,12 +155,16 @@ impl CanBridge {
                 None => continue,
             };
 
+            // Flow control is per ECU, not per link: each one declares how fast it is willing
+            // to be sent a multi-frame request, exactly as a real ECU does.
+            let paramsForEcu = self.ParametersFor(runningEcu.Timing());
+
             mapEndpoints.insert(
                 u32RequestCanId,
                 Endpoint {
                     m_u32RequestCanId: u32RequestCanId,
                     m_u32ResponseCanId: address.m_u32ResponseCanId,
-                    m_receiver: IsoTpReceiver::NewPhysical(self.m_params),
+                    m_receiver: IsoTpReceiver::NewPhysical(paramsForEcu),
                 },
             );
 
@@ -168,12 +178,54 @@ impl CanBridge {
             }
         }
 
+        let u64Generation = simulation.ConfigGeneration();
         tracing::info!(
             endpoints = mapEndpoints.len(),
+            generation = u64Generation,
             bus = %self.m_boxBus.Describe(),
             "bridge endpoints rebuilt"
         );
+        drop(simulation);
+
         self.m_mapEndpoints = mapEndpoints;
+        self.m_u64EndpointGeneration = u64Generation;
+    }
+
+    /// This link's ISO-TP parameters with one ECU's flow control applied.
+    ///
+    /// The padding byte belongs to the link and is kept; BlockSize and STmin belong to the ECU
+    /// and are taken from its timing parameters, which is where an operator sets them.
+    fn ParametersFor(&self, timing: core_domain::model::EcuTiming) -> IsoTpParameters {
+        IsoTpParameters {
+            m_u8BlockSize: timing.m_u8IsoTpBlockSize,
+            m_bySeparationTimeMin: timing.m_byIsoTpSeparationTimeMin,
+            m_optByPaddingByte: self.m_params.m_optByPaddingByte,
+        }
+    }
+
+    /// Rebuild the endpoints if the simulation's configuration has moved on since they were
+    /// built. Cheap when nothing has changed, which is the normal case.
+    ///
+    /// Anything part-way through reassembly is abandoned by the rebuild. That is the honest
+    /// outcome: the operator has just changed what this ECU accepts, and finishing the message
+    /// under the old rules would answer a question nobody asked.
+    fn RebuildEndpointsIfStale(&mut self) {
+        let u64Current = self
+            .m_arcSimulation
+            .lock()
+            .expect("simulation mutex poisoned")
+            .ConfigGeneration();
+
+        if u64Current == self.m_u64EndpointGeneration {
+            return;
+        }
+
+        tracing::info!(
+            from = self.m_u64EndpointGeneration,
+            to = u64Current,
+            "the simulation changed; rebuilding the bridge's endpoints"
+        );
+        self.RebuildEndpoints();
     }
 
     /// Seconds since the bridge started, for stamping frames.
@@ -186,6 +238,7 @@ impl CanBridge {
     /// Returns how many complete requests were answered, so a caller can tell a busy link from
     /// a quiet one.
     pub async fn PumpOnce(&mut self, protocol: &dyn ProtocolHandler) -> usize {
+        self.RebuildEndpointsIfStale();
         self.FillInbound();
 
         let mut uHandled = 0;

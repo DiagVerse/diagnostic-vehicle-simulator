@@ -327,6 +327,17 @@ pub struct EcuTimingDto {
     pub force_response_pending: bool,
     pub forced_response_pending_count: u8,
     pub drop_final_response: bool,
+    /// ConsecutiveFrames this ECU accepts before the tester must wait for another
+    /// FlowControl; 0 means "send the whole message without pausing".
+    ///
+    /// Defaulted rather than required so a client written before these two existed can still
+    /// PUT a timing body, and gets the behaviour it had.
+    #[serde(default)]
+    pub iso_tp_block_size: u8,
+    /// The raw STmin byte this ECU asks the tester to space its ConsecutiveFrames by:
+    /// 0x00-0x7F milliseconds, 0xF1-0xF9 hundreds of microseconds.
+    #[serde(default)]
+    pub iso_tp_separation_time_min: u8,
 }
 
 /// The result of a timing update, with the one thing an operator will otherwise wonder about.
@@ -1500,6 +1511,8 @@ fn BuildTimingDto(timing: &EcuTiming) -> EcuTimingDto {
         force_response_pending: timing.m_bForceResponsePending,
         forced_response_pending_count: timing.m_u8ForcedResponsePendingCount,
         drop_final_response: timing.m_bDropFinalResponse,
+        iso_tp_block_size: timing.m_u8IsoTpBlockSize,
+        iso_tp_separation_time_min: timing.m_byIsoTpSeparationTimeMin,
     }
 }
 
@@ -1514,6 +1527,8 @@ fn BuildTiming(dto: &EcuTimingDto) -> EcuTiming {
         m_bForceResponsePending: dto.force_response_pending,
         m_u8ForcedResponsePendingCount: dto.forced_response_pending_count,
         m_bDropFinalResponse: dto.drop_final_response,
+        m_u8IsoTpBlockSize: dto.iso_tp_block_size,
+        m_byIsoTpSeparationTimeMin: dto.iso_tp_separation_time_min,
     }
 }
 

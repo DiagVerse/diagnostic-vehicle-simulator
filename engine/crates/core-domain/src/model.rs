@@ -129,13 +129,26 @@ pub const c_u32MaxP4ServerMaxMs: u32 = 600_000;
 /// repeated"), but a control that can emit hundreds is a footgun rather than a feature.
 pub const c_u8MaxForcedResponsePendingCount: u8 = 10;
 
+/// Largest separation-time value expressed in whole milliseconds (ISO 15765-2 Table 18).
+pub const c_bySeparationTimeMaxMilliseconds: u8 = 0x7F;
+/// First separation-time value expressed in 100 microsecond units (ISO 15765-2 Table 18).
+pub const c_bySeparationTimeFirstMicroseconds: u8 = 0xF1;
+/// Last such value. Everything between `0x80` and `0xF0`, and everything above `0xF9`, is
+/// reserved — a receiver that sends one is telling the sender nothing it can act on.
+pub const c_bySeparationTimeLastMicroseconds: u8 = 0xF9;
+
 /// UDS server timing (ISO 14229-2 clause 7), in milliseconds.
 ///
-/// Two kinds of value live here and are kept apart by name: the parameters the ECU
-/// **advertises and is judged against** (P2, P2*, P4), and the operator's **fault-injection**
-/// knobs (response delay, forced ResponsePending, dropped final response). The first group
-/// comes from the standard; the second exists so a demo can show the ResponsePending path
-/// without waiting, and can simulate a server that never finishes.
+/// Three kinds of value live here and are kept apart by name: the parameters the ECU
+/// **advertises and is judged against** (P2, P2*, P4), the operator's **fault-injection**
+/// knobs (response delay, forced ResponsePending, dropped final response), and the
+/// **ISO-TP flow control** this ECU asks an incoming multi-frame request to obey (BlockSize,
+/// STmin). The first group comes from ISO 14229-2; the second exists so a demo can show the
+/// ResponsePending path without waiting, and can simulate a server that never finishes.
+///
+/// The third group belongs to ISO 15765-2 rather than ISO 14229, and sits here anyway because
+/// it is the same thing from the operator's chair: how fast this ECU will be talked to. It is
+/// the only group that governs the **request** direction.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EcuTiming {
@@ -178,6 +191,33 @@ pub struct EcuTiming {
     /// tester's P2*Client timeout handling can be exercised. Fault injection.
     #[serde(default)]
     pub m_bDropFinalResponse: bool,
+
+    /// BlockSize — how many ConsecutiveFrames this ECU will accept before the tester must wait
+    /// for another FlowControl. ISO 15765-2 clause 9.6.5.3. `0` means "send the whole message
+    /// without pausing", which is the fastest choice and the right one over a link with
+    /// bandwidth to spare.
+    ///
+    /// It is **not** the right one over a slow adapter. An SLCAN dongle on a 115200 baud
+    /// serial line carries roughly 427 frames per second, while a 500 kbit/s CAN bus delivers
+    /// about 3600 — so a tester told to send 55 frames back to back overruns the dongle's
+    /// buffer and the middle of the message is simply lost. A small non-zero BlockSize paces
+    /// the tester to something the link can actually carry.
+    #[serde(default)]
+    pub m_u8IsoTpBlockSize: u8,
+
+    /// STmin — the minimum gap this ECU requires between the ConsecutiveFrames a tester sends
+    /// it, as the raw byte that travels in the FlowControl. ISO 15765-2 clause 9.6.5.4:
+    /// `0x00`–`0x7F` are milliseconds, `0xF1`–`0xF9` are 100–900 microseconds.
+    ///
+    /// Kept as the raw wire byte rather than a duration: round-tripping `0xF1` through a
+    /// millisecond field would lose the 100 microseconds and silently re-emit `0x00`, changing
+    /// what the ECU says about itself.
+    ///
+    /// The cheaper of the two levers. Where BlockSize costs a FlowControl round trip per
+    /// block, STmin paces the sender with no round trips at all — but a tester is free to
+    /// treat it as advisory, so BlockSize is the one that is actually enforced.
+    #[serde(default)]
+    pub m_byIsoTpSeparationTimeMin: u8,
 }
 
 /// Named serde default for P4Server_max — see the field's doc comment.
@@ -206,6 +246,11 @@ impl Default for EcuTiming {
             m_bForceResponsePending: false,
             m_u8ForcedResponsePendingCount: DefaultForcedResponsePendingCount(),
             m_bDropFinalResponse: false,
+            // No pacing, matching what this engine advertised before these knobs existed. It
+            // is the correct default for a model that is not on a wire and for a link with
+            // bandwidth to spare; a slow adapter needs it raised. See the field docs.
+            m_u8IsoTpBlockSize: 0,
+            m_byIsoTpSeparationTimeMin: 0,
         }
     }
 }
@@ -267,6 +312,10 @@ pub enum TimingValidationError {
     /// ISO 14229-2 clause 7.1.1: `P4 == P2` means NRC 0x78 is not allowed for this server.
     #[error("ResponsePending is forced but P4Server_max equals P2Server_max ({u32P2Ms} ms), which means NRC 0x78 is not allowed for this server")]
     ForcedResponsePendingWithP4EqualToP2 { u32P2Ms: u32 },
+
+    /// ISO 15765-2 Table 18 leaves these values reserved, so a tester cannot act on one.
+    #[error("STmin is 0x{byValue:02X}, which ISO 15765-2 reserves; use 0x00-0x7F for 0-127 ms or 0xF1-0xF9 for 100-900 microseconds")]
+    SeparationTimeReserved { byValue: u8 },
 }
 
 impl EcuTiming {
@@ -331,7 +380,27 @@ impl EcuTiming {
             });
         }
 
+        self.ValidateSeparationTime()?;
         self.ValidateForcedResponsePending()
+    }
+
+    /// STmin must be a value ISO 15765-2 gives a meaning to.
+    ///
+    /// BlockSize deliberately has no matching check: every one of its 256 values is legal, and
+    /// a large one is a slow link rather than an unstateable number.
+    fn ValidateSeparationTime(&self) -> Result<(), TimingValidationError> {
+        let byValue = self.m_byIsoTpSeparationTimeMin;
+
+        let bIsMilliseconds = byValue <= c_bySeparationTimeMaxMilliseconds;
+        let bIsMicroseconds = (c_bySeparationTimeFirstMicroseconds
+            ..=c_bySeparationTimeLastMicroseconds)
+            .contains(&byValue);
+
+        if bIsMilliseconds || bIsMicroseconds {
+            return Ok(());
+        }
+
+        Err(TimingValidationError::SeparationTimeReserved { byValue })
     }
 
     /// The rules that only apply when the operator forces a ResponsePending sequence.
@@ -1212,6 +1281,54 @@ impl Vehicle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_control_defaults_to_no_pacing_and_accepts_both_stmin_units() {
+        // The default is what this engine advertised before these knobs existed; changing it
+        // would alter every link that never asked for pacing.
+        let timing = EcuTiming::default();
+        assert_eq!(timing.m_u8IsoTpBlockSize, 0);
+        assert_eq!(timing.m_byIsoTpSeparationTimeMin, 0);
+        assert!(timing.Validate().is_ok());
+
+        for byLegal in [0x00, 0x01, 0x7F, 0xF1, 0xF5, 0xF9] {
+            let timing = EcuTiming {
+                m_byIsoTpSeparationTimeMin: byLegal,
+                ..EcuTiming::default()
+            };
+            assert!(
+                timing.Validate().is_ok(),
+                "STmin 0x{byLegal:02X} is a value ISO 15765-2 defines"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_separation_time_is_refused_but_any_block_size_is_allowed() {
+        for byReserved in [0x80, 0x90, 0xF0, 0xFA, 0xFF] {
+            let timing = EcuTiming {
+                m_byIsoTpSeparationTimeMin: byReserved,
+                ..EcuTiming::default()
+            };
+            assert!(
+                matches!(
+                    timing.Validate(),
+                    Err(TimingValidationError::SeparationTimeReserved { .. })
+                ),
+                "STmin 0x{byReserved:02X} says nothing a tester can act on"
+            );
+        }
+
+        // BlockSize has no reserved values: a large one is a slow link, not an unstateable
+        // number, so it is a behaviour and this validator does not judge behaviours.
+        for u8BlockSize in [0u8, 1, 8, 255] {
+            let timing = EcuTiming {
+                m_u8IsoTpBlockSize: u8BlockSize,
+                ..EcuTiming::default()
+            };
+            assert!(timing.Validate().is_ok(), "BlockSize {u8BlockSize}");
+        }
+    }
 
     #[test]
     fn session_type_maps_to_and_from_sub_function() {

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use axum::{extract::State, Json};
+use bridge::probe::{DetectSerialLinkSpeed, RequestedSerialLinkSpeed, SerialLinkSpeed};
 use bridge::{BridgeStats, CanBridge};
 use isotp::params::IsoTpParameters;
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,9 @@ pub struct HardwareState {
     pub m_strPortName: String,
     /// The bitrate it opened at.
     pub m_u32BitrateBps: u32,
+    /// The host-to-adapter line speed in use, and how that number was arrived at. `None` until
+    /// a link has been opened.
+    pub m_optLinkSpeed: Option<SerialLinkSpeed>,
     /// Its frame counters.
     pub m_optStats: Option<Arc<BridgeStats>>,
 }
@@ -78,6 +82,13 @@ pub struct StartHardwareBody {
     pub port: String,
     /// Bus speed in bits per second. Must be one an adapter can select.
     pub bitrate_bps: u32,
+    /// Host-to-adapter line speed in bits per second — **not** the CAN bitrate.
+    ///
+    /// Omit it and the adapter is asked what it runs at, which is the right thing almost
+    /// always. Name one to skip the probe: to save the second it takes, or because the adapter
+    /// runs a rate the probe does not try.
+    #[serde(default)]
+    pub serial_baud_bps: Option<u32>,
 }
 
 /// What `GET /hw/status` answers.
@@ -87,16 +98,32 @@ pub struct HardwareStatusDto {
     pub running: bool,
     pub port: Option<String>,
     pub bitrate_bps: Option<u32>,
+    /// Host-to-adapter line speed, not the CAN bitrate. The pair below say where it came from,
+    /// because a measured number and an assumed one call for different next steps when long
+    /// requests start arriving with holes in them.
+    pub serial_baud_bps: Option<u32>,
+    pub serial_baud_source: Option<String>,
+    /// What the adapter called itself when it answered the probe, if it did.
+    pub adapter_version: Option<String>,
     pub frames_received: u64,
     pub frames_sent: u64,
 }
 
-/// The serial line speed used to reach an adapter.
+/// Work out the host-to-adapter line speed for this connection.
 ///
 /// This is the rate between host and dongle, not the CAN bitrate. They are set separately and
 /// only one of them appears on the bus — a distinction worth keeping straight, because getting
 /// them confused produces a link that looks open and carries nothing.
-const c_u32SerialBaudRate: u32 = 115_200;
+///
+/// It used to be a constant 115200. It is determined per connection now because the constant
+/// was wrong in a way that was invisible until a long request arrived with holes in it: the
+/// line, not the bus, was the bottleneck, and nothing reported that.
+fn ResolveSerialLinkSpeed(strPortName: &str, optU32Requested: Option<u32>) -> SerialLinkSpeed {
+    match optU32Requested {
+        Some(u32Requested) => RequestedSerialLinkSpeed(u32Requested),
+        None => DetectSerialLinkSpeed(strPortName),
+    }
+}
 
 /// GET /hw/status — whether the simulation is on a wire, and how much has crossed it.
 pub async fn GetHardwareStatus(State(state): State<Arc<AppState>>) -> Json<HardwareStatusDto> {
@@ -132,7 +159,11 @@ pub async fn PostHardwareStart(
         )));
     }
 
-    let boxTransport = serial_can::OpenPort(&body.port, c_u32SerialBaudRate)
+    // Probing opens and closes the port several times, so it happens before the live one is
+    // opened rather than while it is held.
+    let linkSpeed = ResolveSerialLinkSpeed(&body.port, body.serial_baud_bps);
+
+    let boxTransport = serial_can::OpenPort(&body.port, linkSpeed.m_u32BaudRate)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let bus = bridge::bus::SlcanBus::Open(boxTransport, bitrate)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -155,12 +186,25 @@ pub async fn PostHardwareStart(
     hardware.m_optTask = Some(task);
     hardware.m_strPortName = body.port.clone();
     hardware.m_u32BitrateBps = body.bitrate_bps;
+    hardware.m_optLinkSpeed = Some(linkSpeed.clone());
     hardware.m_optStats = Some(arcStats);
 
-    tracing::info!(port = %body.port, bitrate = body.bitrate_bps, "bridging the simulation onto a CAN bus");
+    tracing::info!(
+        port = %body.port,
+        bitrate = body.bitrate_bps,
+        serialBaud = linkSpeed.m_u32BaudRate,
+        serialBaudSource = linkSpeed.m_source.Describe(),
+        "bridging the simulation onto a CAN bus"
+    );
     state.traffic.Publish(TrafficEvent::Lifecycle {
         at_ms: NowMs(),
-        what: format!("on the wire: {} at {} bit/s", body.port, body.bitrate_bps),
+        what: format!(
+            "on the wire: {} at {} bit/s, host link {} baud ({})",
+            body.port,
+            body.bitrate_bps,
+            linkSpeed.m_u32BaudRate,
+            linkSpeed.m_source.Describe()
+        ),
     });
     Ok(Json(BuildStatusDto(&hardware)))
 }
@@ -176,6 +220,7 @@ pub async fn PostHardwareStop(State(state): State<Arc<AppState>>) -> Json<Hardwa
     hardware.m_optStats = None;
     hardware.m_strPortName.clear();
     hardware.m_u32BitrateBps = 0;
+    hardware.m_optLinkSpeed = None;
 
     Json(BuildStatusDto(&hardware))
 }
@@ -187,6 +232,21 @@ fn BuildStatusDto(hardware: &HardwareState) -> HardwareStatusDto {
         running: bIsRunning,
         port: bIsRunning.then(|| hardware.m_strPortName.clone()),
         bitrate_bps: bIsRunning.then_some(hardware.m_u32BitrateBps),
+        serial_baud_bps: hardware
+            .m_optLinkSpeed
+            .as_ref()
+            .filter(|_| bIsRunning)
+            .map(|speed| speed.m_u32BaudRate),
+        serial_baud_source: hardware
+            .m_optLinkSpeed
+            .as_ref()
+            .filter(|_| bIsRunning)
+            .map(|speed| speed.m_source.Describe().to_string()),
+        adapter_version: hardware
+            .m_optLinkSpeed
+            .as_ref()
+            .filter(|_| bIsRunning)
+            .and_then(|speed| speed.m_optStrAdapterVersion.clone()),
         frames_received: hardware
             .m_optStats
             .as_ref()
