@@ -113,6 +113,12 @@ export interface SimulationState {
   protocolLoaded: boolean
   ecus: SimulationEcu[]
   /**
+   * True when the ECUs are not enforcing their own gates — session restrictions, security
+   * locks, services absent from the supported list — so a configured response is always
+   * reachable. It never fabricates an answer.
+   */
+  permissiveMode: boolean
+  /**
    * True when the vehicle has been edited since it was last written to a file. A freshly
    * loaded one is not unsaved — it came from somewhere you still have.
    */
@@ -519,6 +525,8 @@ export const api = {
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
   /** The loaded vehicle as simulation-file text, ready to save. Clears the unsaved marker. */
   simulationExport: () => getJson<SimFileExport>('/simulation/export'),
+  setPermissiveMode: (enabled: boolean) =>
+    postJson<SimulationState>('/simulation/permissive', { enabled }),
   ecuSecurityLevels: (handle: string) =>
     getJson<SecurityLevel[]>(`/simulation/ecus/${handle}/security`),
   setEcuSecurityLevels: (handle: string, levels: SecurityLevel[]) =>

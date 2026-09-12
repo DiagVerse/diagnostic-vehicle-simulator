@@ -261,6 +261,62 @@ export function Simulate() {
 // ---------------------------------------------------------------------------------------
 
 /**
+ * Turn the ECUs' own gates off for the whole vehicle.
+ *
+ * One switch, not one per ECU: a tester's sequence crosses several ECUs, and having it stop at
+ * whichever one was left strict is the problem this removes.
+ */
+function PermissiveSwitch({
+  state,
+  onChanged,
+  onError,
+  busy,
+}: {
+  state: SimulationState
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [working, setWorking] = useState(false)
+
+  async function toggle(enabled: boolean) {
+    setWorking(true)
+    try {
+      onChanged(await api.setPermissiveMode(enabled))
+      onError(null)
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  if (!state.loaded) return null
+
+  return (
+    <div className="rounded-md border border-slate-800 bg-slate-900/40 px-3 py-2">
+      <label className="flex items-start gap-2 text-xs text-slate-300">
+        <input
+          type="checkbox"
+          checked={state.permissiveMode}
+          disabled={busy || working}
+          onChange={(e) => void toggle(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Permissive mode
+          <span className="block text-[11px] text-slate-500">
+            {state.permissiveMode
+              ? 'Gates off: session restrictions, security locks and the supported-service list are not enforced, so anything you have configured is reachable. Responses are still only what you configured — nothing is invented.'
+              : 'Gates on: each ECU enforces its sessions, security and declared services, as a real one does.'}
+          </span>
+        </span>
+      </label>
+    </div>
+  )
+}
+
+/**
  * Write the loaded vehicle out as a simulation file.
  *
  * Everything configured here — renames, response overrides, security policies, flow control —
@@ -928,6 +984,8 @@ function EcuList({
           {state.ecus.length} ECU{state.ecus.length === 1 ? '' : 's'}
         </span>
       </div>
+
+      <PermissiveSwitch state={state} onChanged={onChanged} onError={onError} busy={busy} />
 
       <SaveVehicleButton state={state} onSaved={onChanged} onError={onError} busy={busy} />
 

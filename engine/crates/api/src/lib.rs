@@ -139,6 +139,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/simulation/export", get(simulation::GetSimulationExport))
         .route(
+            "/simulation/permissive",
+            post(simulation::PostSimulationPermissive),
+        )
+        .route(
             "/simulation/ecus/:requestCanIdHex/security",
             get(simulation::GetEcuSecurityLevels).put(simulation::PutEcuSecurityLevels),
         )

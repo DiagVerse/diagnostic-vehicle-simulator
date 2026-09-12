@@ -21,7 +21,8 @@ use core_domain::model::{
     c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming, SecurityKeyPolicy,
 };
 use plugin_contract::protocol::{
-    c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
+    c_byStateChangeEndTransfer, c_byStateChangeResetToDefaultSession,
+    c_byStateChangeSetActiveSeedLevel, c_byStateChangeSetBlockSequenceCounter,
     c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, RDataIdentifier, RDtc, REcuSnapshot,
     RKeyPolicy, RSecurityLevel, RStateChange,
 };
@@ -106,6 +107,16 @@ pub struct VirtualEcu {
     m_bySessionBeforeRequest: u8,
     m_bySecurityLevelBeforeRequest: u8,
     m_bySeedLevelBeforeRequest: u8,
+    /// The block sequence counter the next TransferData must carry, while one is open.
+    ///
+    /// An `Option` rather than a zero sentinel: the counter wraps 0xFF to 0x00, so 0x00 is an
+    /// ordinary block number and a transfer that read it as "idle" would die at the wrap.
+    /// Diagnostic state, so a reset clears it.
+    m_optByExpectedBlockSequenceCounter: Option<u8>,
+    /// Whether the vehicle is in permissive mode. Held per ECU because that is where a request
+    /// is answered, but set for the whole vehicle at once — see
+    /// `SimulationService::SetPermissiveMode`.
+    m_bIsPermissive: bool,
 }
 
 impl VirtualEcu {
@@ -120,7 +131,19 @@ impl VirtualEcu {
             m_bySessionBeforeRequest: c_bySessionDefault,
             m_bySecurityLevelBeforeRequest: 0,
             m_bySeedLevelBeforeRequest: 0,
+            m_optByExpectedBlockSequenceCounter: None,
+            m_bIsPermissive: false,
         }
+    }
+
+    /// Whether this ECU is currently waving its own gates through.
+    pub fn IsPermissive(&self) -> bool {
+        self.m_bIsPermissive
+    }
+
+    /// Turn permissive mode on or off. Configuration, not diagnostic state.
+    pub fn SetPermissive(&mut self, bIsPermissive: bool) {
+        self.m_bIsPermissive = bIsPermissive;
     }
 
     /// The ECU's static configuration.
@@ -443,6 +466,12 @@ impl VirtualEcu {
             return None;
         }
 
+        // Permissive mode: the operator has said the model's own restrictions are not the
+        // authority here. It stops the ECU refusing; it never invents an answer.
+        if self.m_bIsPermissive {
+            return None;
+        }
+
         // An override is the author saying, of this exact request, "this ECU answers it". That
         // is more specific than a session's service list, which describes what the protocol
         // offers — and without this an override-only service could never be reached at all
@@ -619,6 +648,9 @@ impl VirtualEcu {
             m_vecDids: RVec::from(vecDids),
             m_vecDtcs: RVec::from(vecDtcs),
             m_vecSecurityLevels: RVec::from(vecSecurityLevels),
+            m_byExpectedBlockSequenceCounter: self.m_optByExpectedBlockSequenceCounter.unwrap_or(0),
+            m_bIsTransferInProgress: self.m_optByExpectedBlockSequenceCounter.is_some(),
+            m_bIsPermissive: self.m_bIsPermissive,
         }
     }
 
@@ -650,6 +682,12 @@ impl VirtualEcu {
         self.m_byActiveSeedLevel = 0;
     }
 
+    /// Abandon any transfer in progress, so the next TransferData is refused rather than
+    /// silently joining a sequence that no longer means anything.
+    fn AbandonTransfer(&mut self) {
+        self.m_optByExpectedBlockSequenceCounter = None;
+    }
+
     fn ApplyStateChange(&mut self, change: &RStateChange) {
         match change.m_byKind {
             c_byStateChangeSetSession => {
@@ -670,9 +708,22 @@ impl VirtualEcu {
                 tracing::info!(ecu = %self.m_config.m_strName, "ECU reset: returning to default session");
                 self.m_byCurrentSession = c_bySessionDefault;
                 self.LockSecurity("the ECU was reset");
+                self.AbandonTransfer();
             }
             c_byStateChangeSetActiveSeedLevel => {
                 self.m_byActiveSeedLevel = change.m_byValue;
+            }
+            c_byStateChangeSetBlockSequenceCounter => {
+                tracing::debug!(
+                    ecu = %self.m_config.m_strName,
+                    expecting = format!("{:02X}", change.m_byValue),
+                    "block sequence counter set"
+                );
+                self.m_optByExpectedBlockSequenceCounter = Some(change.m_byValue);
+            }
+            c_byStateChangeEndTransfer => {
+                tracing::debug!(ecu = %self.m_config.m_strName, "transfer ended");
+                self.m_optByExpectedBlockSequenceCounter = None;
             }
             c_byStateChangeUnlockSecurity => {
                 let byLevel = change.m_byValue;

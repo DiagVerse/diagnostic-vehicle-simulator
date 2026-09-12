@@ -220,6 +220,9 @@ pub struct SimulationStateDto {
     pub vehicle_name: Option<String>,
     pub protocol_loaded: bool,
     pub ecus: Vec<SimulationEcuDto>,
+    /// True when the vehicle's ECUs are not enforcing their own gates — session restrictions,
+    /// security locks, services absent from the supported list.
+    pub permissive_mode: bool,
     /// True when the loaded vehicle has been changed since it was last written to a file.
     ///
     /// A freshly loaded vehicle is not "unsaved": it came from somewhere the operator still
@@ -1478,6 +1481,23 @@ fn ResolveAddressingMode(
     }
 }
 
+/// Request body for `POST /simulation/permissive`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPermissiveBody {
+    pub enabled: bool,
+}
+
+/// POST /simulation/permissive — stop, or resume, enforcing the ECUs' own gates.
+pub async fn PostSimulationPermissive(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SetPermissiveBody>,
+) -> Json<SimulationStateDto> {
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation.SetPermissiveMode(body.enabled);
+    Json(BuildStateDto(&simulation, state.protocol.is_some()))
+}
+
 /// GET /simulation/export — the loaded vehicle as a simulation file.
 ///
 /// Returns the file's text rather than a download header: the browser turns it into a file, and
@@ -1753,6 +1773,7 @@ fn BuildStateDto(simulation: &SimulationService, bProtocolLoaded: bool) -> Simul
     SimulationStateDto {
         loaded: simulation.IsLoaded(),
         running: simulation.IsRunning(),
+        permissive_mode: simulation.IsPermissive(),
         unsaved_changes: bHasUnsavedChanges,
         vehicle_name: simulation
             .Vehicle()

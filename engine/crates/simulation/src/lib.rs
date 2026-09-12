@@ -287,6 +287,10 @@ pub struct SimulationService {
     m_u64ModelRevision: u64,
     /// The revision as it was when the vehicle was last written out.
     m_u64SavedRevision: u64,
+    /// Whether the whole vehicle waves its own gates through. One switch rather than one per
+    /// ECU: a tester's sequence crosses several ECUs, and having it stop at whichever one was
+    /// left strict is the problem this exists to remove.
+    m_bIsPermissive: bool,
 }
 
 impl Default for SimulationService {
@@ -307,7 +311,32 @@ impl SimulationService {
             m_u64ConfigGeneration: 0,
             m_u64ModelRevision: 0,
             m_u64SavedRevision: 0,
+            m_bIsPermissive: false,
         }
+    }
+
+    /// Whether the vehicle is in permissive mode.
+    pub fn IsPermissive(&self) -> bool {
+        self.m_bIsPermissive
+    }
+
+    /// Turn permissive mode on or off for every ECU at once.
+    ///
+    /// Permissive means the ECUs stop enforcing their own gates — session restrictions,
+    /// security locks, services absent from the supported list — so a response the operator
+    /// configured is always reachable. It does not fabricate answers: a request with nothing
+    /// configured still gets the honest refusal.
+    pub fn SetPermissiveMode(&mut self, bIsPermissive: bool) {
+        tracing::info!(
+            permissive = bIsPermissive,
+            ecus = self.m_mapEcus.len(),
+            "permissive mode changed for the whole vehicle"
+        );
+        self.m_bIsPermissive = bIsPermissive;
+        for runningEcu in self.m_mapEcus.values_mut() {
+            runningEcu.SetPermissive(bIsPermissive);
+        }
+        self.BumpModelRevision();
     }
 
     /// True when the loaded model has changed since it was last exported.
@@ -397,6 +426,12 @@ impl SimulationService {
         self.m_mapEcus = mapEcus;
         self.m_mapKeyByLogicalAddress = mapKeyByLogicalAddress;
         self.m_mapFunctionalTargets = mapFunctionalTargets;
+        // A vehicle arriving mid-session inherits the mode the operator already chose; losing
+        // it on every load would make the switch useless in the workflow it exists for.
+        let bIsPermissive = self.m_bIsPermissive;
+        for runningEcu in self.m_mapEcus.values_mut() {
+            runningEcu.SetPermissive(bIsPermissive);
+        }
         self.m_optVehicle = Some(vehicle);
         self.BumpConfigGeneration();
         // A vehicle that has just arrived is not unsaved work: it came from a file, or from a
@@ -517,10 +552,10 @@ impl SimulationService {
             "ECU added"
         );
 
-        self.m_mapEcus.insert(
-            EcuKey::Can(address.m_u32RequestCanId),
-            VirtualEcu::New(config.clone()),
-        );
+        let mut runningEcu = VirtualEcu::New(config.clone());
+        runningEcu.SetPermissive(self.m_bIsPermissive);
+        self.m_mapEcus
+            .insert(EcuKey::Can(address.m_u32RequestCanId), runningEcu);
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             vehicle.m_vecEcus.push(config);
         }
