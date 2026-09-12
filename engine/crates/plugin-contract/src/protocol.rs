@@ -41,8 +41,29 @@ pub struct RSecurityLevel {
     pub m_byRequestSeedSubFunction: u8,
     /// Seed returned on requestSeed.
     pub m_vecSeed: RVec<u8>,
-    /// Key expected on sendKey.
+    /// Key expected on sendKey. Empty unless the policy is to compare against it.
     pub m_vecExpectedKey: RVec<u8>,
+    /// What to do with the key a tester sends.
+    pub m_keyPolicy: RKeyPolicy,
+    /// The code to refuse with under [`RKeyPolicy::RefuseWith`]. Ignored by every other policy.
+    ///
+    /// A plain byte alongside the discriminant rather than a payload inside it: an ABI boundary
+    /// is the wrong place for a data-carrying enum, and the pair survives a plugin built
+    /// against an older header far more gracefully.
+    pub m_byRefusalNrc: u8,
+}
+
+/// FFI-safe mirror of `core-domain`'s `SecurityKeyPolicy`.
+#[repr(u8)]
+#[derive(StableAbi, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RKeyPolicy {
+    /// Compare the key against `m_vecExpectedKey`; unlock on a match, NRC 0x35 otherwise.
+    #[default]
+    CompareWithExpectedKey,
+    /// Accept whatever arrives and unlock.
+    AcceptAnyKey,
+    /// Never unlock; answer with `m_byRefusalNrc`.
+    RefuseWith,
 }
 
 /// FFI-safe snapshot of the ECU state a protocol plugin needs to compute a response.

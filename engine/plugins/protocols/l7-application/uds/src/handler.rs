@@ -10,7 +10,8 @@
 
 use plugin_contract::protocol::{
     c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
-    c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, REcuSnapshot, RStateChange,
+    c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, REcuSnapshot, RKeyPolicy,
+    RStateChange,
 };
 
 // --- Request Service IDs (SIDs) ---------------------------------------------------------
@@ -303,14 +304,30 @@ fn HandleSecuritySendKey(
         }
     };
 
-    // A key may only be sent after its seed was requested.
+    // A key may only be sent after its seed was requested. Checked before the policy, and
+    // deliberately: ISO 14229-1 makes this a sequence rule, not a key rule, so even a level
+    // that accepts any key still refuses one that arrives out of order.
     if snapshot.m_byActiveSeedLevel != level.m_byRequestSeedSubFunction {
         return UdsReply::Negative(c_bySidSecurityAccess, c_byNrcRequestSequenceError);
     }
 
     let vecProvidedKey = &vecRequest[2..];
-    if vecProvidedKey != level.m_vecExpectedKey.as_slice() {
-        return UdsReply::Negative(c_bySidSecurityAccess, c_byNrcInvalidKey);
+    match level.m_keyPolicy {
+        // A level whose key nobody has. Reconstruction produces these: a capture yields the
+        // seed but never a key that will answer the *next* seed, so comparing would refuse
+        // every tester.
+        RKeyPolicy::AcceptAnyKey => {}
+
+        // Fault injection: the tester's rejected-key path, on demand.
+        RKeyPolicy::RefuseWith => {
+            return UdsReply::Negative(c_bySidSecurityAccess, level.m_byRefusalNrc);
+        }
+
+        RKeyPolicy::CompareWithExpectedKey => {
+            if vecProvidedKey != level.m_vecExpectedKey.as_slice() {
+                return UdsReply::Negative(c_bySidSecurityAccess, c_byNrcInvalidKey);
+            }
+        }
     }
 
     // Key accepted: unlock this level and clear the outstanding seed.
@@ -449,6 +466,8 @@ mod tests {
                 m_byRequestSeedSubFunction: 0x01,
                 m_vecSeed: RVec::from(vec![0x11, 0x22, 0x33, 0x44]),
                 m_vecExpectedKey: RVec::from(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+                m_keyPolicy: RKeyPolicy::CompareWithExpectedKey,
+                m_byRefusalNrc: 0,
             }]),
         }
     }
@@ -595,5 +614,74 @@ mod tests {
             reply.m_vecResponse,
             vec![0x7F, 0x22, c_byNrcIncorrectMessageLength]
         );
+    }
+
+    /// Build a snapshot whose single security level uses the given policy, with the seed
+    /// already requested so the sequence rule is satisfied.
+    fn SnapshotWithPolicy(keyPolicy: RKeyPolicy, byRefusalNrc: u8) -> REcuSnapshot {
+        // Extended session, nothing unlocked, seed 0x01 already handed out.
+        let mut snapshot = MakeSnapshot(0x03, 0x00, 0x01);
+        snapshot.m_vecSecurityLevels = RVec::from(vec![RSecurityLevel {
+            m_byRequestSeedSubFunction: 0x01,
+            m_vecSeed: RVec::from(vec![0x11, 0x22, 0x33, 0x44]),
+            m_vecExpectedKey: RVec::from(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+            m_keyPolicy: keyPolicy,
+            m_byRefusalNrc: byRefusalNrc,
+        }]);
+        snapshot
+    }
+
+    #[test]
+    fn a_level_that_accepts_any_key_unlocks_on_a_key_it_has_never_seen() {
+        // The reconstruction case: the seed came from a capture, the key did not, and
+        // comparing would refuse every tester with 0x35.
+        let snapshot = SnapshotWithPolicy(RKeyPolicy::AcceptAnyKey, 0);
+        let reply = HandleRequest(&[0x27, 0x02, 0xDE, 0xAD, 0xBE, 0xEF], &snapshot);
+
+        assert_eq!(&reply.m_vecResponse[..2], &[0x67, 0x02]);
+        assert!(
+            reply
+                .m_vecChanges
+                .iter()
+                .any(|change| change.m_byKind == c_byStateChangeUnlockSecurity),
+            "accepting the key must actually unlock, not merely answer positively"
+        );
+    }
+
+    #[test]
+    fn a_refusing_level_answers_with_the_code_it_was_given() {
+        // Fault injection: the tester's rejected-key path, on demand. 0x36 is
+        // exceededNumberOfAttempts, which a tester handles differently from 0x35.
+        let snapshot = SnapshotWithPolicy(RKeyPolicy::RefuseWith, 0x36);
+        let reply = HandleRequest(&[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD], &snapshot);
+
+        assert_eq!(
+            reply.m_vecResponse,
+            vec![0x7F, 0x27, 0x36],
+            "even the correct key is refused, with the configured code"
+        );
+        assert!(reply.m_vecChanges.is_empty(), "a refusal unlocks nothing");
+    }
+
+    #[test]
+    fn accepting_any_key_still_refuses_one_that_arrives_without_a_seed() {
+        // ISO 14229-1 makes seed-before-key a sequence rule, not a key rule, so relaxing the
+        // key comparison must not relax the ordering too.
+        let mut snapshot = SnapshotWithPolicy(RKeyPolicy::AcceptAnyKey, 0);
+        snapshot.m_byActiveSeedLevel = 0x00;
+
+        let reply = HandleRequest(&[0x27, 0x02, 0xDE, 0xAD], &snapshot);
+        assert_eq!(reply.m_vecResponse, vec![0x7F, 0x27, 0x24]);
+    }
+
+    #[test]
+    fn comparing_is_still_what_a_level_with_a_known_key_does() {
+        let snapshot = SnapshotWithPolicy(RKeyPolicy::CompareWithExpectedKey, 0);
+
+        let wrong = HandleRequest(&[0x27, 0x02, 0x00, 0x00, 0x00, 0x00], &snapshot);
+        assert_eq!(wrong.m_vecResponse, vec![0x7F, 0x27, 0x35]);
+
+        let right = HandleRequest(&[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD], &snapshot);
+        assert_eq!(&right.m_vecResponse[..2], &[0x67, 0x02]);
     }
 }

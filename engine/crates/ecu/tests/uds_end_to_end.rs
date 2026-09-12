@@ -7,7 +7,9 @@
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
-use core_domain::model::{DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityLevel, SessionType};
+use core_domain::model::{
+    DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityKeyPolicy, SecurityLevel, SessionType,
+};
 use core_domain::Confidence;
 use ecu::VirtualEcu;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
@@ -62,6 +64,7 @@ fn MakeEngineEcu() -> Ecu {
         m_byRequestSeedSubFunction: 0x01,
         m_vecSeed: vec![0x11, 0x22, 0x33, 0x44],
         m_vecExpectedKey: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        m_keyPolicy: SecurityKeyPolicy::CompareWithExpectedKey,
     });
 
     ecu

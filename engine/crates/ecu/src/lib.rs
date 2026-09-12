@@ -17,11 +17,13 @@ pub mod schedule;
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
-use core_domain::model::{c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming};
+use core_domain::model::{
+    c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming, SecurityKeyPolicy,
+};
 use plugin_contract::protocol::{
     c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
     c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, RDataIdentifier, RDtc, REcuSnapshot,
-    RSecurityLevel, RStateChange,
+    RKeyPolicy, RSecurityLevel, RStateChange,
 };
 
 use crate::schedule::{BuildResponsePlan, ResolveResponsePendingCount, ResponsePlan};
@@ -168,6 +170,20 @@ impl VirtualEcu {
             "ECU response overrides updated"
         );
         self.m_config.m_vecResponseOverrides = vecOverrides;
+    }
+
+    /// Replace the ECU's security levels.
+    ///
+    /// Configuration, not diagnostic state: a level changing does not lock or unlock anything
+    /// that is already unlocked. A tester that has passed security keeps its access until the
+    /// session ends or the ECU is reset, which is what a real one does.
+    pub fn SetSecurityLevels(&mut self, vecLevels: Vec<core_domain::model::SecurityLevel>) {
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            levels = vecLevels.len(),
+            "ECU security levels updated"
+        );
+        self.m_config.m_vecSecurityLevels = vecLevels;
     }
 
     /// The ECU's timing parameters.
@@ -496,10 +512,24 @@ impl VirtualEcu {
             .m_config
             .m_vecSecurityLevels
             .iter()
-            .map(|level| RSecurityLevel {
-                m_byRequestSeedSubFunction: level.m_byRequestSeedSubFunction,
-                m_vecSeed: RVec::from(level.m_vecSeed.clone()),
-                m_vecExpectedKey: RVec::from(level.m_vecExpectedKey.clone()),
+            .map(|level| {
+                // The data-carrying domain enum flattens to a discriminant plus a byte here,
+                // because that is what survives an ABI boundary.
+                let (keyPolicy, byRefusalNrc) = match level.m_keyPolicy {
+                    SecurityKeyPolicy::CompareWithExpectedKey => {
+                        (RKeyPolicy::CompareWithExpectedKey, 0)
+                    }
+                    SecurityKeyPolicy::AcceptAnyKey => (RKeyPolicy::AcceptAnyKey, 0),
+                    SecurityKeyPolicy::RefuseWith { m_byNrc } => (RKeyPolicy::RefuseWith, m_byNrc),
+                };
+
+                RSecurityLevel {
+                    m_byRequestSeedSubFunction: level.m_byRequestSeedSubFunction,
+                    m_vecSeed: RVec::from(level.m_vecSeed.clone()),
+                    m_vecExpectedKey: RVec::from(level.m_vecExpectedKey.clone()),
+                    m_keyPolicy: keyPolicy,
+                    m_byRefusalNrc: byRefusalNrc,
+                }
             })
             .collect();
 
