@@ -137,6 +137,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/ecus/:requestCanIdHex/overrides",
             get(simulation::GetEcuOverrides).put(simulation::PutEcuOverrides),
         )
+        .route("/simulation/export", get(simulation::GetSimulationExport))
         .route(
             "/simulation/ecus/:requestCanIdHex/security",
             get(simulation::GetEcuSecurityLevels).put(simulation::PutEcuSecurityLevels),

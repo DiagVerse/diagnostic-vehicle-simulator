@@ -281,6 +281,12 @@ pub struct SimulationService {
     /// one lock it was taking anyway. Diagnostic *state* — sessions, security — deliberately
     /// does not bump it; that changes on every request and no transport caches it.
     m_u64ConfigGeneration: u64,
+    /// Bumped by every change to the loaded model, including the ones no transport caches —
+    /// response overrides, security levels, a rename. Compared against
+    /// `m_u64SavedRevision` to answer "is there work here that is not in a file yet?".
+    m_u64ModelRevision: u64,
+    /// The revision as it was when the vehicle was last written out.
+    m_u64SavedRevision: u64,
 }
 
 impl Default for SimulationService {
@@ -299,7 +305,22 @@ impl SimulationService {
             m_mapFunctionalTargets: BTreeMap::new(),
             m_bIsRunning: true,
             m_u64ConfigGeneration: 0,
+            m_u64ModelRevision: 0,
+            m_u64SavedRevision: 0,
         }
+    }
+
+    /// True when the loaded model has changed since it was last exported.
+    ///
+    /// A freshly loaded vehicle counts as saved: it came from a file, or from a capture the
+    /// operator still has. Only edits made here are unsaved work.
+    pub fn HasUnsavedChanges(&self) -> bool {
+        self.m_u64ModelRevision != self.m_u64SavedRevision
+    }
+
+    /// Record that the model as it stands has been written out.
+    pub fn MarkSaved(&mut self) {
+        self.m_u64SavedRevision = self.m_u64ModelRevision;
     }
 
     /// How many times the endpoint configuration has changed since this service was created.
@@ -312,6 +333,12 @@ impl SimulationService {
     /// Record that the endpoint configuration changed.
     fn BumpConfigGeneration(&mut self) {
         self.m_u64ConfigGeneration = self.m_u64ConfigGeneration.wrapping_add(1);
+        self.BumpModelRevision();
+    }
+
+    /// Record that the loaded model changed in some way worth saving.
+    fn BumpModelRevision(&mut self) {
+        self.m_u64ModelRevision = self.m_u64ModelRevision.wrapping_add(1);
     }
 
     /// Put the ECUs on the bus.
@@ -372,6 +399,9 @@ impl SimulationService {
         self.m_mapFunctionalTargets = mapFunctionalTargets;
         self.m_optVehicle = Some(vehicle);
         self.BumpConfigGeneration();
+        // A vehicle that has just arrived is not unsaved work: it came from a file, or from a
+        // capture the operator still has. Only edits made from here count as unsaved.
+        self.MarkSaved();
         Ok(self
             .m_optVehicle
             .as_ref()
@@ -384,6 +414,7 @@ impl SimulationService {
         self.m_mapEcus.clear();
         self.m_mapFunctionalTargets.clear();
         self.BumpConfigGeneration();
+        self.MarkSaved();
         tracing::info!("simulation cleared");
     }
 
@@ -454,6 +485,8 @@ impl SimulationService {
         });
 
         self.BumpConfigGeneration();
+        // Nothing has been configured yet, so there is nothing to lose.
+        self.MarkSaved();
         tracing::info!(vehicle = %strName, "empty vehicle created");
         self.m_optVehicle
             .as_ref()
@@ -537,6 +570,7 @@ impl SimulationService {
             }
         }
 
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -556,6 +590,7 @@ impl SimulationService {
                     strHandle: DescribeKey(key),
                 })?;
         runningEcu.SetResponseOverrides(vecOverrides.clone());
+        self.BumpModelRevision();
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             for config in &mut vehicle.m_vecEcus {
@@ -614,6 +649,7 @@ impl SimulationService {
             "security levels replaced"
         );
         runningEcu.SetSecurityLevels(vecLevels.clone());
+        self.BumpModelRevision();
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             for config in &mut vehicle.m_vecEcus {
@@ -709,6 +745,7 @@ impl SimulationService {
             kind = ?network.m_kind,
             "network declared"
         );
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -743,6 +780,7 @@ impl SimulationService {
         self.CommitVehicleEdit(vehicle)?;
 
         tracing::info!(network = %strNetworkId, "network removed");
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -800,6 +838,7 @@ impl SimulationService {
 
         vehicle.m_identity = identity;
         tracing::info!("vehicle identity updated");
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -830,6 +869,7 @@ impl SimulationService {
                 }
             }
         }
+        self.BumpModelRevision();
         Ok(())
     }
 

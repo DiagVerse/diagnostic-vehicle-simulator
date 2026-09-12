@@ -82,6 +82,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial-can",
+ "simfile",
  "simulation",
  "slcan",
  "tokio",

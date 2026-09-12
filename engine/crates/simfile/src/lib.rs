@@ -13,6 +13,7 @@
 
 pub mod dto;
 pub mod encode;
+pub mod export;
 
 use core_domain::model::{
     CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode, EchoSpan, Ecu, EcuTiming,
@@ -292,7 +293,7 @@ fn BuildEcu(dto: &EcuDto, vecNetworks: &[Network]) -> Result<Ecu, SimFileError> 
     ecu.m_mapDids = BuildDids(dto, &strWhere)?;
     ecu.m_vecDtcs = BuildDtcs(dto, &strWhere)?;
     ecu.m_vecSecurityLevels = BuildSecurityLevels(dto, &strWhere)?;
-    ecu.m_timing = BuildTiming(dto.timing.as_ref());
+    ecu.m_timing = BuildTiming(dto.timing.as_ref(), &strWhere)?;
     ecu.m_vecResponseOverrides = BuildOverrides(&dto.responses, &strWhere)?;
 
     Ok(ecu)
@@ -751,20 +752,36 @@ fn BuildKeyPolicy(
 }
 
 /// Read timing overrides onto the defaults.
-fn BuildTiming(optTiming: Option<&TimingDto>) -> EcuTiming {
+fn BuildTiming(optTiming: Option<&TimingDto>, strWhere: &str) -> Result<EcuTiming, SimFileError> {
     let timing = match optTiming {
         Some(timing) => timing,
-        None => return EcuTiming::default(),
+        None => return Ok(EcuTiming::default()),
+    };
+
+    let bySeparationTime = match timing.iso_tp_separation_time_min.as_deref() {
+        Some(strValue) => ParseHexByte(strValue).map_err(|strReason| SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!("timing isoTpSeparationTimeMin: {strReason}"),
+        })?,
+        None => 0,
     };
 
     let defaults = EcuTiming::default();
-    EcuTiming {
+    let built = EcuTiming {
         m_u32P2ServerMaxMs: timing.p2_ms.unwrap_or(defaults.m_u32P2ServerMaxMs),
         m_u32P2StarServerMaxMs: timing.p2_star_ms.unwrap_or(defaults.m_u32P2StarServerMaxMs),
         m_u32P4ServerMaxMs: timing.p4_ms.unwrap_or(defaults.m_u32P4ServerMaxMs),
         m_u32ResponseDelayMs: timing.response_delay_ms.unwrap_or(0),
+        m_u8IsoTpBlockSize: timing.iso_tp_block_size.unwrap_or(0),
+        m_byIsoTpSeparationTimeMin: bySeparationTime,
         ..defaults
-    }
+    };
+
+    built.Validate().map_err(|error| SimFileError::BadField {
+        strWhere: strWhere.to_string(),
+        strReason: format!("timing: {error}"),
+    })?;
+    Ok(built)
 }
 
 /// Read the answers an ECU gives to particular requests.

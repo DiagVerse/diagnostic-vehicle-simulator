@@ -220,6 +220,11 @@ pub struct SimulationStateDto {
     pub vehicle_name: Option<String>,
     pub protocol_loaded: bool,
     pub ecus: Vec<SimulationEcuDto>,
+    /// True when the loaded vehicle has been changed since it was last written to a file.
+    ///
+    /// A freshly loaded vehicle is not "unsaved": it came from somewhere the operator still
+    /// has. Only edits made here count, which is what makes the indicator worth looking at.
+    pub unsaved_changes: bool,
 }
 
 /// One message an ECU put on the wire, with both when it was scheduled and when it actually
@@ -339,6 +344,16 @@ pub struct SecurityLevelDto {
 #[serde(rename_all = "camelCase")]
 pub struct SetSecurityLevelsBody {
     pub levels: Vec<SecurityLevelDto>,
+}
+
+/// A vehicle written out as a simulation file, ready for the browser to save.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimFileExportDto {
+    /// What to call the file, derived from the vehicle's name.
+    pub file_name: String,
+    /// The file's whole text.
+    pub content: String,
 }
 
 /// An ECU's timing parameters, as the UI reads and writes them.
@@ -1463,6 +1478,60 @@ fn ResolveAddressingMode(
     }
 }
 
+/// GET /simulation/export — the loaded vehicle as a simulation file.
+///
+/// Returns the file's text rather than a download header: the browser turns it into a file, and
+/// keeping this a plain JSON string means the same endpoint serves a script piping it to disk.
+///
+/// Marks the model saved, so the unsaved indicator clears. That is a claim about the operator
+/// having been *given* the file, which is the most this side can honestly know — whether they
+/// then kept it is not something an HTTP handler can find out.
+pub async fn GetSimulationExport(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SimFileExportDto>, ApiError> {
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+
+    let vehicle = simulation.Vehicle().ok_or_else(|| {
+        ApiError::Conflict("no vehicle is loaded, so there is nothing to save".to_string())
+    })?;
+
+    let strFileName = BuildExportFileName(&vehicle.m_strName);
+    let strContent = simfile::export::WriteSimFileText(vehicle).map_err(|error| {
+        ApiError::BadRequest(format!("the vehicle could not be written: {error}"))
+    })?;
+
+    simulation.MarkSaved();
+    tracing::info!(file = %strFileName, bytes = strContent.len(), "vehicle exported as a simulation file");
+
+    Ok(Json(SimFileExportDto {
+        file_name: strFileName,
+        content: strContent,
+    }))
+}
+
+/// A filename a person will recognise, derived from the vehicle's own name.
+///
+/// Anything that is not a letter, digit, dash or underscore becomes a dash: a vehicle called
+/// "CAN(B)/P33C" must not produce a path with a directory separator in it.
+fn BuildExportFileName(strVehicleName: &str) -> String {
+    let strSafe: String = strVehicleName
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let strTrimmed = strSafe.trim_matches('-');
+    if strTrimmed.is_empty() {
+        return "vehicle.simfile.json".to_string();
+    }
+    format!("{strTrimmed}.simfile.json")
+}
+
 /// GET /simulation/ecus/{requestCanIdHex}/security — one ECU's security levels.
 pub async fn GetEcuSecurityLevels(
     State(state): State<Arc<AppState>>,
@@ -1675,6 +1744,7 @@ fn BuildTiming(dto: &EcuTimingDto) -> EcuTiming {
 
 /// Describe the running simulation for the UI.
 fn BuildStateDto(simulation: &SimulationService, bProtocolLoaded: bool) -> SimulationStateDto {
+    let bHasUnsavedChanges = simulation.HasUnsavedChanges();
     let vecEcus: Vec<SimulationEcuDto> = simulation
         .RunningEcus()
         .map(|(key, runningEcu)| BuildEcuDto(key, runningEcu))
@@ -1683,6 +1753,7 @@ fn BuildStateDto(simulation: &SimulationService, bProtocolLoaded: bool) -> Simul
     SimulationStateDto {
         loaded: simulation.IsLoaded(),
         running: simulation.IsRunning(),
+        unsaved_changes: bHasUnsavedChanges,
         vehicle_name: simulation
             .Vehicle()
             .map(|vehicle| vehicle.m_strName.clone()),

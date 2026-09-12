@@ -112,6 +112,11 @@ export interface SimulationState {
   vehicleName: string | null
   protocolLoaded: boolean
   ecus: SimulationEcu[]
+  /**
+   * True when the vehicle has been edited since it was last written to a file. A freshly
+   * loaded one is not unsaved — it came from somewhere you still have.
+   */
+  unsavedChanges: boolean
 }
 
 /** One message an ECU put on the wire, with both its scheduled and its measured offset. */
@@ -249,6 +254,12 @@ export interface EchoSpan {
  * Declaring a service supported does not implement it — the engine's UDS plugin answers seven
  * services, and an override is the only way to get a positive response out of the rest.
  */
+/** A vehicle written out as a simulation file. */
+export interface SimFileExport {
+  fileName: string
+  content: string
+}
+
 /**
  * One SecurityAccess level.
  *
@@ -506,6 +517,8 @@ export const api = {
   hardwareStart: (port: string, bitrateBps: number, serialBaudBps?: number) =>
     postJson<HardwareStatus>('/hw/start', { port, bitrateBps, serialBaudBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
+  /** The loaded vehicle as simulation-file text, ready to save. Clears the unsaved marker. */
+  simulationExport: () => getJson<SimFileExport>('/simulation/export'),
   ecuSecurityLevels: (handle: string) =>
     getJson<SecurityLevel[]>(`/simulation/ecus/${handle}/security`),
   setEcuSecurityLevels: (handle: string, levels: SecurityLevel[]) =>

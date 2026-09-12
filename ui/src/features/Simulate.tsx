@@ -259,6 +259,79 @@ export function Simulate() {
 // Where the vehicle comes from
 // ---------------------------------------------------------------------------------------
 
+/**
+ * Write the loaded vehicle out as a simulation file.
+ *
+ * Everything configured here — renames, response overrides, security policies, flow control —
+ * lives only in the running engine until this is pressed. The file it produces goes back in
+ * through Load → Simulation file, so a worked-on vehicle is something you can keep, reload
+ * tomorrow, or hand to someone else.
+ *
+ * A button with a marker rather than a prompt on every change: applying four overrides in a
+ * row is one piece of work, and interrupting each of them would make the editor tiring to use.
+ */
+function SaveVehicleButton({
+  state,
+  onSaved,
+  onError,
+  busy,
+}: {
+  state: SimulationState
+  onSaved: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [saving, setSaving] = useState(false)
+
+  async function save() {
+    setSaving(true)
+    try {
+      const exported = await api.simulationExport()
+      DownloadTextFile(exported.fileName, exported.content)
+      onError(null)
+      // The engine clears its unsaved marker as it hands the file over, so re-read the state
+      // rather than assuming: what the engine believes is the thing being displayed.
+      onSaved(await api.simulationState())
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!state.loaded) return null
+
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        onClick={save}
+        disabled={busy || saving}
+        className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition hover:border-slate-500 disabled:opacity-40"
+      >
+        {saving ? 'Saving…' : 'Save vehicle to file'}
+      </button>
+      {state.unsavedChanges ? (
+        <span className="text-xs text-amber-400" title="Changes made here are not in any file yet">
+          unsaved changes
+        </span>
+      ) : (
+        <span className="text-xs text-slate-600">saved</span>
+      )}
+    </div>
+  )
+}
+
+/** Hand the browser a file to save. */
+function DownloadTextFile(strFileName: string, strContent: string) {
+  const blob = new Blob([strContent], { type: 'application/json' })
+  const strUrl = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = strUrl
+  anchor.download = strFileName
+  anchor.click()
+  URL.revokeObjectURL(strUrl)
+}
+
 const c_strRememberedEcuKey = 'dvsim.simulate.selectedEcu'
 
 /**
@@ -824,6 +897,8 @@ function EcuList({
           {state.ecus.length} ECU{state.ecus.length === 1 ? '' : 's'}
         </span>
       </div>
+
+      <SaveVehicleButton state={state} onSaved={onChanged} onError={onError} busy={busy} />
 
       {state.ecus.map((ecu) => (
         <EcuCard
