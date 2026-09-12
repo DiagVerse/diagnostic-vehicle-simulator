@@ -69,6 +69,15 @@ export type TrafficEvent =
 export interface TrafficEntry {
   id: number
   event: TrafficEvent
+  /**
+   * Everything in the event, uppercased, for the filter to search.
+   *
+   * Built once when the event arrives rather than during filtering. Searching used to
+   * `JSON.stringify` each entry on every pass, and a pass runs whenever the buffer changes —
+   * so a busy bus meant twenty thousand serialisations several times a second, which is what
+   * made the window stop responding to clicks.
+   */
+  search: string
 }
 
 export type FeedStatus = 'connecting' | 'live' | 'offline'
@@ -96,7 +105,7 @@ const FLUSH_INTERVAL_MS = 250
  * consequence — that you are looking at a window, not a complete record — is surfaced rather
  * than hidden.
  */
-export function useTrafficFeed(maxEntries: number) {
+export function useTrafficFeed(maxEntries: number, wantFrames = true) {
   const [entries, setEntries] = useState<TrafficEntry[]>([])
   const [status, setStatus] = useState<FeedStatus>('connecting')
   const [isPaused, setPaused] = useState(false)
@@ -116,7 +125,10 @@ export function useTrafficFeed(maxEntries: number) {
   }, [isPaused])
 
   useEffect(() => {
-    const source = new EventSource('/events')
+    // The engine drops frames for us when they are not wanted, so a flash transfer never
+    // reaches this tab at all. Changing the choice reopens the stream, which replays the
+    // history filtered the same way — the buffer is rebuilt rather than left inconsistent.
+    const source = new EventSource(wantFrames ? '/events' : '/events?frames=false')
 
     source.onopen = () => setStatus('live')
     source.onerror = () => {
@@ -132,7 +144,11 @@ export function useTrafficFeed(maxEntries: number) {
         if (event.kind === 'replayed') {
           setReplay(event)
         }
-        pendingRef.current.push({ id: nextIdRef.current++, event })
+        pendingRef.current.push({
+          id: nextIdRef.current++,
+          event,
+          search: JSON.stringify(event).toUpperCase(),
+        })
       } catch {
         // A malformed line is not worth tearing the monitor down for; skip it and keep going.
       }
@@ -145,9 +161,16 @@ export function useTrafficFeed(maxEntries: number) {
       }
       pendingRef.current = []
       setTotalSeen((seen) => seen + pending.length)
+
+      // A flood can deliver more in one flush than the buffer will ever hold. Trimming the
+      // batch first means the merge below never builds an array larger than the ceiling —
+      // during a flash transfer that is the difference between one allocation and fifty.
+      const vecArriving =
+        pending.length > maxEntries ? pending.slice(pending.length - maxEntries) : pending
+
       // Appended at the end, and never longer than the ceiling: once full, the oldest go.
       setEntries((previous) => {
-        const vecNext = [...previous, ...pending]
+        const vecNext = [...previous, ...vecArriving]
         return vecNext.length > maxEntries ? vecNext.slice(vecNext.length - maxEntries) : vecNext
       })
     }, FLUSH_INTERVAL_MS)
@@ -156,7 +179,7 @@ export function useTrafficFeed(maxEntries: number) {
       window.clearInterval(flush)
       source.close()
     }
-  }, [maxEntries])
+  }, [maxEntries, wantFrames])
 
   const clear = useCallback(() => {
     pendingRef.current = []

@@ -51,11 +51,12 @@ export function OpenMonitorWindow(): void {
  * make the app itself stutter.
  */
 export function TrafficMonitor({ standalone = false }: { standalone?: boolean }) {
-  const { entries, status, isPaused, setPaused, totalSeen, replay, clear } = useTrafficFeed(
-    standalone ? WINDOW_BUFFER : PANEL_BUFFER,
-  )
   const [filter, setFilter] = useState('')
   const [showFrames, setShowFrames] = useState(true)
+  const { entries, status, isPaused, setPaused, totalSeen, replay, clear } = useTrafficFeed(
+    standalone ? WINDOW_BUFFER : PANEL_BUFFER,
+    showFrames,
+  )
 
   const vecVisible = useMemo(
     () => FilterEntries(entries, filter, showFrames),
@@ -98,6 +99,11 @@ export function TrafficMonitor({ standalone = false }: { standalone?: boolean })
             />
             frames
           </label>
+          {!showFrames && (
+            <span className="text-[11px] text-slate-500" title="The engine stops sending them">
+              not requested
+            </span>
+          )}
           <SmallButton onClick={() => setPaused(!isPaused)}>
             {isPaused ? 'Resume' : 'Pause'}
           </SmallButton>
@@ -424,6 +430,13 @@ function FilterEntries(
 ): TrafficEntry[] {
   const strNeedle = filter.trim().toUpperCase()
 
+  // Nothing to exclude: hand back the same array rather than a copy of it. The buffer changes
+  // several times a second, and copying twenty thousand entries each time to reach an
+  // identical list is pure waste — and re-renders everything downstream for nothing.
+  if (showFrames && strNeedle.length === 0) {
+    return entries
+  }
+
   return entries.filter((entry) => {
     if (!showFrames && entry.event.kind === 'frame') {
       return false
@@ -431,7 +444,8 @@ function FilterEntries(
     if (strNeedle.length === 0) {
       return true
     }
-    return JSON.stringify(entry.event).toUpperCase().includes(strNeedle)
+    // Pre-built when the event arrived. See TrafficEntry.search.
+    return entry.search.includes(strNeedle)
   })
 }
 
