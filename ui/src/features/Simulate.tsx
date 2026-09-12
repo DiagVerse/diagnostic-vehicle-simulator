@@ -3,6 +3,7 @@ import { Badge, DetailRow, PowerSwitch, type BadgeTone } from '../components/pri
 import {
   NEGATIVE_RESPONSES,
   UDS_CATALOGUE,
+  VARIABLE_TAIL_SERVICES,
   type CatalogueService,
   type CatalogueVariant,
 } from './udsCatalogue'
@@ -1218,6 +1219,9 @@ function OverridePanel({
   const [requestHex, setRequestHex] = useState(UDS_CATALOGUE[0].variants[0].requestHex)
   const [responseHex, setResponseHex] = useState(UDS_CATALOGUE[0].variants[0].responseHex)
   const [lastApplied, setLastApplied] = useState<string | null>(null)
+  const [matchTrailing, setMatchTrailing] = useState(
+    DefaultMatchTrailing(UDS_CATALOGUE[0], UDS_CATALOGUE[0].variants[0]),
+  )
 
   const requestCanIdHex = ecu?.requestCanIdHex
 
@@ -1268,11 +1272,15 @@ function OverridePanel({
   }
 
   function selectService(sid: string) {
-    const next = UDS_CATALOGUE.find((entry) => entry.sid === sid)
+    // The per-ECU list, not the static catalogue: this ECU's own identifiers are folded into
+    // 0x22 and 0x2E, and picking from the catalogue here would fill the fields with a
+    // well-known identifier the operator did not choose.
+    const next = vecServices.find((entry) => entry.sid === sid)
     if (!next) return
     setServiceSid(sid)
     setVariantIndex(0)
     fillFor(next.variants[0].requestHex, next.variants[0].responseHex)
+    setMatchTrailing(DefaultMatchTrailing(next, next.variants[0]))
   }
 
   function selectVariant(index: number) {
@@ -1280,6 +1288,7 @@ function OverridePanel({
     if (!next) return
     setVariantIndex(index)
     fillFor(next.requestHex, next.responseHex)
+    setMatchTrailing(DefaultMatchTrailing(service, next))
   }
 
   async function save(vecNext: ResponseOverride[], strAppliedLabel: string | null) {
@@ -1305,7 +1314,7 @@ function OverridePanel({
   function apply(action: 'substitute' | 'suppress') {
     const rule: ResponseOverride = {
       requestHex,
-      matchTrailingBytes: existing?.matchTrailingBytes ?? false,
+      matchTrailingBytes: matchTrailing,
       action,
       responseHex: action === 'substitute' ? responseHex : null,
       // Echo spans come from the catalogue entry, but only while its request template is
@@ -1396,6 +1405,30 @@ function OverridePanel({
           </select>
         </label>
       </div>
+
+      <label className="mt-2 flex items-start gap-2 text-[11px] text-slate-400">
+        <input
+          type="checkbox"
+          checked={matchTrailing}
+          onChange={(e) => setMatchTrailing(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Match as a prefix, ignoring anything after it.
+          {matchTrailing ? (
+            <span className="text-slate-500">
+              {' '}
+              A request starting with these bytes matches however long it is.
+            </span>
+          ) : (
+            <span className="text-amber-400/90">
+              {' '}
+              Off: the request must be exactly this length. A WriteDataByIdentifier carries the
+              value it is writing, so an exact template never matches one.
+            </span>
+          )}
+        </span>
+      </label>
 
       {!service.implemented && (
         <p className="mt-2 rounded border border-amber-900/50 bg-amber-950/20 px-2 py-1.5 text-[11px] text-amber-400/90">
@@ -1784,6 +1817,9 @@ function ServicesForEcu(ecu: SimulationEcu | null): CatalogueService[] {
         label: `${FormatDid(u16Did)} — on this ECU`,
         requestHex: strRequestHex,
         responseHex: strResponseHex,
+        // A write carries the value after the identifier, and its length is whatever is being
+        // written; a read of one identifier is exactly three bytes.
+        matchTrailingBytes: !bIsRead,
       }
     })
 
@@ -1791,6 +1827,17 @@ function ServicesForEcu(ecu: SimulationEcu | null): CatalogueService[] {
     const vecRest = service.variants.filter((entry) => !setOwn.has(entry.requestHex))
     return { ...service, variants: [...vecOwn, ...vecRest] }
   })
+}
+
+/**
+ * Whether a template should match as a prefix by default.
+ *
+ * The variant decides if it says so; otherwise the service does. Services in
+ * `VARIABLE_TAIL_SERVICES` carry a tail no template can state — the value being written, the
+ * key being sent, the block being transferred — and an exact-length match there can never fire.
+ */
+function DefaultMatchTrailing(service: CatalogueService, variant: CatalogueVariant): boolean {
+  return variant.matchTrailingBytes ?? VARIABLE_TAIL_SERVICES.includes(service.sid)
 }
 
 function EmptySecurityLevel(): SecurityLevel {

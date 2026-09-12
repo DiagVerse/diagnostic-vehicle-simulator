@@ -19,6 +19,12 @@ export interface CatalogueVariant {
   responseHex: string
   /** Runs of the request the response should echo, for a wildcard template. */
   echoSpans?: { requestOffset: number; length: number; responseOffset: number }[]
+  /**
+   * Match the template as a prefix, letting a longer request still hit.
+   *
+   * Left undefined the service's own default applies — see `VARIABLE_TAIL_SERVICES`.
+   */
+  matchTrailingBytes?: boolean
 }
 
 export interface CatalogueService {
@@ -32,6 +38,18 @@ export interface CatalogueService {
 
 /** Services the bundled UDS plugin answers on its own. */
 export const IMPLEMENTED_SERVICES = ['10', '11', '19', '22', '27', '31', '3E']
+
+/**
+ * Services whose request carries a variable tail the template cannot state.
+ *
+ * A WriteDataByIdentifier is `2E <did> <value…>`, and the value's length is whatever is being
+ * written. An override matched on exact length therefore never fires: the tester sends four or
+ * forty bytes, the template says three, and the request falls through to the plugin — which for
+ * an unimplemented service answers NRC 0x11, making a perfectly good override look ignored.
+ *
+ * These default to prefix matching for that reason. The checkbox in the editor is the override.
+ */
+export const VARIABLE_TAIL_SERVICES = ['27', '2C', '2E', '2F', '31', '34', '35', '36', '85']
 
 /** Echo the two identifier bytes of a `22`/`2E`-shaped request into the response. */
 const c_echoIdentifier = [{ requestOffset: 1, length: 2, responseOffset: 1 }]
