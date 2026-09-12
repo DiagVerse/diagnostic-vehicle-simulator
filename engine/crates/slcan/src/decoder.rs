@@ -355,6 +355,29 @@ mod tests {
     }
 
     #[test]
+    fn only_a_well_formed_version_reply_counts_as_one() {
+        assert!(crate::IsVersionReply("V1013"));
+        assert!(crate::IsVersionReply("Vffff"));
+
+        // Everything a wrong baud rate produces must be rejected, or the probe would settle on
+        // a line speed that cannot actually carry a frame.
+        for strNotAReply in [
+            "",
+            "V",
+            "V101",
+            "V10133",
+            "N1013",
+            "Vzzzz",
+            "\u{7F}\u{7F}\u{7F}\u{7F}\u{7F}",
+        ] {
+            assert!(
+                !crate::IsVersionReply(strNotAReply),
+                "{strNotAReply:?} is not an adapter identifying itself"
+            );
+        }
+    }
+
+    #[test]
     fn status_flags_are_named_rather_than_printed_as_a_number() {
         assert_eq!(crate::DescribeStatusFlags(0x00), Vec::<&str>::new());
         assert_eq!(crate::DescribeStatusFlags(0x80), vec!["bus off"]);
