@@ -35,6 +35,16 @@ pub const c_bySidTransferData: u8 = 0x36;
 /// RequestTransferExit.
 pub const c_bySidRequestTransferExit: u8 = 0x37;
 
+/// ReadDTCInformation sub-functions this server answers (ISO 14229-1 Table 251).
+pub const c_bySubReportNumberOfDtcByStatusMask: u8 = 0x01;
+pub const c_bySubReportDtcByStatusMask: u8 = 0x02;
+pub const c_bySubReportSupportedDtc: u8 = 0x0A;
+
+/// Which status bits this server maintains. All of them, in this model.
+pub const c_byStatusAvailabilityMask: u8 = 0xFF;
+/// DTC format: ISO 14229-1 Table 250, `00` = SAE J2012-DA DTCFormat_00.
+pub const c_byDtcFormatIdentifier: u8 = 0x00;
+
 /// The first block sequence counter of any transfer (ISO 14229-1 clause 14.2.4).
 pub const c_byFirstBlockSequenceCounter: u8 = 0x01;
 /// `lengthFormatIdentifier` in the RequestDownload response: the maximum block length is
@@ -460,37 +470,105 @@ fn HandleSecuritySendKey(
 
 /// 0x19 ReadDTCInformation — Phase 1 supports sub-function 0x02 (reportDTCByStatusMask).
 fn HandleReadDtcInformation(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
-    const c_bySubReportByStatusMask: u8 = 0x02;
-
-    if vecRequest.len() != 3 {
+    // Every sub-function carries at least the sub-function byte itself.
+    if vecRequest.len() < 2 {
         return UdsReply::Negative(c_bySidReadDtcInformation, c_byNrcIncorrectMessageLength);
     }
 
     let bySubFunction = vecRequest[1];
-    if bySubFunction != c_bySubReportByStatusMask {
-        return UdsReply::Negative(c_bySidReadDtcInformation, c_byNrcSubFunctionNotSupported);
+
+    // The length a request must be depends on which sub-function it is, and that is why the
+    // sub-function is read first. Checking a single fixed length up front refuses `19 0A` —
+    // a perfectly valid two-byte request — for being the wrong length for `19 02`.
+    match bySubFunction {
+        c_bySubReportNumberOfDtcByStatusMask => {
+            ExpectLength(vecRequest, 3).unwrap_or_else(|| ReportDtcCount(vecRequest, snapshot))
+        }
+        c_bySubReportDtcByStatusMask => ExpectLength(vecRequest, 3)
+            .unwrap_or_else(|| ReportDtcsByStatusMask(vecRequest, snapshot)),
+        c_bySubReportSupportedDtc => {
+            ExpectLength(vecRequest, 2).unwrap_or_else(|| ReportSupportedDtcs(snapshot))
+        }
+        // Snapshot and extended records, fault-detection counters, permanent status: real
+        // sub-functions this model holds no data for. Refused as unsupported rather than
+        // answered with something invented, which is the whole point of a reconstruction.
+        _ => UdsReply::Negative(c_bySidReadDtcInformation, c_byNrcSubFunctionNotSupported),
     }
+}
 
+/// `Some(refusal)` when the request is not exactly this long, `None` when it is.
+fn ExpectLength(vecRequest: &[u8], uExpected: usize) -> Option<UdsReply> {
+    if vecRequest.len() == uExpected {
+        return None;
+    }
+    Some(UdsReply::Negative(
+        c_bySidReadDtcInformation,
+        c_byNrcIncorrectMessageLength,
+    ))
+}
+
+/// 0x01 reportNumberOfDTCByStatusMask — how many DTCs match, without listing them.
+fn ReportDtcCount(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
     let byStatusMask = vecRequest[2];
+    let uCount = snapshot
+        .m_vecDtcs
+        .iter()
+        .filter(|dtc| (dtc.m_byStatus & byStatusMask) != 0)
+        .count();
 
+    UdsReply::ResponseOnly(vec![
+        c_bySidReadDtcInformation + c_byPositiveResponseOffset,
+        c_bySubReportNumberOfDtcByStatusMask,
+        c_byStatusAvailabilityMask,
+        c_byDtcFormatIdentifier,
+        ((uCount >> 8) & 0xFF) as u8,
+        (uCount & 0xFF) as u8,
+    ])
+}
+
+/// 0x02 reportDTCByStatusMask — the DTCs whose status intersects the mask.
+fn ReportDtcsByStatusMask(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
+    let byStatusMask = vecRequest[2];
     let mut vecResponse = vec![
         c_bySidReadDtcInformation + c_byPositiveResponseOffset,
-        bySubFunction,
-        0xFF, // statusAvailabilityMask — all bits available in this simple model
+        c_bySubReportDtcByStatusMask,
+        c_byStatusAvailabilityMask,
     ];
 
     for dtc in snapshot.m_vecDtcs.iter() {
-        // Only report DTCs whose status intersects the requested mask.
         if (dtc.m_byStatus & byStatusMask) == 0 {
             continue;
         }
-        vecResponse.push(((dtc.m_u32Code >> 16) & 0xFF) as u8);
-        vecResponse.push(((dtc.m_u32Code >> 8) & 0xFF) as u8);
-        vecResponse.push((dtc.m_u32Code & 0xFF) as u8);
-        vecResponse.push(dtc.m_byStatus);
+        AppendDtc(&mut vecResponse, dtc.m_u32Code, dtc.m_byStatus);
     }
 
     UdsReply::ResponseOnly(vecResponse)
+}
+
+/// 0x0A reportSupportedDTC — every DTC this ECU can report, whatever its status.
+///
+/// Takes no status mask, which is the whole reason this service needed per-sub-function
+/// lengths: the request is two bytes and was being refused for not being three.
+fn ReportSupportedDtcs(snapshot: &REcuSnapshot) -> UdsReply {
+    let mut vecResponse = vec![
+        c_bySidReadDtcInformation + c_byPositiveResponseOffset,
+        c_bySubReportSupportedDtc,
+        c_byStatusAvailabilityMask,
+    ];
+
+    for dtc in snapshot.m_vecDtcs.iter() {
+        AppendDtc(&mut vecResponse, dtc.m_u32Code, dtc.m_byStatus);
+    }
+
+    UdsReply::ResponseOnly(vecResponse)
+}
+
+/// One DTC record: three bytes of code, then its status byte.
+fn AppendDtc(vecResponse: &mut Vec<u8>, u32Code: u32, byStatus: u8) {
+    vecResponse.push(((u32Code >> 16) & 0xFF) as u8);
+    vecResponse.push(((u32Code >> 8) & 0xFF) as u8);
+    vecResponse.push((u32Code & 0xFF) as u8);
+    vecResponse.push(byStatus);
 }
 
 /// 0x31 RoutineControl — Phase 1 acknowledges start/stop/requestResults for any routine id.
@@ -921,5 +999,71 @@ mod tests {
             0x10, 0x11, 0x19, 0x22, 0x27, 0x31, 0x34, 0x35, 0x36, 0x37, 0x3E,
         ]);
         snapshot
+    }
+
+    #[test]
+    fn report_supported_dtc_is_two_bytes_and_is_not_refused_for_it() {
+        // The bug: a single fixed length refused 19 0A with NRC 0x13 for not being the length
+        // of 19 02. The length a request must be depends on which sub-function it is.
+        let snapshot = Snapshot();
+        let reply = HandleRequest(&[0x19, 0x0A], &snapshot);
+
+        assert_eq!(&reply.m_vecResponse[..3], &[0x59, 0x0A, 0xFF]);
+        assert_eq!(
+            &reply.m_vecResponse[3..],
+            &[0x12, 0x34, 0x56, 0x2F],
+            "reportSupportedDTC lists every DTC, whatever its status"
+        );
+    }
+
+    #[test]
+    fn each_sub_function_is_measured_against_its_own_length() {
+        let snapshot = Snapshot();
+
+        // 0x0A takes no status mask, so a third byte is wrong for it...
+        assert_eq!(
+            HandleRequest(&[0x19, 0x0A, 0xFF], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x13]
+        );
+        // ...while 0x02 requires one.
+        assert_eq!(
+            HandleRequest(&[0x19, 0x02], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x13]
+        );
+        // A sub-function alone is never enough to be a request.
+        assert_eq!(
+            HandleRequest(&[0x19], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x13]
+        );
+    }
+
+    #[test]
+    fn an_unsupported_sub_function_is_refused_as_one_rather_than_as_bad_length() {
+        // 0x04 reportDTCSnapshotRecordByDTCNumber is a real sub-function this model holds no
+        // data for. Saying "sub-function not supported" is the truth; inventing a snapshot
+        // record would not be.
+        let snapshot = Snapshot();
+        assert_eq!(
+            HandleRequest(&[0x19, 0x04, 0x12, 0x34, 0x56, 0x01], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x12]
+        );
+    }
+
+    #[test]
+    fn report_number_of_dtc_counts_without_listing() {
+        let snapshot = Snapshot();
+        let reply = HandleRequest(&[0x19, 0x01, 0xFF], &snapshot);
+        assert_eq!(
+            reply.m_vecResponse,
+            vec![0x59, 0x01, 0xFF, 0x00, 0x00, 0x01],
+            "availability mask, format identifier, then a two-byte count"
+        );
+
+        // A mask nothing matches counts nothing, rather than refusing.
+        let reply = HandleRequest(&[0x19, 0x01, 0x00], &snapshot);
+        assert_eq!(
+            reply.m_vecResponse,
+            vec![0x59, 0x01, 0xFF, 0x00, 0x00, 0x00]
+        );
     }
 }
