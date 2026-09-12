@@ -283,12 +283,14 @@ function SaveVehicleButton({
   busy: boolean
 }) {
   const [saving, setSaving] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
 
   async function save() {
     setSaving(true)
     try {
       const exported = await api.simulationExport()
       DownloadTextFile(exported.fileName, exported.content)
+      setNote(DescribeSavedFile(exported.fileName, exported.content))
       onError(null)
       // The engine clears its unsaved marker as it hands the file over, so re-read the state
       // rather than assuming: what the engine believes is the thing being displayed.
@@ -316,10 +318,30 @@ function SaveVehicleButton({
           unsaved changes
         </span>
       ) : (
-        <span className="text-xs text-slate-600">saved</span>
+        <span className="text-xs text-slate-600">{note ?? 'saved'}</span>
       )}
     </div>
   )
+}
+
+/**
+ * What the written file actually contains, counted from the file itself.
+ *
+ * Not decoration. "Did my overrides get saved?" is otherwise unanswerable until the file is
+ * reloaded, and by then the answer arrives too late to do anything about.
+ */
+function DescribeSavedFile(strFileName: string, strContent: string): string {
+  try {
+    const doc = JSON.parse(strContent) as {
+      ecus?: { responses?: unknown[]; security?: unknown[] }[]
+    }
+    const vecEcus = doc.ecus ?? []
+    const uOverrides = vecEcus.reduce((total, ecu) => total + (ecu.responses?.length ?? 0), 0)
+    const uLevels = vecEcus.reduce((total, ecu) => total + (ecu.security?.length ?? 0), 0)
+    return `${strFileName}: ${vecEcus.length} ECUs, ${uOverrides} responses, ${uLevels} security levels`
+  } catch {
+    return strFileName
+  }
 }
 
 /** Hand the browser a file to save. */
@@ -329,8 +351,16 @@ function DownloadTextFile(strFileName: string, strContent: string) {
   const anchor = document.createElement('a')
   anchor.href = strUrl
   anchor.download = strFileName
+
+  // Two things that look unnecessary and are not. A detached anchor's click is ignored by
+  // Firefox, so the element has to be in the document; and revoking the object URL in the same
+  // tick can cancel a download that has not started reading yet. Either one fails silently —
+  // no error, no file — which then looks like the save having lost the work.
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
   anchor.click()
-  URL.revokeObjectURL(strUrl)
+  document.body.removeChild(anchor)
+  setTimeout(() => URL.revokeObjectURL(strUrl), 10_000)
 }
 
 const c_strRememberedEcuKey = 'dvsim.simulate.selectedEcu'
