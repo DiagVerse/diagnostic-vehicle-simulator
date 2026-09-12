@@ -1512,7 +1512,7 @@ const c_arrKeyPolicies: { value: SecurityLevel['keyPolicy']; label: string; hint
   {
     value: 'refuse',
     label: 'Always refuse',
-    hint: 'Never unlock; answer every key with the code below. Fault injection — the tester\u2019s rejected-key path on demand.',
+    hint: 'Never unlock; answer every key with the code below. Fault injection — the tester’s rejected-key path on demand.',
   },
 ]
 
@@ -1545,11 +1545,36 @@ function DescribeHexProblem(value: string, label: string, allowEmpty: boolean): 
   return null
 }
 
-/** The sendKey sub-function a level is unlocked by, or null while the field is unreadable. */
-function SendKeyOf(requestSeedHex: string): number | null {
-  const tokens = HexTokens(requestSeedHex)
+/** The one hex byte in a field, or null while it holds anything else. */
+function SingleByteOf(value: string): number | null {
+  const tokens = HexTokens(value)
   if (tokens.length !== 1 || !/^[0-9a-fA-F]{2}$/.test(tokens[0])) return null
-  return parseInt(tokens[0], 16) + 1
+  return parseInt(tokens[0], 16)
+}
+
+function Hex2(value: number): string {
+  return value.toString(16).toUpperCase().padStart(2, '0')
+}
+
+/**
+ * The requestSeed/sendKey pair a level would cover, or null when the field is not yet a usable
+ * odd sub-function.
+ *
+ * Returns null for an even value rather than pairing it up. Someone who typed 02 meant "the
+ * level for 27 02", and telling them it "handles 27 02 requestSeed and 27 03 sendKey" confirms
+ * the misreading in the same breath the error below denies it.
+ */
+function CoveredPairOf(requestSeedHex: string): { requestSeed: string; sendKey: string } | null {
+  const value = SingleByteOf(requestSeedHex)
+  if (value === null || value % 2 === 0) return null
+  return { requestSeed: Hex2(value), sendKey: Hex2(value + 1) }
+}
+
+/** For an even sub-function, the odd one that names the same level. */
+function OddSubFunctionFor(requestSeedHex: string): string | null {
+  const value = SingleByteOf(requestSeedHex)
+  if (value === null || value % 2 !== 0 || value === 0) return null
+  return Hex2(value - 1)
 }
 
 /** Everything wrong with one level, or null when it would be accepted. */
@@ -1561,8 +1586,7 @@ function DescribeLevelProblem(level: SecurityLevel): string | null {
 
   const value = parseInt(seedTokens[0], 16)
   if (value % 2 === 0) {
-    const suggested = (value - 1 + 256) % 256
-    return `0x${seedTokens[0].toUpperCase()} is a sendKey sub-function. A level is named by its requestSeed — the odd value below it — so use ${suggested.toString(16).toUpperCase().padStart(2, '0')} here, and this level will handle 27 ${seedTokens[0].toUpperCase()}.`
+    return `27 ${Hex2(value)} is the sendKey half of a pair, and a level is named by the requestSeed half — the odd value below it. Naming this level ${Hex2((value - 1 + 256) % 256)} is what makes it answer 27 ${Hex2(value)}.`
   }
 
   const seedProblem = DescribeHexProblem(level.seedHex, 'Seed', true)
@@ -1735,17 +1759,17 @@ function SecurityPanel({
                   mono
                 />
                 <p className="mt-1 text-xs text-slate-500">
-                  {SendKeyOf(level.requestSeedHex) === null ? (
-                    'One hex byte, odd \u2014 e.g. 01'
+                  {CoveredPairOf(level.requestSeedHex) === null ? (
+                    'One hex byte, odd — e.g. 01'
                   ) : (
                     <>
                       handles{' '}
                       <span className="font-mono text-slate-400">
-                        27 {level.requestSeedHex.trim().toUpperCase().padStart(2, '0')}
+                        27 {CoveredPairOf(level.requestSeedHex)!.requestSeed}
                       </span>{' '}
                       requestSeed and{' '}
                       <span className="font-mono text-slate-400">
-                        27 {SendKeyOf(level.requestSeedHex)!.toString(16).toUpperCase().padStart(2, '0')}
+                        27 {CoveredPairOf(level.requestSeedHex)!.sendKey}
                       </span>{' '}
                       sendKey
                     </>
@@ -1777,7 +1801,7 @@ function SecurityPanel({
             <div className="mt-3">
               <TextField
                 label="Seed returned on requestSeed"
-                placeholder="11 22 33 44 (literal bytes \u2014 no ** wildcards)"
+                placeholder="11 22 33 44 (literal bytes — no ** wildcards)"
                 value={level.seedHex}
                 onChange={(v) => update(index, { seedHex: v })}
                 mono
@@ -1787,7 +1811,7 @@ function SecurityPanel({
                   A response override for{' '}
                   <span className="font-mono">{ShadowingOverrideOf(overrides, level)}</span>{' '}
                   already answers requestSeed on this ECU, and an override replaces the response
-                  bytes. This seed will not reach the wire \u2014 leave it blank unless you delete
+                  bytes. This seed will not reach the wire — leave it blank unless you delete
                   that override. The level is still what makes sendKey work.
                 </p>
               )}
@@ -1818,9 +1842,19 @@ function SecurityPanel({
             )}
 
             {arrProblems[index] && (
-              <p className="mt-3 rounded-md border border-rose-900/60 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
-                {arrProblems[index]}
-              </p>
+              <div className="mt-3 rounded-md border border-rose-900/60 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
+                <p>{arrProblems[index]}</p>
+                {OddSubFunctionFor(level.requestSeedHex) && (
+                  <button
+                    onClick={() =>
+                      update(index, { requestSeedHex: OddSubFunctionFor(level.requestSeedHex)! })
+                    }
+                    className="mt-2 rounded border border-rose-700 px-2 py-1 font-mono text-xs text-rose-200 transition hover:border-rose-500"
+                  >
+                    Use {OddSubFunctionFor(level.requestSeedHex)} instead
+                  </button>
+                )}
+              </div>
             )}
 
             <button
