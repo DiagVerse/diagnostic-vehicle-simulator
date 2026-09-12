@@ -82,6 +82,13 @@ pub struct CanBridge {
     /// the main loop and the flow-control wait draw from, the second would be thrown away and
     /// every segmented response would time out.
     m_queueInbound: VecDeque<CanFrame>,
+    /// Frames taken off the queue while waiting for a flow control that were not it.
+    ///
+    /// They are put back, in order, once the transfer finishes. Discarding them is what makes
+    /// a second ECU's multi-frame request lose ConsecutiveFrames while the first is still
+    /// answering — and the hole then shows up as a sequence error on hardware that sent
+    /// everything correctly.
+    m_vecDeferred: Vec<CanFrame>,
     m_arcStats: Arc<BridgeStats>,
     m_startedAt: Instant,
     /// The simulation's configuration generation these endpoints were built from. Compared
@@ -104,6 +111,7 @@ impl CanBridge {
             m_params: params,
             m_mapEndpoints: BTreeMap::new(),
             m_queueInbound: VecDeque::new(),
+            m_vecDeferred: Vec::new(),
             m_arcStats: Arc::new(BridgeStats::default()),
             m_startedAt: Instant::now(),
             m_u64EndpointGeneration: 0,
@@ -379,12 +387,13 @@ impl CanBridge {
         ExecutePlans(&vecResponses, &mut fnOnFrame).await;
 
         for (u32ResponseCanId, vecBytes) in vecDue {
-            self.TransmitPdu(u32ResponseCanId, &vecBytes).await;
+            self.TransmitPdu(u32RequestCanId, u32ResponseCanId, &vecBytes)
+                .await;
         }
     }
 
     /// Send one PDU, segmenting it and obeying the tester's flow control.
-    async fn TransmitPdu(&mut self, u32ResponseCanId: u32, vecPdu: &[u8]) {
+    async fn TransmitPdu(&mut self, u32RequestCanId: u32, u32ResponseCanId: u32, vecPdu: &[u8]) {
         let mut transmitter = IsoTpTransmitter::New(self.m_params);
 
         let vecFirst = match transmitter.Begin(vecPdu) {
@@ -397,10 +406,14 @@ impl CanBridge {
         self.SendRaw(u32ResponseCanId, vecFirst, self.NowSeconds());
 
         while *transmitter.State() != TransmitState::Complete {
-            match self.AwaitFlowControl(&mut transmitter).await {
+            match self
+                .AwaitFlowControl(u32RequestCanId, &mut transmitter)
+                .await
+            {
                 Ok(()) => {}
                 Err(error) => {
                     tracing::warn!(%error, responseCanId = format!("{u32ResponseCanId:03X}"), "response abandoned");
+                    self.RestoreDeferredFrames();
                     return;
                 }
             }
@@ -414,11 +427,32 @@ impl CanBridge {
                 self.SendRaw(u32ResponseCanId, vecFrame, self.NowSeconds());
             }
         }
+
+        self.RestoreDeferredFrames();
+    }
+
+    /// Put everything set aside during a transfer back at the head of the queue, in the order
+    /// it arrived, so the next pump deals with it as though the transfer had not happened.
+    fn RestoreDeferredFrames(&mut self) {
+        if self.m_vecDeferred.is_empty() {
+            return;
+        }
+
+        tracing::debug!(
+            frames = self.m_vecDeferred.len(),
+            "returning frames set aside during a transfer"
+        );
+        // Pushed to the front in reverse, which puts them back in their original order ahead of
+        // anything that has arrived since.
+        for frame in self.m_vecDeferred.drain(..).rev() {
+            self.m_queueInbound.push_front(frame);
+        }
     }
 
     /// Poll the bus until the tester's flow control turns up, or the timeout expires.
     async fn AwaitFlowControl(
         &mut self,
+        u32TransmittingForCanId: u32,
         transmitter: &mut IsoTpTransmitter,
     ) -> Result<(), IsoTpTransportError> {
         let deadline = Instant::now() + c_timeoutFlowControl;
@@ -443,13 +477,22 @@ impl CanBridge {
                 continue;
             }
 
-            // Anything else arriving mid-transfer is dropped. An ECU part-way through
-            // answering has told the tester it is busy, and a real one does not take a new
-            // request; interleaving two messages on one identifier would be unrecoverable.
-            tracing::warn!(
-                canId = format!("{:03X}", frame.m_u32CanId),
-                "dropping a frame that arrived while this ECU was mid-transfer"
-            );
+            // A frame for the identifier being answered is dropped: this ECU has told the
+            // tester it is busy, a real one does not take a new request mid-response, and
+            // interleaving two messages on one identifier is unrecoverable.
+            if frame.m_u32CanId == u32TransmittingForCanId {
+                tracing::warn!(
+                    canId = format!("{:03X}", frame.m_u32CanId),
+                    "dropping a frame that arrived while this ECU was mid-transfer"
+                );
+                continue;
+            }
+
+            // A frame for any *other* identifier belongs to a different conversation and is
+            // nothing to do with this transfer. Dropping it used to punch a hole in that ECU's
+            // message, which surfaces as a consecutive-frame sequence error on a bus where
+            // every frame was in fact sent correctly.
+            self.m_vecDeferred.push(frame);
         }
         Ok(())
     }
