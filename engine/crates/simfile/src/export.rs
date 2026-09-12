@@ -235,7 +235,7 @@ fn BuildTimingDto(timing: &EcuTiming) -> Option<TimingDto> {
         ),
         p4_ms: DifferentU32(timing.m_u32P4ServerMaxMs, defaults.m_u32P4ServerMaxMs),
         response_delay_ms: DifferentU32(timing.m_u32ResponseDelayMs, 0),
-        iso_tp_block_size: if timing.m_u8IsoTpBlockSize == 0 {
+        iso_tp_block_size: if timing.m_u8IsoTpBlockSize == defaults.m_u8IsoTpBlockSize {
             None
         } else {
             Some(timing.m_u8IsoTpBlockSize)

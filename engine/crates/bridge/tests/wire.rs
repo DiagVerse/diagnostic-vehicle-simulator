@@ -164,7 +164,8 @@ async fn a_multi_frame_request_is_flow_controlled_on_the_response_identifier() {
     assert_eq!(vecFlowControl.len(), 1);
     // On 0x7E8, not 0x7E0: that is where the tester's transmitter is listening.
     assert_eq!(vecFlowControl[0].0, 0x7E8);
-    assert_eq!(&vecFlowControl[0].1[0..3], &[0x30, 0x00, 0x00]);
+    // BlockSize 1 is the default: one frame per flow control, which every link can carry.
+    assert_eq!(&vecFlowControl[0].1[0..3], &[0x30, 0x01, 0x00]);
 
     // The trailing pad bytes must not become part of the request.
     handle.InjectFrame(Frame(
@@ -383,8 +384,8 @@ async fn changing_an_ecus_flow_control_reaches_a_bridge_that_is_already_running(
     let vecBefore = Sent(&handle);
     assert_eq!(
         &vecBefore[0].1[0..3],
-        &[0x30, 0x00, 0x00],
-        "the default is still send-it-all"
+        &[0x30, 0x01, 0x00],
+        "the default paces one frame per flow control"
     );
 
     {

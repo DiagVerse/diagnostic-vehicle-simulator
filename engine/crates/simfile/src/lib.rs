@@ -772,7 +772,9 @@ fn BuildTiming(optTiming: Option<&TimingDto>, strWhere: &str) -> Result<EcuTimin
         m_u32P2StarServerMaxMs: timing.p2_star_ms.unwrap_or(defaults.m_u32P2StarServerMaxMs),
         m_u32P4ServerMaxMs: timing.p4_ms.unwrap_or(defaults.m_u32P4ServerMaxMs),
         m_u32ResponseDelayMs: timing.response_delay_ms.unwrap_or(0),
-        m_u8IsoTpBlockSize: timing.iso_tp_block_size.unwrap_or(0),
+        m_u8IsoTpBlockSize: timing
+            .iso_tp_block_size
+            .unwrap_or(defaults.m_u8IsoTpBlockSize),
         m_byIsoTpSeparationTimeMin: bySeparationTime,
         ..defaults
     };

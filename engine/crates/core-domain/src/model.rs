@@ -336,10 +336,13 @@ impl Default for EcuTiming {
             m_bForceResponsePending: false,
             m_u8ForcedResponsePendingCount: DefaultForcedResponsePendingCount(),
             m_bDropFinalResponse: false,
-            // No pacing, matching what this engine advertised before these knobs existed. It
-            // is the correct default for a model that is not on a wire and for a link with
-            // bandwidth to spare; a slow adapter needs it raised. See the field docs.
-            m_u8IsoTpBlockSize: 0,
+            // One frame per FlowControl. Not the fastest choice — that is 0, "send them all"
+            // — but the only one that works on every link without being told about it. An
+            // SLCAN dongle on a 115200 baud line carries about an eighth of what a 500 kbit/s
+            // bus delivers, and a default of 0 loses the middle of every long request there,
+            // which is a silent wrong answer rather than a slow one. Raise it, or set it to 0,
+            // once the link is known to keep up.
+            m_u8IsoTpBlockSize: 1,
             m_byIsoTpSeparationTimeMin: 0,
         }
     }
@@ -1376,8 +1379,10 @@ mod tests {
     fn flow_control_defaults_to_no_pacing_and_accepts_both_stmin_units() {
         // The default is what this engine advertised before these knobs existed; changing it
         // would alter every link that never asked for pacing.
+        // One frame per flow control: the pacing every link can carry, rather than the
+        // fastest one, which silently loses frames on a slow serial adapter.
         let timing = EcuTiming::default();
-        assert_eq!(timing.m_u8IsoTpBlockSize, 0);
+        assert_eq!(timing.m_u8IsoTpBlockSize, 1);
         assert_eq!(timing.m_byIsoTpSeparationTimeMin, 0);
         assert!(timing.Validate().is_ok());
 

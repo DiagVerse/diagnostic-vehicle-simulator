@@ -28,6 +28,32 @@ use plugin_contract::protocol::{
 
 use crate::schedule::{BuildResponsePlan, ResolveResponsePendingCount, ResponsePlan};
 
+/// Render bytes for a log line.
+fn FormatBytes(vecBytes: &[u8]) -> String {
+    vecBytes
+        .iter()
+        .map(|byByte| format!("{byByte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render an override's pattern the way the editor shows it, wildcards included, so the log
+/// line can be compared against what is on screen without translation.
+fn FormatPattern(vecPattern: &[u8], vecMask: &[u8]) -> String {
+    vecPattern
+        .iter()
+        .enumerate()
+        .map(|(uIndex, byValue)| {
+            if vecMask.get(uIndex).copied().unwrap_or(0xFF) == 0x00 {
+                "**".to_string()
+            } else {
+                format!("{byValue:02X}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// UDS default-session sub-function; the session an ECU powers up in.
 const c_bySessionDefault: u8 = 0x01;
 
@@ -279,6 +305,8 @@ impl VirtualEcu {
         if let Some(vecOverridden) = optOverridden {
             self.DiscardStateChangesOnRefusal(byRequestSid, &vecResponse, &vecOverridden);
             vecResponse = vecOverridden;
+        } else {
+            self.ReportOverrideNearMiss(vecRequest, &vecResponse);
         }
 
         let mut plan = BuildResponsePlan(
@@ -289,6 +317,48 @@ impl VirtualEcu {
         );
         plan.m_bIsOverridden = bIsOverridden;
         plan
+    }
+
+    /// Say so when this ECU has an override for the service and it did not match.
+    ///
+    /// The failure this exists for is silent and indistinguishable from a bug in the engine: a
+    /// request is refused with "service not supported" while an override for that very service
+    /// sits configured and unused, because its pattern was written against a template whose
+    /// address, identifier or value differs from what the tester actually sends. Everything
+    /// looks correct from both ends and nothing says why.
+    ///
+    /// Only fires on a refusal, and only when a rule for the same service exists, so an ECU
+    /// answering normally stays quiet.
+    fn ReportOverrideNearMiss(&self, vecRequest: &[u8], vecResponse: &[u8]) {
+        let bWasRefused = vecResponse.first() == Some(&c_byNegativeResponseSid);
+        if !bWasRefused || vecRequest.is_empty() {
+            return;
+        }
+
+        let byRequestSid = vecRequest[0];
+        let vecCandidates: Vec<&core_domain::model::ResponseOverride> = self
+            .m_config
+            .m_vecResponseOverrides
+            .iter()
+            .filter(|rule| rule.m_vecRequestPattern.first() == Some(&byRequestSid))
+            .collect();
+
+        if vecCandidates.is_empty() {
+            return;
+        }
+
+        for rule in vecCandidates {
+            tracing::warn!(
+                ecu = %self.m_config.m_strName,
+                sid = format!("{byRequestSid:02X}"),
+                request = %FormatBytes(vecRequest),
+                pattern = %FormatPattern(&rule.m_vecRequestPattern, &rule.m_vecRequestMask),
+                matchesPrefixOnly = rule.m_bMatchTrailingBytes,
+                enabled = rule.m_bIsEnabled,
+                note = %rule.m_strNote,
+                "a response override for this service did not match the request; the request was refused instead"
+            );
+        }
     }
 
     /// Apply the user's answer for this request, if one matches.
