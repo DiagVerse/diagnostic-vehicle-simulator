@@ -554,6 +554,32 @@ impl VirtualEcu {
 
     /// Apply one state change requested by the protocol handler. Important transitions are
     /// logged so an operator can follow the ECU's behaviour from the logs alone.
+    /// Return security to locked and drop any outstanding seed.
+    ///
+    /// ISO 14229-1 clause 10.3: a server transitions to locked when it enters the default
+    /// session, and a reset returns it to its power-on state. Enforced here rather than in the
+    /// protocol plugin because this is a rule about the *server's state*, not about how any one
+    /// service is answered — a second plugin driving the same ECU must not be able to skip it.
+    ///
+    /// Dropping the seed matters as much as locking. A seed left armed across a session change
+    /// would let a sendKey from the previous cycle unlock the ECU, and a seed *not* dropped is
+    /// exactly what makes requestSeed report "already unlocked" on the next cycle and answer
+    /// the following sendKey with NRC 0x24.
+    fn LockSecurity(&mut self, strReason: &str) {
+        if self.m_bySecurityUnlockedLevel == 0 && self.m_byActiveSeedLevel == 0 {
+            return;
+        }
+
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            fromLevel = self.m_bySecurityUnlockedLevel,
+            reason = strReason,
+            "security relocked and any outstanding seed dropped"
+        );
+        self.m_bySecurityUnlockedLevel = 0;
+        self.m_byActiveSeedLevel = 0;
+    }
+
     fn ApplyStateChange(&mut self, change: &RStateChange) {
         match change.m_byKind {
             c_byStateChangeSetSession => {
@@ -565,10 +591,15 @@ impl VirtualEcu {
                     "session changed"
                 );
                 self.m_byCurrentSession = byNewSession;
+
+                if byNewSession == c_bySessionDefault {
+                    self.LockSecurity("the default session was entered");
+                }
             }
             c_byStateChangeResetToDefaultSession => {
                 tracing::info!(ecu = %self.m_config.m_strName, "ECU reset: returning to default session");
                 self.m_byCurrentSession = c_bySessionDefault;
+                self.LockSecurity("the ECU was reset");
             }
             c_byStateChangeSetActiveSeedLevel => {
                 self.m_byActiveSeedLevel = change.m_byValue;
