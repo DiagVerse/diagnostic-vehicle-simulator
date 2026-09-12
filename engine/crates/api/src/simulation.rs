@@ -1865,6 +1865,15 @@ fn ParseHexBytesField(strInput: &str, strField: &str) -> Result<Vec<u8>, String>
 
     let mut vecBytes = Vec::new();
     for strToken in SplitPatternTokens(strInput) {
+        // Wildcards get their own message. The response-override editor sits next to this one
+        // and its pattern field does accept `**`, so reaching for one here is a reasonable
+        // mistake that "not a hex byte" does nothing to correct.
+        if IsWildcardToken(&strToken) {
+            return Err(format!(
+                "{strField}: '{strToken}' is a wildcard, and this field holds literal bytes; wildcards match a request pattern, which is a response override's job"
+            ));
+        }
+
         let byValue = u8::from_str_radix(&strToken, 16)
             .map_err(|_| format!("{strField}: '{strToken}' is not a hex byte"))?;
         vecBytes.push(byValue);

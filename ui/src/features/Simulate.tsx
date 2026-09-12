@@ -1516,6 +1516,98 @@ const c_arrKeyPolicies: { value: SecurityLevel['keyPolicy']; label: string; hint
   },
 ]
 
+const c_arrWildcardTokens = ['**', '??', '..', 'xx', 'XX']
+
+/** Split a hex field the way the engine does: whitespace ignored, two characters per byte. */
+function HexTokens(value: string): string[] {
+  const clean = value.replace(/\s+/g, '')
+  const tokens: string[] = []
+  for (let i = 0; i < clean.length; i += 2) tokens.push(clean.slice(i, i + 2))
+  return tokens
+}
+
+/**
+ * What is wrong with a hex field, in the words the engine would use — checked here so the
+ * operator sees it while typing rather than after a rejected round trip.
+ */
+function DescribeHexProblem(value: string, label: string, allowEmpty: boolean): string | null {
+  if (value.trim() === '') {
+    return allowEmpty ? null : `${label} is empty`
+  }
+  for (const token of HexTokens(value)) {
+    if (c_arrWildcardTokens.includes(token)) {
+      return `${label}: ${token} is a wildcard, and this field holds literal bytes. Wildcards match a request pattern, which is a response override's job.`
+    }
+    if (!/^[0-9a-fA-F]{2}$/.test(token)) {
+      return `${label}: "${token}" is not a hex byte`
+    }
+  }
+  return null
+}
+
+/** The sendKey sub-function a level is unlocked by, or null while the field is unreadable. */
+function SendKeyOf(requestSeedHex: string): number | null {
+  const tokens = HexTokens(requestSeedHex)
+  if (tokens.length !== 1 || !/^[0-9a-fA-F]{2}$/.test(tokens[0])) return null
+  return parseInt(tokens[0], 16) + 1
+}
+
+/** Everything wrong with one level, or null when it would be accepted. */
+function DescribeLevelProblem(level: SecurityLevel): string | null {
+  const seedTokens = HexTokens(level.requestSeedHex)
+  if (seedTokens.length !== 1 || !/^[0-9a-fA-F]{2}$/.test(seedTokens[0])) {
+    return 'requestSeed must be exactly one hex byte, e.g. 01'
+  }
+
+  const value = parseInt(seedTokens[0], 16)
+  if (value % 2 === 0) {
+    const suggested = (value - 1 + 256) % 256
+    return `0x${seedTokens[0].toUpperCase()} is a sendKey sub-function. A level is named by its requestSeed — the odd value below it — so use ${suggested.toString(16).toUpperCase().padStart(2, '0')} here, and this level will handle 27 ${seedTokens[0].toUpperCase()}.`
+  }
+
+  const seedProblem = DescribeHexProblem(level.seedHex, 'Seed', true)
+  if (seedProblem) return seedProblem
+
+  if (level.keyPolicy === 'compare') {
+    const keyProblem = DescribeHexProblem(level.expectedKeyHex, 'Expected key', false)
+    if (keyProblem) return keyProblem
+  }
+
+  if (level.keyPolicy === 'refuse') {
+    const nrc = level.refusalNrcHex ?? ''
+    const nrcProblem = DescribeHexProblem(nrc, 'Refusal NRC', false)
+    if (nrcProblem) return nrcProblem
+    if (parseInt(HexTokens(nrc)[0], 16) === 0) {
+      return 'Refusal NRC 00 is the positive-response code, not a negative one'
+    }
+  }
+
+  return null
+}
+
+/**
+ * The request pattern of an override that already answers this level's requestSeed, if one
+ * exists.
+ *
+ * Worth surfacing because the two features overlap invisibly: the protocol runs first and sets
+ * the ECU's state, then an override replaces the bytes. So a level plus a matching override
+ * gives a working unlock whose seed field is dead weight — which looks exactly like the level
+ * not having been applied.
+ */
+function ShadowingOverrideOf(
+  overrides: ResponseOverride[],
+  level: SecurityLevel,
+): string | null {
+  const tokens = HexTokens(level.requestSeedHex)
+  if (tokens.length !== 1) return null
+  const wanted = `27 ${tokens[0].toUpperCase()}`
+
+  const match = overrides.find(
+    (rule) => rule.enabled && rule.requestHex.trim().toUpperCase().startsWith(wanted),
+  )
+  return match ? match.requestHex : null
+}
+
 function EmptySecurityLevel(): SecurityLevel {
   return {
     requestSeedHex: '01',
@@ -1544,6 +1636,7 @@ function SecurityPanel({
   busy: boolean
 }) {
   const [levels, setLevels] = useState<SecurityLevel[] | null>(null)
+  const [overrides, setOverrides] = useState<ResponseOverride[]>([])
   const [draft, setDraft] = useState<SecurityLevel[] | null>(null)
   const [saving, setSaving] = useState(false)
   const [note, setNote] = useState<string | null>(null)
@@ -1555,8 +1648,14 @@ function SecurityPanel({
     if (!handle) return
     void (async () => {
       try {
-        const loaded = await api.ecuSecurityLevels(handle)
-        if (!cancelled) setLevels(loaded)
+        const [loaded, loadedOverrides] = await Promise.all([
+          api.ecuSecurityLevels(handle),
+          api.ecuOverrides(handle),
+        ])
+        if (!cancelled) {
+          setLevels(loaded)
+          setOverrides(loadedOverrides)
+        }
       } catch (e) {
         if (!cancelled) onError(DescribeError(e))
       }
@@ -1597,6 +1696,8 @@ function SecurityPanel({
   }
 
   const bIsDirty = draft !== null
+  const arrProblems = shown.map(DescribeLevelProblem)
+  const firstProblem = arrProblems.find((problem) => problem !== null) ?? null
 
   return (
     <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
@@ -1625,13 +1726,32 @@ function SecurityPanel({
         {shown.map((level, index) => (
           <div key={index} className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
             <div className="grid gap-3 sm:grid-cols-2">
-              <TextField
-                label="requestSeed sub-function"
-                placeholder="01"
-                value={level.requestSeedHex}
-                onChange={(v) => update(index, { requestSeedHex: v })}
-                mono
-              />
+              <div>
+                <TextField
+                  label="requestSeed sub-function"
+                  placeholder="01"
+                  value={level.requestSeedHex}
+                  onChange={(v) => update(index, { requestSeedHex: v })}
+                  mono
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  {SendKeyOf(level.requestSeedHex) === null ? (
+                    'One hex byte, odd \u2014 e.g. 01'
+                  ) : (
+                    <>
+                      handles{' '}
+                      <span className="font-mono text-slate-400">
+                        27 {level.requestSeedHex.trim().toUpperCase().padStart(2, '0')}
+                      </span>{' '}
+                      requestSeed and{' '}
+                      <span className="font-mono text-slate-400">
+                        27 {SendKeyOf(level.requestSeedHex)!.toString(16).toUpperCase().padStart(2, '0')}
+                      </span>{' '}
+                      sendKey
+                    </>
+                  )}
+                </p>
+              </div>
               <label className="block">
                 <span className="text-xs text-slate-400">On sendKey</span>
                 <select
@@ -1657,11 +1777,20 @@ function SecurityPanel({
             <div className="mt-3">
               <TextField
                 label="Seed returned on requestSeed"
-                placeholder="11 22 33 44"
+                placeholder="11 22 33 44 (literal bytes \u2014 no ** wildcards)"
                 value={level.seedHex}
                 onChange={(v) => update(index, { seedHex: v })}
                 mono
               />
+              {ShadowingOverrideOf(overrides, level) && (
+                <p className="mt-1 text-xs text-amber-400">
+                  A response override for{' '}
+                  <span className="font-mono">{ShadowingOverrideOf(overrides, level)}</span>{' '}
+                  already answers requestSeed on this ECU, and an override replaces the response
+                  bytes. This seed will not reach the wire \u2014 leave it blank unless you delete
+                  that override. The level is still what makes sendKey work.
+                </p>
+              )}
             </div>
 
             {level.keyPolicy === 'compare' && (
@@ -1686,6 +1815,12 @@ function SecurityPanel({
                   mono
                 />
               </div>
+            )}
+
+            {arrProblems[index] && (
+              <p className="mt-3 rounded-md border border-rose-900/60 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
+                {arrProblems[index]}
+              </p>
             )}
 
             <button
@@ -1713,12 +1848,14 @@ function SecurityPanel({
         </button>
         <button
           onClick={save}
-          disabled={busy || saving || !bIsDirty}
+          disabled={busy || saving || !bIsDirty || firstProblem !== null}
           className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-600 disabled:opacity-40"
         >
           Apply security
         </button>
-        {bIsDirty && <span className="text-xs text-amber-400">unsaved</span>}
+        {bIsDirty && firstProblem === null && (
+          <span className="text-xs text-amber-400">unsaved</span>
+        )}
         {note && <span className="text-xs text-slate-400">{note}</span>}
       </div>
     </section>
