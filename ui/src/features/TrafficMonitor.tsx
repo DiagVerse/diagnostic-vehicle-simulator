@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   FormatEventTime,
   SaveTrafficLog,
+  SearchTextOf,
   useTrafficFeed,
   type TrafficEntry,
   type TrafficEvent,
@@ -53,7 +54,7 @@ export function OpenMonitorWindow(): void {
 export function TrafficMonitor({ standalone = false }: { standalone?: boolean }) {
   const [filter, setFilter] = useState('')
   const [showFrames, setShowFrames] = useState(true)
-  const { entries, status, isPaused, setPaused, totalSeen, replay, clear } = useTrafficFeed(
+  const { entries, status, isPaused, setPaused, totalSeen, replay, clear, reconnects } = useTrafficFeed(
     standalone ? WINDOW_BUFFER : PANEL_BUFFER,
     showFrames,
   )
@@ -79,6 +80,7 @@ export function TrafficMonitor({ standalone = false }: { standalone?: boolean })
 
         <span className="text-xs text-slate-500">
           {entries.length} held · {totalSeen} seen
+          {reconnects > 1 && ` · reattached ${reconnects - 1}×`}
           {uDropped > 0 && ` · ${uDropped} dropped`}
           {vecVisible.length !== entries.length && ` · ${vecVisible.length} shown`}
         </span>
@@ -444,8 +446,8 @@ function FilterEntries(
     if (strNeedle.length === 0) {
       return true
     }
-    // Pre-built when the event arrived. See TrafficEntry.search.
-    return entry.search.includes(strNeedle)
+    // Built on first use and kept. See TrafficEntry.search.
+    return SearchTextOf(entry).includes(strNeedle)
   })
 }
 

@@ -70,14 +70,23 @@ export interface TrafficEntry {
   id: number
   event: TrafficEvent
   /**
-   * Everything in the event, uppercased, for the filter to search.
+   * Everything in the event, uppercased, for the filter to search — built the first time a
+   * filter actually needs it and kept thereafter.
    *
-   * Built once when the event arrives rather than during filtering. Searching used to
-   * `JSON.stringify` each entry on every pass, and a pass runs whenever the buffer changes —
-   * so a busy bus meant twenty thousand serialisations several times a second, which is what
-   * made the window stop responding to clicks.
+   * Lazy rather than eager, and that is the whole point. Building it on arrival cost a
+   * serialisation per event even though most sessions never type a filter, and made a
+   * reconnect — which replays the engine's entire history in one burst — do twenty thousand
+   * of them inside the event handler, on the main thread, before the tab could draw anything.
    */
-  search: string
+  search?: string
+}
+
+/** The searchable text of one event, built on demand. See `TrafficEntry.search`. */
+export function SearchTextOf(entry: TrafficEntry): string {
+  if (entry.search === undefined) {
+    entry.search = JSON.stringify(entry.event).toUpperCase()
+  }
+  return entry.search
 }
 
 export type FeedStatus = 'connecting' | 'live' | 'offline'
@@ -113,6 +122,8 @@ export function useTrafficFeed(maxEntries: number, wantFrames = true) {
   const [totalSeen, setTotalSeen] = useState(0)
   /** What the engine said it replayed, so the monitor can be honest about where history starts. */
   const [replay, setReplay] = useState<TrafficReplayed | null>(null)
+  /** How many times the feed has attached. More than one means the connection dropped. */
+  const [reconnects, setReconnects] = useState(0)
 
   const pendingRef = useRef<TrafficEntry[]>([])
   const nextIdRef = useRef(1)
@@ -128,7 +139,14 @@ export function useTrafficFeed(maxEntries: number, wantFrames = true) {
     // The engine drops frames for us when they are not wanted, so a flash transfer never
     // reaches this tab at all. Changing the choice reopens the stream, which replays the
     // history filtered the same way — the buffer is rebuilt rather than left inconsistent.
-    const source = new EventSource(wantFrames ? '/events' : '/events?frames=false')
+    // Ask for no more history than this monitor can hold. Replaying twenty thousand events
+    // into a buffer that keeps two thousand is eighteen thousand parsed and discarded, on the
+    // main thread, every time the connection comes back.
+    const params = new URLSearchParams({ history: String(maxEntries) })
+    if (!wantFrames) {
+      params.set('frames', 'false')
+    }
+    const source = new EventSource(`/events?${params.toString()}`)
 
     source.onopen = () => setStatus('live')
     source.onerror = () => {
@@ -142,13 +160,20 @@ export function useTrafficFeed(maxEntries: number, wantFrames = true) {
       try {
         const event = JSON.parse(message.data) as TrafficEvent
         if (event.kind === 'replayed') {
+          // An EventSource reconnects by itself, and the engine replays everything it holds to
+          // whoever attaches — so a dropped connection during a long session delivers the whole
+          // history again, on top of a buffer that already contains it. Appending that meant
+          // thousands of duplicated events and a main-thread stall for each reconnect, which is
+          // what made the window need closing and reopening.
+          //
+          // The replay is authoritative, so the buffer is rebuilt from it rather than grown.
           setReplay(event)
+          pendingRef.current = []
+          setEntries([])
+          setTotalSeen(0)
+          setReconnects((count) => count + 1)
         }
-        pendingRef.current.push({
-          id: nextIdRef.current++,
-          event,
-          search: JSON.stringify(event).toUpperCase(),
-        })
+        pendingRef.current.push({ id: nextIdRef.current++, event })
       } catch {
         // A malformed line is not worth tearing the monitor down for; skip it and keep going.
       }
@@ -187,7 +212,7 @@ export function useTrafficFeed(maxEntries: number, wantFrames = true) {
     setTotalSeen(0)
   }, [])
 
-  return { entries, status, isPaused, setPaused, totalSeen, replay, clear }
+  return { entries, status, isPaused, setPaused, totalSeen, replay, clear, reconnects }
 }
 
 /** Wall-clock time of an event, as a monitor should show it. */

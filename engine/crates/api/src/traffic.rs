@@ -341,7 +341,7 @@ pub async fn GetEvents(
     // Dropping frames here rather than in the monitor is the difference between a browser
     // receiving fifty thousand events during a flash transfer and receiving a few hundred. The
     // exchange lines — request, answer, which ECU — survive, and those are what a person reads.
-    let vecHistory: Vec<TrafficEvent> = if bWantsFrames {
+    let mut vecHistory: Vec<TrafficEvent> = if bWantsFrames {
         vecHistory
     } else {
         vecHistory
@@ -349,6 +349,13 @@ pub async fn GetEvents(
             .filter(|event| !IsFrameEvent(event))
             .collect()
     };
+
+    // Keep the most recent, which is the part anybody scrolls back to first.
+    if let Some(uWanted) = query.history {
+        if vecHistory.len() > uWanted {
+            vecHistory.drain(..vecHistory.len() - uWanted);
+        }
+    }
 
     tracing::info!(
         monitors = state.traffic.SubscriberCount(),
@@ -377,6 +384,12 @@ pub async fn GetEvents(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsQuery {
+    /// How many past events to replay on attach. Left out, everything held is replayed.
+    ///
+    /// Worth bounding because an EventSource reconnects by itself: a long session with a
+    /// dropped connection replays the whole history again, and a monitor that can only hold a
+    /// few thousand events pays to parse twenty thousand in order to throw most of them away.
+    pub history: Option<usize>,
     /// Send individual CAN frames as well as decoded exchanges. Defaults to true.
     ///
     /// Turning it off is not cosmetic. A flash transfer puts tens of thousands of frames on the
