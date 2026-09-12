@@ -17,14 +17,43 @@ pub mod schedule;
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
-use core_domain::model::{c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming};
+use core_domain::model::{
+    c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming, SecurityKeyPolicy,
+};
 use plugin_contract::protocol::{
-    c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
+    c_byStateChangeEndTransfer, c_byStateChangeResetToDefaultSession,
+    c_byStateChangeSetActiveSeedLevel, c_byStateChangeSetBlockSequenceCounter,
     c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, RDataIdentifier, RDtc, REcuSnapshot,
-    RSecurityLevel, RStateChange,
+    RKeyPolicy, RSecurityLevel, RStateChange,
 };
 
 use crate::schedule::{BuildResponsePlan, ResolveResponsePendingCount, ResponsePlan};
+
+/// Render bytes for a log line.
+fn FormatBytes(vecBytes: &[u8]) -> String {
+    vecBytes
+        .iter()
+        .map(|byByte| format!("{byByte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render an override's pattern the way the editor shows it, wildcards included, so the log
+/// line can be compared against what is on screen without translation.
+fn FormatPattern(vecPattern: &[u8], vecMask: &[u8]) -> String {
+    vecPattern
+        .iter()
+        .enumerate()
+        .map(|(uIndex, byValue)| {
+            if vecMask.get(uIndex).copied().unwrap_or(0xFF) == 0x00 {
+                "**".to_string()
+            } else {
+                format!("{byValue:02X}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// UDS default-session sub-function; the session an ECU powers up in.
 const c_bySessionDefault: u8 = 0x01;
@@ -78,6 +107,16 @@ pub struct VirtualEcu {
     m_bySessionBeforeRequest: u8,
     m_bySecurityLevelBeforeRequest: u8,
     m_bySeedLevelBeforeRequest: u8,
+    /// The block sequence counter the next TransferData must carry, while one is open.
+    ///
+    /// An `Option` rather than a zero sentinel: the counter wraps 0xFF to 0x00, so 0x00 is an
+    /// ordinary block number and a transfer that read it as "idle" would die at the wrap.
+    /// Diagnostic state, so a reset clears it.
+    m_optByExpectedBlockSequenceCounter: Option<u8>,
+    /// Whether the vehicle is in permissive mode. Held per ECU because that is where a request
+    /// is answered, but set for the whole vehicle at once — see
+    /// `SimulationService::SetPermissiveMode`.
+    m_bIsPermissive: bool,
 }
 
 impl VirtualEcu {
@@ -92,7 +131,19 @@ impl VirtualEcu {
             m_bySessionBeforeRequest: c_bySessionDefault,
             m_bySecurityLevelBeforeRequest: 0,
             m_bySeedLevelBeforeRequest: 0,
+            m_optByExpectedBlockSequenceCounter: None,
+            m_bIsPermissive: false,
         }
+    }
+
+    /// Whether this ECU is currently waving its own gates through.
+    pub fn IsPermissive(&self) -> bool {
+        self.m_bIsPermissive
+    }
+
+    /// Turn permissive mode on or off. Configuration, not diagnostic state.
+    pub fn SetPermissive(&mut self, bIsPermissive: bool) {
+        self.m_bIsPermissive = bIsPermissive;
     }
 
     /// The ECU's static configuration.
@@ -168,6 +219,20 @@ impl VirtualEcu {
             "ECU response overrides updated"
         );
         self.m_config.m_vecResponseOverrides = vecOverrides;
+    }
+
+    /// Replace the ECU's security levels.
+    ///
+    /// Configuration, not diagnostic state: a level changing does not lock or unlock anything
+    /// that is already unlocked. A tester that has passed security keeps its access until the
+    /// session ends or the ECU is reset, which is what a real one does.
+    pub fn SetSecurityLevels(&mut self, vecLevels: Vec<core_domain::model::SecurityLevel>) {
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            levels = vecLevels.len(),
+            "ECU security levels updated"
+        );
+        self.m_config.m_vecSecurityLevels = vecLevels;
     }
 
     /// The ECU's timing parameters.
@@ -263,6 +328,8 @@ impl VirtualEcu {
         if let Some(vecOverridden) = optOverridden {
             self.DiscardStateChangesOnRefusal(byRequestSid, &vecResponse, &vecOverridden);
             vecResponse = vecOverridden;
+        } else {
+            self.ReportOverrideNearMiss(vecRequest, &vecResponse);
         }
 
         let mut plan = BuildResponsePlan(
@@ -273,6 +340,48 @@ impl VirtualEcu {
         );
         plan.m_bIsOverridden = bIsOverridden;
         plan
+    }
+
+    /// Say so when this ECU has an override for the service and it did not match.
+    ///
+    /// The failure this exists for is silent and indistinguishable from a bug in the engine: a
+    /// request is refused with "service not supported" while an override for that very service
+    /// sits configured and unused, because its pattern was written against a template whose
+    /// address, identifier or value differs from what the tester actually sends. Everything
+    /// looks correct from both ends and nothing says why.
+    ///
+    /// Only fires on a refusal, and only when a rule for the same service exists, so an ECU
+    /// answering normally stays quiet.
+    fn ReportOverrideNearMiss(&self, vecRequest: &[u8], vecResponse: &[u8]) {
+        let bWasRefused = vecResponse.first() == Some(&c_byNegativeResponseSid);
+        if !bWasRefused || vecRequest.is_empty() {
+            return;
+        }
+
+        let byRequestSid = vecRequest[0];
+        let vecCandidates: Vec<&core_domain::model::ResponseOverride> = self
+            .m_config
+            .m_vecResponseOverrides
+            .iter()
+            .filter(|rule| rule.m_vecRequestPattern.first() == Some(&byRequestSid))
+            .collect();
+
+        if vecCandidates.is_empty() {
+            return;
+        }
+
+        for rule in vecCandidates {
+            tracing::warn!(
+                ecu = %self.m_config.m_strName,
+                sid = format!("{byRequestSid:02X}"),
+                request = %FormatBytes(vecRequest),
+                pattern = %FormatPattern(&rule.m_vecRequestPattern, &rule.m_vecRequestMask),
+                matchesPrefixOnly = rule.m_bMatchTrailingBytes,
+                enabled = rule.m_bIsEnabled,
+                note = %rule.m_strNote,
+                "a response override for this service did not match the request; the request was refused instead"
+            );
+        }
     }
 
     /// Apply the user's answer for this request, if one matches.
@@ -354,6 +463,12 @@ impl VirtualEcu {
             .m_config
             .IsServiceAllowedInSession(byRequestSid, self.m_byCurrentSession);
         if bIsAllowed {
+            return None;
+        }
+
+        // Permissive mode: the operator has said the model's own restrictions are not the
+        // authority here. It stops the ECU refusing; it never invents an answer.
+        if self.m_bIsPermissive {
             return None;
         }
 
@@ -496,10 +611,24 @@ impl VirtualEcu {
             .m_config
             .m_vecSecurityLevels
             .iter()
-            .map(|level| RSecurityLevel {
-                m_byRequestSeedSubFunction: level.m_byRequestSeedSubFunction,
-                m_vecSeed: RVec::from(level.m_vecSeed.clone()),
-                m_vecExpectedKey: RVec::from(level.m_vecExpectedKey.clone()),
+            .map(|level| {
+                // The data-carrying domain enum flattens to a discriminant plus a byte here,
+                // because that is what survives an ABI boundary.
+                let (keyPolicy, byRefusalNrc) = match level.m_keyPolicy {
+                    SecurityKeyPolicy::CompareWithExpectedKey => {
+                        (RKeyPolicy::CompareWithExpectedKey, 0)
+                    }
+                    SecurityKeyPolicy::AcceptAnyKey => (RKeyPolicy::AcceptAnyKey, 0),
+                    SecurityKeyPolicy::RefuseWith { m_byNrc } => (RKeyPolicy::RefuseWith, m_byNrc),
+                };
+
+                RSecurityLevel {
+                    m_byRequestSeedSubFunction: level.m_byRequestSeedSubFunction,
+                    m_vecSeed: RVec::from(level.m_vecSeed.clone()),
+                    m_vecExpectedKey: RVec::from(level.m_vecExpectedKey.clone()),
+                    m_keyPolicy: keyPolicy,
+                    m_byRefusalNrc: byRefusalNrc,
+                }
             })
             .collect();
 
@@ -519,11 +648,46 @@ impl VirtualEcu {
             m_vecDids: RVec::from(vecDids),
             m_vecDtcs: RVec::from(vecDtcs),
             m_vecSecurityLevels: RVec::from(vecSecurityLevels),
+            m_byExpectedBlockSequenceCounter: self.m_optByExpectedBlockSequenceCounter.unwrap_or(0),
+            m_bIsTransferInProgress: self.m_optByExpectedBlockSequenceCounter.is_some(),
+            m_bIsPermissive: self.m_bIsPermissive,
         }
     }
 
     /// Apply one state change requested by the protocol handler. Important transitions are
     /// logged so an operator can follow the ECU's behaviour from the logs alone.
+    /// Return security to locked and drop any outstanding seed.
+    ///
+    /// ISO 14229-1 clause 10.3: a server transitions to locked when it enters the default
+    /// session, and a reset returns it to its power-on state. Enforced here rather than in the
+    /// protocol plugin because this is a rule about the *server's state*, not about how any one
+    /// service is answered — a second plugin driving the same ECU must not be able to skip it.
+    ///
+    /// Dropping the seed matters as much as locking. A seed left armed across a session change
+    /// would let a sendKey from the previous cycle unlock the ECU, and a seed *not* dropped is
+    /// exactly what makes requestSeed report "already unlocked" on the next cycle and answer
+    /// the following sendKey with NRC 0x24.
+    fn LockSecurity(&mut self, strReason: &str) {
+        if self.m_bySecurityUnlockedLevel == 0 && self.m_byActiveSeedLevel == 0 {
+            return;
+        }
+
+        tracing::info!(
+            ecu = %self.m_config.m_strName,
+            fromLevel = self.m_bySecurityUnlockedLevel,
+            reason = strReason,
+            "security relocked and any outstanding seed dropped"
+        );
+        self.m_bySecurityUnlockedLevel = 0;
+        self.m_byActiveSeedLevel = 0;
+    }
+
+    /// Abandon any transfer in progress, so the next TransferData is refused rather than
+    /// silently joining a sequence that no longer means anything.
+    fn AbandonTransfer(&mut self) {
+        self.m_optByExpectedBlockSequenceCounter = None;
+    }
+
     fn ApplyStateChange(&mut self, change: &RStateChange) {
         match change.m_byKind {
             c_byStateChangeSetSession => {
@@ -535,13 +699,31 @@ impl VirtualEcu {
                     "session changed"
                 );
                 self.m_byCurrentSession = byNewSession;
+
+                if byNewSession == c_bySessionDefault {
+                    self.LockSecurity("the default session was entered");
+                }
             }
             c_byStateChangeResetToDefaultSession => {
                 tracing::info!(ecu = %self.m_config.m_strName, "ECU reset: returning to default session");
                 self.m_byCurrentSession = c_bySessionDefault;
+                self.LockSecurity("the ECU was reset");
+                self.AbandonTransfer();
             }
             c_byStateChangeSetActiveSeedLevel => {
                 self.m_byActiveSeedLevel = change.m_byValue;
+            }
+            c_byStateChangeSetBlockSequenceCounter => {
+                tracing::debug!(
+                    ecu = %self.m_config.m_strName,
+                    expecting = format!("{:02X}", change.m_byValue),
+                    "block sequence counter set"
+                );
+                self.m_optByExpectedBlockSequenceCounter = Some(change.m_byValue);
+            }
+            c_byStateChangeEndTransfer => {
+                tracing::debug!(ecu = %self.m_config.m_strName, "transfer ended");
+                self.m_optByExpectedBlockSequenceCounter = None;
             }
             c_byStateChangeUnlockSecurity => {
                 let byLevel = change.m_byValue;

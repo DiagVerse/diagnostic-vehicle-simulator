@@ -13,6 +13,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Serde needs a named predicate to omit a `false`; there is no built-in one.
+fn IsFalse(bValue: &bool) -> bool {
+    !*bValue
+}
+
 /// The version this engine writes. Bumped for a change that adds expressive power.
 ///
 /// Version 2 added vehicle architecture: an ECU may declare itself the gateway for other
@@ -34,13 +39,14 @@ pub struct SimFileDto {
     /// What to call the vehicle.
     pub vehicle: String,
     /// The buses. Optional: a file may describe ECUs without saying how they are wired.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<NetworkDto>,
     /// The ECUs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ecus: Vec<EcuDto>,
     /// What the vehicle tells a DoIP tester about itself. Left out, nothing is programmed —
     /// which is a real state, and announced as such rather than as a plausible-looking VIN.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityDto>,
 }
 
@@ -49,20 +55,20 @@ pub struct SimFileDto {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IdentityDto {
     /// The 17-character VIN, as text.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vin: Option<String>,
     /// The entity identification: six bytes in hex, conventionally a MAC address.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eid: Option<String>,
     /// The group identification: six bytes in hex, shared by every entity of one vehicle.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gid: Option<String>,
     /// ISO 13400-2 Table 6, in hex. `00` no further action; `10` central security required.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub further_action: Option<String>,
     /// ISO 13400-2 Table 7, in hex. `00` synchronized; `10` not — which tells a tester to wait
     /// and ask again, and is worth being able to inject.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vin_gid_sync_status: Option<String>,
 }
 
@@ -81,14 +87,14 @@ pub struct NetworkDto {
     ///
     /// Left out on every network, the engine treats each link nothing gateways onto as an
     /// entry point, so a file that does not model gateways needs no entry point either.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IsFalse")]
     pub entry_point: bool,
     /// Arbitration bit rate. Left out means unknown, which is rendered as unknown rather than
     /// filled in with a plausible default.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitrate_bps: Option<u32>,
     /// The CAN-FD data-phase bit rate, for a link that has one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_bitrate_bps: Option<u32>,
 }
 
@@ -99,7 +105,7 @@ pub struct EcuDto {
     /// What to call it: "Engine", "BCM", "ABS".
     pub name: String,
     /// The id of the bus it sits on. Left out means nobody has said.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     /// The networks this ECU forwards diagnostics onto, making it a gateway.
     ///
@@ -107,28 +113,28 @@ pub struct EcuDto {
     /// tester only through this one. A gateway is usually on an Ethernet link and forwards
     /// onto several CAN segments, but nothing here requires that — it forwards onto whatever
     /// it says it does.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gateway_for: Vec<String>,
     /// How a tester addresses it on CAN. Left out for an ECU reachable only over DoIP.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can: Option<CanAddressDto>,
     /// How a tester addresses it over DoIP. Left out for an ECU reachable only over CAN.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doip: Option<DoIpAddressDto>,
     /// Version 1 spelling of `can.request`. Kept so existing files load unchanged.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_can_id: Option<String>,
     /// Version 1 spelling of `can.response`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_can_id: Option<String>,
     /// Version 1 spelling of `can.addressing`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addressing: Option<String>,
     /// Version 1 spelling of `doip.logicalAddress`, as a decimal number.
     #[serde(default)]
     pub logical_address: Option<u16>,
     /// Sessions it can enter: `"default"`, `"programming"`, `"extended"`, `"safety"`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<String>,
     /// Which services are reachable in which session, keyed by session name.
     ///
@@ -137,27 +143,27 @@ pub struct EcuDto {
     /// a real ECU keeps flashing and actuation out of the default session. A session *not*
     /// mentioned stays unrestricted, so locking down `extended` does not silently lock
     /// `default` too.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_services: BTreeMap<String, Vec<String>>,
     /// Service identifiers it supports, in hex. Left out, it gets the ones the engine's UDS
     /// plugin implements.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<String>>,
     /// Data identifiers it answers, keyed by DID in hex.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dids: BTreeMap<String, ValueDto>,
     /// Trouble codes it reports.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dtcs: Vec<DtcDto>,
     /// Security levels it offers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<SecurityDto>,
     /// Its timing, if it should differ from the defaults.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingDto>,
     /// Answers to particular requests, for services the engine does not implement or for
     /// behaviour that differs from the default.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses: Vec<ResponseDto>,
 }
 
@@ -168,13 +174,14 @@ pub struct CanAddressDto {
     /// The identifier a tester addresses it on, in hex.
     pub request: String,
     /// The identifier it answers on, in hex.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub response: String,
     /// `"Normal11Bit"` or `"NormalFixed29Bit"`. Left out, it follows from the identifier width.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addressing: Option<String>,
     /// A broadcast identifier it also listens on, in hex. Left out, the legislated 0x7DF is
     /// used for an 11-bit ECU in the OBD range and nothing is assumed for anything else.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub functional: Option<String>,
 }
 
@@ -215,7 +222,7 @@ pub struct DtcDto {
     /// `"P0123"`, `"P0123-00"` or a raw `"0x012300"`.
     pub code: String,
     /// The status-of-DTC byte in hex. Left out means confirmed and stored.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
 
@@ -227,22 +234,44 @@ pub struct SecurityDto {
     pub request_seed: String,
     /// The seed this level hands out.
     pub seed: String,
-    /// The key it expects back.
+    /// The key it expects back. Only needed under the `compare` policy, which is the default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key: String,
+    /// What to do with the key a tester sends: `compare` (the default), `acceptAny`, or
+    /// `refuse`.
+    ///
+    /// `acceptAny` is the honest choice for a level taken from a capture: the seed was
+    /// observed, the key never usefully was, and comparing against a key nobody has refuses
+    /// every tester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_policy: Option<String>,
+    /// The code `refuse` answers with, in hex. Defaults to `35` (invalidKey).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_nrc: Option<String>,
 }
 
 /// Timing overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TimingDto {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2_ms: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2_star_ms: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p4_ms: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_delay_ms: Option<u32>,
+    /// ConsecutiveFrames this ECU accepts before the tester must wait for another
+    /// FlowControl; 0, the default, means "send the whole message without pausing".
+    ///
+    /// Worth stating in a file: it is the setting that makes a long request survive a slow
+    /// serial CAN adapter, and one an operator does not want to rediscover per session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso_tp_block_size: Option<u8>,
+    /// The raw STmin byte: 0x00-0x7F milliseconds, 0xF1-0xF9 hundreds of microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso_tp_separation_time_min: Option<String>,
 }
 
 /// One answer to one request.
@@ -252,7 +281,7 @@ pub struct ResponseDto {
     /// The request bytes to match. A byte written `**` is a wildcard.
     pub request: String,
     /// The bytes to answer with. Left out means answer with silence.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
     /// Treat `request` as a prefix and accept anything longer.
     ///
@@ -261,7 +290,7 @@ pub struct ResponseDto {
     /// length is not fixed: `2E` carries a value of any size, `36` a block of any size, `31`
     /// may carry routine parameters. Without it those can only ever be answered for one
     /// particular length, which is not a simulation of the service at all.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IsFalse")]
     pub match_trailing_bytes: bool,
     /// Runs of request bytes copied into the response after it is built.
     ///
@@ -269,10 +298,10 @@ pub struct ResponseDto {
     /// sequence counter in a `0x76`, the routine identifier in a `0x71`. With a wildcard
     /// pattern the response would otherwise have to hard-code one value and answer every
     /// request with it, which a tester checking its own echo will catch immediately.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub echo: Vec<EchoSpanDto>,
     /// Why this answer exists, for whoever reads the file next.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
 }
 

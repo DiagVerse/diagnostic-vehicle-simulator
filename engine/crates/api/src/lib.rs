@@ -58,6 +58,13 @@ pub struct AppState {
 struct Health {
     status: &'static str,
     engine_version: &'static str,
+    /// The commit this engine was built from, with a `+` when the tree was dirty.
+    ///
+    /// Reported because a fix that is not in the running binary looks exactly like a fix that
+    /// does not work, and telling those apart from outside was impossible.
+    build_commit: &'static str,
+    /// When the binary was built, as seconds since the epoch.
+    built_at_secs: u64,
     plugin_count: usize,
 }
 
@@ -137,6 +144,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/ecus/:requestCanIdHex/overrides",
             get(simulation::GetEcuOverrides).put(simulation::PutEcuOverrides),
         )
+        .route("/simulation/export", get(simulation::GetSimulationExport))
+        .route(
+            "/simulation/permissive",
+            post(simulation::PostSimulationPermissive),
+        )
+        .route(
+            "/simulation/ecus/:requestCanIdHex/security",
+            get(simulation::GetEcuSecurityLevels).put(simulation::PutEcuSecurityLevels),
+        )
         .route(
             "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
@@ -165,6 +181,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
     Json(Health {
         status: "ok",
         engine_version: env!("CARGO_PKG_VERSION"),
+        build_commit: env!("DVSIM_BUILD_COMMIT"),
+        built_at_secs: env!("DVSIM_BUILT_AT_SECS").parse().unwrap_or(0),
         plugin_count: state.plugins.len(),
     })
 }

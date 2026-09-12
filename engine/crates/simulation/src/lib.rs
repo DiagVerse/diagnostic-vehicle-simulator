@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
 use core_domain::model::{
-    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, Vehicle, VehicleIdentity,
+    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, Vehicle, VehicleIdentity,
 };
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
@@ -281,6 +281,16 @@ pub struct SimulationService {
     /// one lock it was taking anyway. Diagnostic *state* — sessions, security — deliberately
     /// does not bump it; that changes on every request and no transport caches it.
     m_u64ConfigGeneration: u64,
+    /// Bumped by every change to the loaded model, including the ones no transport caches —
+    /// response overrides, security levels, a rename. Compared against
+    /// `m_u64SavedRevision` to answer "is there work here that is not in a file yet?".
+    m_u64ModelRevision: u64,
+    /// The revision as it was when the vehicle was last written out.
+    m_u64SavedRevision: u64,
+    /// Whether the whole vehicle waves its own gates through. One switch rather than one per
+    /// ECU: a tester's sequence crosses several ECUs, and having it stop at whichever one was
+    /// left strict is the problem this exists to remove.
+    m_bIsPermissive: bool,
 }
 
 impl Default for SimulationService {
@@ -299,7 +309,47 @@ impl SimulationService {
             m_mapFunctionalTargets: BTreeMap::new(),
             m_bIsRunning: true,
             m_u64ConfigGeneration: 0,
+            m_u64ModelRevision: 0,
+            m_u64SavedRevision: 0,
+            m_bIsPermissive: false,
         }
+    }
+
+    /// Whether the vehicle is in permissive mode.
+    pub fn IsPermissive(&self) -> bool {
+        self.m_bIsPermissive
+    }
+
+    /// Turn permissive mode on or off for every ECU at once.
+    ///
+    /// Permissive means the ECUs stop enforcing their own gates — session restrictions,
+    /// security locks, services absent from the supported list — so a response the operator
+    /// configured is always reachable. It does not fabricate answers: a request with nothing
+    /// configured still gets the honest refusal.
+    pub fn SetPermissiveMode(&mut self, bIsPermissive: bool) {
+        tracing::info!(
+            permissive = bIsPermissive,
+            ecus = self.m_mapEcus.len(),
+            "permissive mode changed for the whole vehicle"
+        );
+        self.m_bIsPermissive = bIsPermissive;
+        for runningEcu in self.m_mapEcus.values_mut() {
+            runningEcu.SetPermissive(bIsPermissive);
+        }
+        self.BumpModelRevision();
+    }
+
+    /// True when the loaded model has changed since it was last exported.
+    ///
+    /// A freshly loaded vehicle counts as saved: it came from a file, or from a capture the
+    /// operator still has. Only edits made here are unsaved work.
+    pub fn HasUnsavedChanges(&self) -> bool {
+        self.m_u64ModelRevision != self.m_u64SavedRevision
+    }
+
+    /// Record that the model as it stands has been written out.
+    pub fn MarkSaved(&mut self) {
+        self.m_u64SavedRevision = self.m_u64ModelRevision;
     }
 
     /// How many times the endpoint configuration has changed since this service was created.
@@ -312,6 +362,12 @@ impl SimulationService {
     /// Record that the endpoint configuration changed.
     fn BumpConfigGeneration(&mut self) {
         self.m_u64ConfigGeneration = self.m_u64ConfigGeneration.wrapping_add(1);
+        self.BumpModelRevision();
+    }
+
+    /// Record that the loaded model changed in some way worth saving.
+    fn BumpModelRevision(&mut self) {
+        self.m_u64ModelRevision = self.m_u64ModelRevision.wrapping_add(1);
     }
 
     /// Put the ECUs on the bus.
@@ -370,8 +426,17 @@ impl SimulationService {
         self.m_mapEcus = mapEcus;
         self.m_mapKeyByLogicalAddress = mapKeyByLogicalAddress;
         self.m_mapFunctionalTargets = mapFunctionalTargets;
+        // A vehicle arriving mid-session inherits the mode the operator already chose; losing
+        // it on every load would make the switch useless in the workflow it exists for.
+        let bIsPermissive = self.m_bIsPermissive;
+        for runningEcu in self.m_mapEcus.values_mut() {
+            runningEcu.SetPermissive(bIsPermissive);
+        }
         self.m_optVehicle = Some(vehicle);
         self.BumpConfigGeneration();
+        // A vehicle that has just arrived is not unsaved work: it came from a file, or from a
+        // capture the operator still has. Only edits made from here count as unsaved.
+        self.MarkSaved();
         Ok(self
             .m_optVehicle
             .as_ref()
@@ -384,6 +449,7 @@ impl SimulationService {
         self.m_mapEcus.clear();
         self.m_mapFunctionalTargets.clear();
         self.BumpConfigGeneration();
+        self.MarkSaved();
         tracing::info!("simulation cleared");
     }
 
@@ -454,6 +520,8 @@ impl SimulationService {
         });
 
         self.BumpConfigGeneration();
+        // Nothing has been configured yet, so there is nothing to lose.
+        self.MarkSaved();
         tracing::info!(vehicle = %strName, "empty vehicle created");
         self.m_optVehicle
             .as_ref()
@@ -484,10 +552,10 @@ impl SimulationService {
             "ECU added"
         );
 
-        self.m_mapEcus.insert(
-            EcuKey::Can(address.m_u32RequestCanId),
-            VirtualEcu::New(config.clone()),
-        );
+        let mut runningEcu = VirtualEcu::New(config.clone());
+        runningEcu.SetPermissive(self.m_bIsPermissive);
+        self.m_mapEcus
+            .insert(EcuKey::Can(address.m_u32RequestCanId), runningEcu);
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             vehicle.m_vecEcus.push(config);
         }
@@ -537,6 +605,7 @@ impl SimulationService {
             }
         }
 
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -556,6 +625,7 @@ impl SimulationService {
                     strHandle: DescribeKey(key),
                 })?;
         runningEcu.SetResponseOverrides(vecOverrides.clone());
+        self.BumpModelRevision();
 
         if let Some(vehicle) = self.m_optVehicle.as_mut() {
             for config in &mut vehicle.m_vecEcus {
@@ -588,6 +658,54 @@ impl SimulationService {
         // resolves to, and letting one go stale would be a silent routing bug.
         self.m_mapKeyByLogicalAddress = BuildLogicalAddressIndex(&self.m_mapEcus)?;
         Ok(())
+    }
+
+    /// Replace one ECU's security levels.
+    ///
+    /// The whole list is replaced, matching how response overrides are set: the caller sends
+    /// what the ECU should end up with, rather than a patch to reconcile against a list the UI
+    /// may hold a stale copy of. Written to both the running ECU and the loaded model so the
+    /// two cannot drift. The caller validates the levels first.
+    pub fn SetEcuSecurityLevels(
+        &mut self,
+        key: EcuKey,
+        vecLevels: Vec<SecurityLevel>,
+    ) -> Result<(), SimulationError> {
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
+
+        tracing::info!(
+            ecu = %runningEcu.Config().m_strName,
+            levels = vecLevels.len(),
+            "security levels replaced"
+        );
+        runningEcu.SetSecurityLevels(vecLevels.clone());
+        self.BumpModelRevision();
+
+        if let Some(vehicle) = self.m_optVehicle.as_mut() {
+            for config in &mut vehicle.m_vecEcus {
+                if MatchesKey(config, key) {
+                    config.m_vecSecurityLevels = vecLevels;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// One ECU's security levels.
+    pub fn EcuSecurityLevelsOf(&self, key: EcuKey) -> Result<Vec<SecurityLevel>, SimulationError> {
+        self.m_mapEcus
+            .get(&key)
+            .map(|runningEcu| runningEcu.Config().m_vecSecurityLevels.clone())
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })
     }
 
     /// Replace one ECU's timing parameters.
@@ -662,6 +780,7 @@ impl SimulationService {
             kind = ?network.m_kind,
             "network declared"
         );
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -696,6 +815,7 @@ impl SimulationService {
         self.CommitVehicleEdit(vehicle)?;
 
         tracing::info!(network = %strNetworkId, "network removed");
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -753,6 +873,7 @@ impl SimulationService {
 
         vehicle.m_identity = identity;
         tracing::info!("vehicle identity updated");
+        self.BumpModelRevision();
         Ok(())
     }
 
@@ -783,6 +904,7 @@ impl SimulationService {
                 }
             }
         }
+        self.BumpModelRevision();
         Ok(())
     }
 

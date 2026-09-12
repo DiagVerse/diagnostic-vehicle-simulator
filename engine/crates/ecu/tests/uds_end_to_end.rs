@@ -7,7 +7,9 @@
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
-use core_domain::model::{DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityLevel, SessionType};
+use core_domain::model::{
+    DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityKeyPolicy, SecurityLevel, SessionType,
+};
 use core_domain::Confidence;
 use ecu::VirtualEcu;
 use plugin_contract::protocol::{REcuSnapshot, RProtocolOutcome};
@@ -62,6 +64,7 @@ fn MakeEngineEcu() -> Ecu {
         m_byRequestSeedSubFunction: 0x01,
         m_vecSeed: vec![0x11, 0x22, 0x33, 0x44],
         m_vecExpectedKey: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        m_keyPolicy: SecurityKeyPolicy::CompareWithExpectedKey,
     });
 
     ecu
@@ -121,4 +124,75 @@ fn wrong_key_does_not_unlock() {
     let response = ecu.ProcessRequest(&handler, &[0x27, 0x02, 0x00, 0x00, 0x00, 0x00]);
     assert_eq!(response, vec![0x7F, 0x27, 0x35]); // invalidKey
     assert!(!ecu.IsSecurityUnlocked());
+}
+
+/// The exact sequence a tester repeats when it runs a diagnostic session twice.
+///
+/// It regressed in the field: the first cycle unlocked, the second answered the *same* sendKey
+/// with NRC 0x24. Security survived the return to the default session, so requestSeed took the
+/// "already unlocked" branch, returned a zero seed and armed nothing — and the tester, which had
+/// been handed a real-looking seed by a response override, had no way to see that.
+#[test]
+fn a_second_security_cycle_works_exactly_like_the_first() {
+    let handler = UdsHandler;
+    let mut ecu = VirtualEcu::New(MakeEngineEcu());
+
+    for uCycle in 1..=2 {
+        // Default session, then extended: what every tester does on connect.
+        ecu.ProcessRequest(&handler, &[0x10, 0x01]);
+        ecu.ProcessRequest(&handler, &[0x10, 0x03]);
+
+        let vecSeed = ecu.ProcessRequest(&handler, &[0x27, 0x01]);
+        assert_eq!(&vecSeed[..2], &[0x67, 0x01], "cycle {uCycle}: requestSeed");
+        assert_ne!(
+            &vecSeed[2..],
+            &[0x00, 0x00, 0x00, 0x00],
+            "cycle {uCycle}: a zero seed means the ECU thinks it is still unlocked"
+        );
+
+        let vecKey = ecu.ProcessRequest(&handler, &[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            &vecKey[..2],
+            &[0x67, 0x02],
+            "cycle {uCycle}: sendKey must unlock, not answer 7F 27 24"
+        );
+        assert!(ecu.IsSecurityUnlocked(), "cycle {uCycle}: unlocked");
+    }
+}
+
+#[test]
+fn returning_to_the_default_session_locks_security() {
+    // ISO 14229-1 clause 10.3. Checked on its own because the cycle test above would still
+    // pass if security were reset by something else entirely.
+    let handler = UdsHandler;
+    let mut ecu = VirtualEcu::New(MakeEngineEcu());
+
+    ecu.ProcessRequest(&handler, &[0x10, 0x03]);
+    ecu.ProcessRequest(&handler, &[0x27, 0x01]);
+    ecu.ProcessRequest(&handler, &[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD]);
+    assert!(ecu.IsSecurityUnlocked());
+
+    ecu.ProcessRequest(&handler, &[0x10, 0x01]);
+    assert!(
+        !ecu.IsSecurityUnlocked(),
+        "the default session must return the server to locked"
+    );
+}
+
+#[test]
+fn an_ecu_reset_locks_security_too() {
+    // A reset returns the server to its power-on state, and power-on is locked.
+    let handler = UdsHandler;
+    let mut ecu = VirtualEcu::New(MakeEngineEcu());
+
+    ecu.ProcessRequest(&handler, &[0x10, 0x03]);
+    ecu.ProcessRequest(&handler, &[0x27, 0x01]);
+    ecu.ProcessRequest(&handler, &[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD]);
+    assert!(ecu.IsSecurityUnlocked());
+
+    ecu.ProcessRequest(&handler, &[0x11, 0x01]);
+    assert!(
+        !ecu.IsSecurityUnlocked(),
+        "a reset must leave the ECU locked"
+    );
 }

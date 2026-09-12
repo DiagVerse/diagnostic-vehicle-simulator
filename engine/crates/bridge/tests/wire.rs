@@ -164,7 +164,8 @@ async fn a_multi_frame_request_is_flow_controlled_on_the_response_identifier() {
     assert_eq!(vecFlowControl.len(), 1);
     // On 0x7E8, not 0x7E0: that is where the tester's transmitter is listening.
     assert_eq!(vecFlowControl[0].0, 0x7E8);
-    assert_eq!(&vecFlowControl[0].1[0..3], &[0x30, 0x00, 0x00]);
+    // BlockSize 1 is the default: one frame per flow control, which every link can carry.
+    assert_eq!(&vecFlowControl[0].1[0..3], &[0x30, 0x01, 0x00]);
 
     // The trailing pad bytes must not become part of the request.
     handle.InjectFrame(Frame(
@@ -383,8 +384,8 @@ async fn changing_an_ecus_flow_control_reaches_a_bridge_that_is_already_running(
     let vecBefore = Sent(&handle);
     assert_eq!(
         &vecBefore[0].1[0..3],
-        &[0x30, 0x00, 0x00],
-        "the default is still send-it-all"
+        &[0x30, 0x01, 0x00],
+        "the default paces one frame per flow control"
     );
 
     {
@@ -406,5 +407,75 @@ async fn changing_an_ecus_flow_control_reaches_a_bridge_that_is_already_running(
         &vecAfter[0].1[0..3],
         &[0x30, 0x04, 0x00],
         "the change must reach the wire without the link being restarted"
+    );
+}
+
+/// Two ECUs, so a transfer for one can be interrupted by traffic for the other.
+fn BuildTwoEcuSimulation() -> Arc<Mutex<SimulationService>> {
+    let arcSimulation = BuildSimulation();
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let mut second = Ecu::New("Transmission", 0);
+        second.m_optCanAddress = Some(CanAddress::NewSpecified(
+            0x7E1,
+            0x7E9,
+            CanAddressingMode::Normal11Bit,
+        ));
+        second.m_vecSupportedServices = vec![0x10, 0x22, 0x2E, 0x3E];
+        second.m_vecSupportedSessions = vec![SessionType::Default, SessionType::Extended];
+        simulation.AddEcu(second).expect("the second ECU");
+    }
+    arcSimulation
+}
+
+#[tokio::test]
+async fn a_second_ecus_frames_survive_the_first_ecus_transfer() {
+    // The bug this guards: while one ECU waited for flow control, every frame for every other
+    // identifier was thrown away. A multi-frame request to the second ECU lost the middle of
+    // itself and reported a consecutive-frame sequence error — on a bus where the tester had
+    // sent every frame correctly, and with nothing in any log to say the engine had eaten them.
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, BuildTwoEcuSimulation());
+
+    // Ask the first ECU for the VIN: 20 bytes, so the answer is segmented and waits for flow
+    // control that never comes.
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x03, 0x22, 0xF1, 0x90, 0xAA, 0xAA, 0xAA, 0xAA],
+    ));
+
+    // And, arriving while that is in flight, a segmented request to the *second* ECU.
+    handle.InjectFrame(Frame(
+        0x7E1,
+        vec![0x10, 0x14, 0x2E, 0xF1, 0x90, b'1', b'H', b'G'],
+    ));
+    handle.InjectFrame(Frame(
+        0x7E1,
+        vec![0x21, b'C', b'M', b'8', b'2', b'6', b'3', b'3'],
+    ));
+    handle.InjectFrame(Frame(
+        0x7E1,
+        vec![0x22, b'A', b'0', b'0', b'4', b'3', b'5', b'2'],
+    ));
+
+    bridge.PumpOnce(&UdsHandler).await;
+    // The first pump ends when the first ECU's flow control times out; the deferred frames go
+    // back on the queue, so a second pump deals with them.
+    bridge.PumpOnce(&UdsHandler).await;
+
+    let vecSent = Sent(&handle);
+    let vecFromSecond: Vec<&(u32, Vec<u8>)> =
+        vecSent.iter().filter(|(id, _)| *id == 0x7E9).collect();
+
+    assert!(
+        !vecFromSecond.is_empty(),
+        "the second ECU must still have been reachable; it sent nothing at all"
+    );
+    assert!(
+        vecFromSecond
+            .iter()
+            .any(|(_, data)| data[0..4] == [0x03, 0x7F, 0x2E, 0x11]),
+        "its 20-byte request must reassemble whole and be answered, not lose frames to the \
+         first ECU's transfer: {vecFromSecond:02X?}"
     );
 }

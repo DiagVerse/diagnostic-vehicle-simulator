@@ -9,8 +9,10 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use plugin_contract::protocol::{
-    c_byStateChangeResetToDefaultSession, c_byStateChangeSetActiveSeedLevel,
-    c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, REcuSnapshot, RStateChange,
+    c_byStateChangeEndTransfer, c_byStateChangeResetToDefaultSession,
+    c_byStateChangeSetActiveSeedLevel, c_byStateChangeSetBlockSequenceCounter,
+    c_byStateChangeSetSession, c_byStateChangeUnlockSecurity, REcuSnapshot, RKeyPolicy,
+    RStateChange,
 };
 
 // --- Request Service IDs (SIDs) ---------------------------------------------------------
@@ -24,6 +26,33 @@ pub const c_bySidReadDtcInformation: u8 = 0x19;
 pub const c_bySidReadDataByIdentifier: u8 = 0x22;
 /// SecurityAccess.
 pub const c_bySidSecurityAccess: u8 = 0x27;
+/// RequestDownload.
+pub const c_bySidRequestDownload: u8 = 0x34;
+/// RequestUpload.
+pub const c_bySidRequestUpload: u8 = 0x35;
+/// TransferData.
+pub const c_bySidTransferData: u8 = 0x36;
+/// RequestTransferExit.
+pub const c_bySidRequestTransferExit: u8 = 0x37;
+
+/// ReadDTCInformation sub-functions this server answers (ISO 14229-1 Table 251).
+pub const c_bySubReportNumberOfDtcByStatusMask: u8 = 0x01;
+pub const c_bySubReportDtcByStatusMask: u8 = 0x02;
+pub const c_bySubReportSupportedDtc: u8 = 0x0A;
+
+/// Which status bits this server maintains. All of them, in this model.
+pub const c_byStatusAvailabilityMask: u8 = 0xFF;
+/// DTC format: ISO 14229-1 Table 250, `00` = SAE J2012-DA DTCFormat_00.
+pub const c_byDtcFormatIdentifier: u8 = 0x00;
+
+/// The first block sequence counter of any transfer (ISO 14229-1 clause 14.2.4).
+pub const c_byFirstBlockSequenceCounter: u8 = 0x01;
+/// `lengthFormatIdentifier` in the RequestDownload response: the maximum block length is
+/// announced in two bytes.
+pub const c_byLengthFormatIdentifier: u8 = 0x20;
+/// The largest block this server accepts, including the TransferData header. Modest on purpose:
+/// a simulator has no memory to size it against, and an invented number is one a tester trusts.
+pub const c_u16MaxBlockLength: u16 = 0x0400;
 /// RoutineControl.
 pub const c_bySidRoutineControl: u8 = 0x31;
 /// TesterPresent.
@@ -41,6 +70,8 @@ const c_bySuppressPositiveResponseBit: u8 = 0x80;
 pub const c_byNrcServiceNotSupported: u8 = 0x11;
 /// subFunctionNotSupported.
 pub const c_byNrcSubFunctionNotSupported: u8 = 0x12;
+/// The block sequence counter was neither the expected one nor a repeat of the previous.
+pub const c_byNrcWrongBlockSequenceCounter: u8 = 0x73;
 /// incorrectMessageLengthOrInvalidFormat.
 pub const c_byNrcIncorrectMessageLength: u8 = 0x13;
 /// conditionsNotCorrect.
@@ -101,7 +132,11 @@ pub fn HandleRequest(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
 
     let byServiceId = vecRequest[0];
 
-    if !snapshot.m_vecSupportedServices.contains(&byServiceId) {
+    // Permissive mode skips the supported-service list. The list describes what the ECU was
+    // observed or declared to offer, and in permissive mode the operator has said that is not
+    // the authority — a handler below, or a response override above, is.
+    let bIsDeclared = snapshot.m_vecSupportedServices.contains(&byServiceId);
+    if !bIsDeclared && !snapshot.m_bIsPermissive {
         return UdsReply::Negative(byServiceId, c_byNrcServiceNotSupported);
     }
 
@@ -113,9 +148,97 @@ pub fn HandleRequest(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
         c_bySidReadDtcInformation => HandleReadDtcInformation(vecRequest, snapshot),
         c_bySidRoutineControl => HandleRoutineControl(vecRequest),
         c_bySidTesterPresent => HandleTesterPresent(vecRequest),
-        // Should be unreachable because of the supported-service check above, but stay safe.
+        c_bySidRequestDownload | c_bySidRequestUpload => HandleRequestTransfer(vecRequest),
+        c_bySidTransferData => HandleTransferData(vecRequest, snapshot),
+        c_bySidRequestTransferExit => HandleRequestTransferExit(),
         _ => UdsReply::Negative(byServiceId, c_byNrcServiceNotSupported),
     }
+}
+
+/// 0x34 RequestDownload / 0x35 RequestUpload — accept the transfer and arm the block counter.
+///
+/// The block length announced is deliberately modest and fixed. A simulator has no memory to
+/// size it against, and a number invented to look plausible is a number a tester will believe.
+fn HandleRequestTransfer(vecRequest: &[u8]) -> UdsReply {
+    // SID + dataFormatIdentifier + addressAndLengthFormatIdentifier, then the address and size
+    // those two describe. Anything shorter cannot be read at all.
+    if vecRequest.len() < 3 {
+        return UdsReply::Negative(vecRequest[0], c_byNrcIncorrectMessageLength);
+    }
+
+    UdsReply {
+        m_vecResponse: vec![
+            vecRequest[0] + c_byPositiveResponseOffset,
+            c_byLengthFormatIdentifier,
+            (c_u16MaxBlockLength >> 8) as u8,
+            (c_u16MaxBlockLength & 0xFF) as u8,
+        ],
+        // ISO 14229-1 clause 14.2.4: the first TransferData of a transfer carries 0x01.
+        m_vecChanges: vec![MakeStateChange(
+            c_byStateChangeSetBlockSequenceCounter,
+            c_byFirstBlockSequenceCounter,
+        )],
+    }
+}
+
+/// 0x36 TransferData — echo the block sequence counter and advance it.
+///
+/// The counter is why this cannot be a response override: it changes with every block. It
+/// starts at 0x01 after RequestDownload or RequestUpload, counts up, and wraps from 0xFF to
+/// 0x00 rather than back to 0x01 — the wrap value implementations most often get wrong.
+///
+/// A block repeating the *previous* counter is a retransmission, not an error: ISO 14229-1
+/// clause 14.2.5 has the server answer it exactly as it answered the first time, without
+/// advancing, because the tester is telling us its own response went missing.
+fn HandleTransferData(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
+    if vecRequest.len() < 2 {
+        return UdsReply::Negative(c_bySidTransferData, c_byNrcIncorrectMessageLength);
+    }
+
+    if !snapshot.m_bIsTransferInProgress {
+        // No RequestDownload or RequestUpload came first, so there is no transfer to add to.
+        return UdsReply::Negative(c_bySidTransferData, c_byNrcRequestSequenceError);
+    }
+
+    let byExpected = snapshot.m_byExpectedBlockSequenceCounter;
+    let byReceived = vecRequest[1];
+    if byReceived == PreviousBlockSequenceCounter(byExpected) {
+        return UdsReply::ResponseOnly(vec![
+            c_bySidTransferData + c_byPositiveResponseOffset,
+            byReceived,
+        ]);
+    }
+
+    if byReceived != byExpected {
+        return UdsReply::Negative(c_bySidTransferData, c_byNrcWrongBlockSequenceCounter);
+    }
+
+    UdsReply {
+        m_vecResponse: vec![c_bySidTransferData + c_byPositiveResponseOffset, byReceived],
+        m_vecChanges: vec![MakeStateChange(
+            c_byStateChangeSetBlockSequenceCounter,
+            NextBlockSequenceCounter(byReceived),
+        )],
+    }
+}
+
+/// 0x37 RequestTransferExit — end the transfer and disarm the counter.
+fn HandleRequestTransferExit() -> UdsReply {
+    UdsReply {
+        m_vecResponse: vec![c_bySidRequestTransferExit + c_byPositiveResponseOffset],
+        m_vecChanges: vec![MakeStateChange(c_byStateChangeEndTransfer, 0)],
+    }
+}
+
+/// The counter after this one. ISO 14229-1 clause 14.2.4: 0xFF is followed by 0x00, not 0x01 —
+/// only the *first* block of a transfer is 0x01.
+fn NextBlockSequenceCounter(byCounter: u8) -> u8 {
+    byCounter.wrapping_add(1)
+}
+
+/// The counter before this one, for recognising a retransmission.
+fn PreviousBlockSequenceCounter(byCounter: u8) -> u8 {
+    byCounter.wrapping_sub(1)
 }
 
 /// Split a sub-function byte into (suppressPositiveResponse, rawSubFunction).
@@ -303,14 +426,30 @@ fn HandleSecuritySendKey(
         }
     };
 
-    // A key may only be sent after its seed was requested.
+    // A key may only be sent after its seed was requested. Checked before the policy, and
+    // deliberately: ISO 14229-1 makes this a sequence rule, not a key rule, so even a level
+    // that accepts any key still refuses one that arrives out of order.
     if snapshot.m_byActiveSeedLevel != level.m_byRequestSeedSubFunction {
         return UdsReply::Negative(c_bySidSecurityAccess, c_byNrcRequestSequenceError);
     }
 
     let vecProvidedKey = &vecRequest[2..];
-    if vecProvidedKey != level.m_vecExpectedKey.as_slice() {
-        return UdsReply::Negative(c_bySidSecurityAccess, c_byNrcInvalidKey);
+    match level.m_keyPolicy {
+        // A level whose key nobody has. Reconstruction produces these: a capture yields the
+        // seed but never a key that will answer the *next* seed, so comparing would refuse
+        // every tester.
+        RKeyPolicy::AcceptAnyKey => {}
+
+        // Fault injection: the tester's rejected-key path, on demand.
+        RKeyPolicy::RefuseWith => {
+            return UdsReply::Negative(c_bySidSecurityAccess, level.m_byRefusalNrc);
+        }
+
+        RKeyPolicy::CompareWithExpectedKey => {
+            if vecProvidedKey != level.m_vecExpectedKey.as_slice() {
+                return UdsReply::Negative(c_bySidSecurityAccess, c_byNrcInvalidKey);
+            }
+        }
     }
 
     // Key accepted: unlock this level and clear the outstanding seed.
@@ -331,37 +470,105 @@ fn HandleSecuritySendKey(
 
 /// 0x19 ReadDTCInformation — Phase 1 supports sub-function 0x02 (reportDTCByStatusMask).
 fn HandleReadDtcInformation(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
-    const c_bySubReportByStatusMask: u8 = 0x02;
-
-    if vecRequest.len() != 3 {
+    // Every sub-function carries at least the sub-function byte itself.
+    if vecRequest.len() < 2 {
         return UdsReply::Negative(c_bySidReadDtcInformation, c_byNrcIncorrectMessageLength);
     }
 
     let bySubFunction = vecRequest[1];
-    if bySubFunction != c_bySubReportByStatusMask {
-        return UdsReply::Negative(c_bySidReadDtcInformation, c_byNrcSubFunctionNotSupported);
+
+    // The length a request must be depends on which sub-function it is, and that is why the
+    // sub-function is read first. Checking a single fixed length up front refuses `19 0A` —
+    // a perfectly valid two-byte request — for being the wrong length for `19 02`.
+    match bySubFunction {
+        c_bySubReportNumberOfDtcByStatusMask => {
+            ExpectLength(vecRequest, 3).unwrap_or_else(|| ReportDtcCount(vecRequest, snapshot))
+        }
+        c_bySubReportDtcByStatusMask => ExpectLength(vecRequest, 3)
+            .unwrap_or_else(|| ReportDtcsByStatusMask(vecRequest, snapshot)),
+        c_bySubReportSupportedDtc => {
+            ExpectLength(vecRequest, 2).unwrap_or_else(|| ReportSupportedDtcs(snapshot))
+        }
+        // Snapshot and extended records, fault-detection counters, permanent status: real
+        // sub-functions this model holds no data for. Refused as unsupported rather than
+        // answered with something invented, which is the whole point of a reconstruction.
+        _ => UdsReply::Negative(c_bySidReadDtcInformation, c_byNrcSubFunctionNotSupported),
     }
+}
 
+/// `Some(refusal)` when the request is not exactly this long, `None` when it is.
+fn ExpectLength(vecRequest: &[u8], uExpected: usize) -> Option<UdsReply> {
+    if vecRequest.len() == uExpected {
+        return None;
+    }
+    Some(UdsReply::Negative(
+        c_bySidReadDtcInformation,
+        c_byNrcIncorrectMessageLength,
+    ))
+}
+
+/// 0x01 reportNumberOfDTCByStatusMask — how many DTCs match, without listing them.
+fn ReportDtcCount(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
     let byStatusMask = vecRequest[2];
+    let uCount = snapshot
+        .m_vecDtcs
+        .iter()
+        .filter(|dtc| (dtc.m_byStatus & byStatusMask) != 0)
+        .count();
 
+    UdsReply::ResponseOnly(vec![
+        c_bySidReadDtcInformation + c_byPositiveResponseOffset,
+        c_bySubReportNumberOfDtcByStatusMask,
+        c_byStatusAvailabilityMask,
+        c_byDtcFormatIdentifier,
+        ((uCount >> 8) & 0xFF) as u8,
+        (uCount & 0xFF) as u8,
+    ])
+}
+
+/// 0x02 reportDTCByStatusMask — the DTCs whose status intersects the mask.
+fn ReportDtcsByStatusMask(vecRequest: &[u8], snapshot: &REcuSnapshot) -> UdsReply {
+    let byStatusMask = vecRequest[2];
     let mut vecResponse = vec![
         c_bySidReadDtcInformation + c_byPositiveResponseOffset,
-        bySubFunction,
-        0xFF, // statusAvailabilityMask — all bits available in this simple model
+        c_bySubReportDtcByStatusMask,
+        c_byStatusAvailabilityMask,
     ];
 
     for dtc in snapshot.m_vecDtcs.iter() {
-        // Only report DTCs whose status intersects the requested mask.
         if (dtc.m_byStatus & byStatusMask) == 0 {
             continue;
         }
-        vecResponse.push(((dtc.m_u32Code >> 16) & 0xFF) as u8);
-        vecResponse.push(((dtc.m_u32Code >> 8) & 0xFF) as u8);
-        vecResponse.push((dtc.m_u32Code & 0xFF) as u8);
-        vecResponse.push(dtc.m_byStatus);
+        AppendDtc(&mut vecResponse, dtc.m_u32Code, dtc.m_byStatus);
     }
 
     UdsReply::ResponseOnly(vecResponse)
+}
+
+/// 0x0A reportSupportedDTC — every DTC this ECU can report, whatever its status.
+///
+/// Takes no status mask, which is the whole reason this service needed per-sub-function
+/// lengths: the request is two bytes and was being refused for not being three.
+fn ReportSupportedDtcs(snapshot: &REcuSnapshot) -> UdsReply {
+    let mut vecResponse = vec![
+        c_bySidReadDtcInformation + c_byPositiveResponseOffset,
+        c_bySubReportSupportedDtc,
+        c_byStatusAvailabilityMask,
+    ];
+
+    for dtc in snapshot.m_vecDtcs.iter() {
+        AppendDtc(&mut vecResponse, dtc.m_u32Code, dtc.m_byStatus);
+    }
+
+    UdsReply::ResponseOnly(vecResponse)
+}
+
+/// One DTC record: three bytes of code, then its status byte.
+fn AppendDtc(vecResponse: &mut Vec<u8>, u32Code: u32, byStatus: u8) {
+    vecResponse.push(((u32Code >> 16) & 0xFF) as u8);
+    vecResponse.push(((u32Code >> 8) & 0xFF) as u8);
+    vecResponse.push((u32Code & 0xFF) as u8);
+    vecResponse.push(byStatus);
 }
 
 /// 0x31 RoutineControl — Phase 1 acknowledges start/stop/requestResults for any routine id.
@@ -445,10 +652,15 @@ mod tests {
                 m_u32Code: 0x123456,
                 m_byStatus: 0x2F,
             }]),
+            m_byExpectedBlockSequenceCounter: 0,
+            m_bIsTransferInProgress: false,
+            m_bIsPermissive: false,
             m_vecSecurityLevels: RVec::from(vec![RSecurityLevel {
                 m_byRequestSeedSubFunction: 0x01,
                 m_vecSeed: RVec::from(vec![0x11, 0x22, 0x33, 0x44]),
                 m_vecExpectedKey: RVec::from(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+                m_keyPolicy: RKeyPolicy::CompareWithExpectedKey,
+                m_byRefusalNrc: 0,
             }]),
         }
     }
@@ -594,6 +806,264 @@ mod tests {
         assert_eq!(
             reply.m_vecResponse,
             vec![0x7F, 0x22, c_byNrcIncorrectMessageLength]
+        );
+    }
+
+    /// Build a snapshot whose single security level uses the given policy, with the seed
+    /// already requested so the sequence rule is satisfied.
+    fn SnapshotWithPolicy(keyPolicy: RKeyPolicy, byRefusalNrc: u8) -> REcuSnapshot {
+        // Extended session, nothing unlocked, seed 0x01 already handed out.
+        let mut snapshot = MakeSnapshot(0x03, 0x00, 0x01);
+        snapshot.m_vecSecurityLevels = RVec::from(vec![RSecurityLevel {
+            m_byRequestSeedSubFunction: 0x01,
+            m_vecSeed: RVec::from(vec![0x11, 0x22, 0x33, 0x44]),
+            m_vecExpectedKey: RVec::from(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+            m_keyPolicy: keyPolicy,
+            m_byRefusalNrc: byRefusalNrc,
+        }]);
+        snapshot
+    }
+
+    #[test]
+    fn a_level_that_accepts_any_key_unlocks_on_a_key_it_has_never_seen() {
+        // The reconstruction case: the seed came from a capture, the key did not, and
+        // comparing would refuse every tester with 0x35.
+        let snapshot = SnapshotWithPolicy(RKeyPolicy::AcceptAnyKey, 0);
+        let reply = HandleRequest(&[0x27, 0x02, 0xDE, 0xAD, 0xBE, 0xEF], &snapshot);
+
+        assert_eq!(&reply.m_vecResponse[..2], &[0x67, 0x02]);
+        assert!(
+            reply
+                .m_vecChanges
+                .iter()
+                .any(|change| change.m_byKind == c_byStateChangeUnlockSecurity),
+            "accepting the key must actually unlock, not merely answer positively"
+        );
+    }
+
+    #[test]
+    fn a_refusing_level_answers_with_the_code_it_was_given() {
+        // Fault injection: the tester's rejected-key path, on demand. 0x36 is
+        // exceededNumberOfAttempts, which a tester handles differently from 0x35.
+        let snapshot = SnapshotWithPolicy(RKeyPolicy::RefuseWith, 0x36);
+        let reply = HandleRequest(&[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD], &snapshot);
+
+        assert_eq!(
+            reply.m_vecResponse,
+            vec![0x7F, 0x27, 0x36],
+            "even the correct key is refused, with the configured code"
+        );
+        assert!(reply.m_vecChanges.is_empty(), "a refusal unlocks nothing");
+    }
+
+    #[test]
+    fn accepting_any_key_still_refuses_one_that_arrives_without_a_seed() {
+        // ISO 14229-1 makes seed-before-key a sequence rule, not a key rule, so relaxing the
+        // key comparison must not relax the ordering too.
+        let mut snapshot = SnapshotWithPolicy(RKeyPolicy::AcceptAnyKey, 0);
+        snapshot.m_byActiveSeedLevel = 0x00;
+
+        let reply = HandleRequest(&[0x27, 0x02, 0xDE, 0xAD], &snapshot);
+        assert_eq!(reply.m_vecResponse, vec![0x7F, 0x27, 0x24]);
+    }
+
+    #[test]
+    fn comparing_is_still_what_a_level_with_a_known_key_does() {
+        let snapshot = SnapshotWithPolicy(RKeyPolicy::CompareWithExpectedKey, 0);
+
+        let wrong = HandleRequest(&[0x27, 0x02, 0x00, 0x00, 0x00, 0x00], &snapshot);
+        assert_eq!(wrong.m_vecResponse, vec![0x7F, 0x27, 0x35]);
+
+        let right = HandleRequest(&[0x27, 0x02, 0xAA, 0xBB, 0xCC, 0xDD], &snapshot);
+        assert_eq!(&right.m_vecResponse[..2], &[0x67, 0x02]);
+    }
+
+    /// Run a download from RequestDownload through to RequestTransferExit, carrying the block
+    /// counter forward the way the ECU does.
+    fn RunTransfer(byStartCounter: u8, arrBlocks: &[u8]) -> Vec<Vec<u8>> {
+        let mut snapshot = Snapshot();
+        snapshot.m_byExpectedBlockSequenceCounter = byStartCounter;
+        snapshot.m_bIsTransferInProgress = true;
+
+        let mut vecResponses = Vec::new();
+        for byBlock in arrBlocks {
+            let reply = HandleRequest(&[0x36, *byBlock, 0xAA], &snapshot);
+            for change in &reply.m_vecChanges {
+                if change.m_byKind == c_byStateChangeSetBlockSequenceCounter {
+                    snapshot.m_byExpectedBlockSequenceCounter = change.m_byValue;
+                }
+            }
+            vecResponses.push(reply.m_vecResponse);
+        }
+        vecResponses
+    }
+
+    #[test]
+    fn a_transfer_starts_at_one_and_echoes_each_block_counter() {
+        let snapshot = Snapshot();
+        let reply = HandleRequest(&[0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x01, 0x00], &snapshot);
+        assert_eq!(reply.m_vecResponse, vec![0x74, 0x20, 0x04, 0x00]);
+        assert_eq!(
+            reply.m_vecChanges[0].m_byValue, 0x01,
+            "the first TransferData of a transfer carries 0x01"
+        );
+
+        let vecResponses = RunTransfer(0x01, &[0x01, 0x02, 0x03]);
+        assert_eq!(
+            vecResponses,
+            vec![vec![0x76, 0x01], vec![0x76, 0x02], vec![0x76, 0x03]]
+        );
+    }
+
+    #[test]
+    fn the_block_counter_wraps_from_ff_to_zero_not_back_to_one() {
+        // The value implementations most often get wrong: 0x01 is only the *first* block of a
+        // transfer, so the wrap goes to 0x00 and the sequence continues from there.
+        let vecResponses = RunTransfer(0xFE, &[0xFE, 0xFF, 0x00, 0x01]);
+        assert_eq!(
+            vecResponses,
+            vec![
+                vec![0x76, 0xFE],
+                vec![0x76, 0xFF],
+                vec![0x76, 0x00],
+                vec![0x76, 0x01]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_block_is_answered_again_rather_than_refused() {
+        // ISO 14229-1 clause 14.2.5: the tester is saying its copy of the response went
+        // missing, not that it has lost its place.
+        let mut snapshot = Snapshot();
+        snapshot.m_byExpectedBlockSequenceCounter = 0x05;
+        snapshot.m_bIsTransferInProgress = true;
+
+        let reply = HandleRequest(&[0x36, 0x04, 0xAA], &snapshot);
+        assert_eq!(reply.m_vecResponse, vec![0x76, 0x04]);
+        assert!(
+            reply.m_vecChanges.is_empty(),
+            "a retransmission must not advance the counter"
+        );
+    }
+
+    #[test]
+    fn a_block_out_of_sequence_is_refused_with_seventy_three() {
+        let mut snapshot = Snapshot();
+        snapshot.m_byExpectedBlockSequenceCounter = 0x05;
+        snapshot.m_bIsTransferInProgress = true;
+
+        let reply = HandleRequest(&[0x36, 0x09, 0xAA], &snapshot);
+        assert_eq!(reply.m_vecResponse, vec![0x7F, 0x36, 0x73]);
+    }
+
+    #[test]
+    fn transfer_data_before_any_request_download_is_a_sequence_error() {
+        let snapshot = Snapshot();
+        let reply = HandleRequest(&[0x36, 0x01, 0xAA], &snapshot);
+        assert_eq!(reply.m_vecResponse, vec![0x7F, 0x36, 0x24]);
+    }
+
+    #[test]
+    fn permissive_mode_stops_the_supported_service_list_refusing() {
+        // 0x2F is not in the fixture's list. Strict, it is refused; permissive, it reaches the
+        // dispatch — which still has no handler for it, because permissive never invents.
+        let mut snapshot = Snapshot();
+        assert_eq!(
+            HandleRequest(&[0x2F, 0x01, 0x02, 0x03], &snapshot).m_vecResponse,
+            vec![0x7F, 0x2F, 0x11]
+        );
+
+        snapshot.m_bIsPermissive = true;
+        assert_eq!(
+            HandleRequest(&[0x2F, 0x01, 0x02, 0x03], &snapshot).m_vecResponse,
+            vec![0x7F, 0x2F, 0x11],
+            "permissive lets the request through the gate; it does not answer for it"
+        );
+
+        // A service that does have a handler is reached, though, which is the point.
+        snapshot.m_vecSupportedServices = RVec::from(vec![0x10]);
+        assert_eq!(
+            HandleRequest(&[0x36, 0x01, 0xAA], &snapshot).m_vecResponse,
+            vec![0x7F, 0x36, 0x24],
+            "0x36 is absent from the list but permissive reaches its handler"
+        );
+    }
+
+    /// An ECU in the extended session that declares the transfer services, as one being
+    /// flashed would. Without them the supported-service gate refuses before any handler runs
+    /// — which is itself worth knowing: implementing 0x36 is not enough on its own.
+    fn Snapshot() -> REcuSnapshot {
+        let mut snapshot = MakeSnapshot(0x03, 0x00, 0x00);
+        snapshot.m_vecSupportedServices = RVec::from(vec![
+            0x10, 0x11, 0x19, 0x22, 0x27, 0x31, 0x34, 0x35, 0x36, 0x37, 0x3E,
+        ]);
+        snapshot
+    }
+
+    #[test]
+    fn report_supported_dtc_is_two_bytes_and_is_not_refused_for_it() {
+        // The bug: a single fixed length refused 19 0A with NRC 0x13 for not being the length
+        // of 19 02. The length a request must be depends on which sub-function it is.
+        let snapshot = Snapshot();
+        let reply = HandleRequest(&[0x19, 0x0A], &snapshot);
+
+        assert_eq!(&reply.m_vecResponse[..3], &[0x59, 0x0A, 0xFF]);
+        assert_eq!(
+            &reply.m_vecResponse[3..],
+            &[0x12, 0x34, 0x56, 0x2F],
+            "reportSupportedDTC lists every DTC, whatever its status"
+        );
+    }
+
+    #[test]
+    fn each_sub_function_is_measured_against_its_own_length() {
+        let snapshot = Snapshot();
+
+        // 0x0A takes no status mask, so a third byte is wrong for it...
+        assert_eq!(
+            HandleRequest(&[0x19, 0x0A, 0xFF], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x13]
+        );
+        // ...while 0x02 requires one.
+        assert_eq!(
+            HandleRequest(&[0x19, 0x02], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x13]
+        );
+        // A sub-function alone is never enough to be a request.
+        assert_eq!(
+            HandleRequest(&[0x19], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x13]
+        );
+    }
+
+    #[test]
+    fn an_unsupported_sub_function_is_refused_as_one_rather_than_as_bad_length() {
+        // 0x04 reportDTCSnapshotRecordByDTCNumber is a real sub-function this model holds no
+        // data for. Saying "sub-function not supported" is the truth; inventing a snapshot
+        // record would not be.
+        let snapshot = Snapshot();
+        assert_eq!(
+            HandleRequest(&[0x19, 0x04, 0x12, 0x34, 0x56, 0x01], &snapshot).m_vecResponse,
+            vec![0x7F, 0x19, 0x12]
+        );
+    }
+
+    #[test]
+    fn report_number_of_dtc_counts_without_listing() {
+        let snapshot = Snapshot();
+        let reply = HandleRequest(&[0x19, 0x01, 0xFF], &snapshot);
+        assert_eq!(
+            reply.m_vecResponse,
+            vec![0x59, 0x01, 0xFF, 0x00, 0x00, 0x01],
+            "availability mask, format identifier, then a two-byte count"
+        );
+
+        // A mask nothing matches counts nothing, rather than refusing.
+        let reply = HandleRequest(&[0x19, 0x01, 0x00], &snapshot);
+        assert_eq!(
+            reply.m_vecResponse,
+            vec![0x59, 0x01, 0xFF, 0x00, 0x00, 0x00]
         );
     }
 }

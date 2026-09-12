@@ -23,13 +23,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use bridge::observer::{FrameDirection, FrameObserver};
 use can::CanFrame;
 use futures_core::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use simulation::RoutingOutcome;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -331,13 +331,37 @@ fn DescribeOutcome(
 /// replay ended. People open a monitor *because* something looked wrong, which is necessarily
 /// after it happened; a feed that started blank would always be missing the thing they came to
 /// look at.
-pub async fn GetEvents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn GetEvents(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EventsQuery>,
+) -> impl IntoResponse {
     let (vecHistory, u64DroppedBefore, receiver) = state.traffic.SubscribeWithHistory();
+    let bWantsFrames = query.frames.unwrap_or(true);
+
+    // Dropping frames here rather than in the monitor is the difference between a browser
+    // receiving fifty thousand events during a flash transfer and receiving a few hundred. The
+    // exchange lines — request, answer, which ECU — survive, and those are what a person reads.
+    let mut vecHistory: Vec<TrafficEvent> = if bWantsFrames {
+        vecHistory
+    } else {
+        vecHistory
+            .into_iter()
+            .filter(|event| !IsFrameEvent(event))
+            .collect()
+    };
+
+    // Keep the most recent, which is the part anybody scrolls back to first.
+    if let Some(uWanted) = query.history {
+        if vecHistory.len() > uWanted {
+            vecHistory.drain(..vecHistory.len() - uWanted);
+        }
+    }
 
     tracing::info!(
         monitors = state.traffic.SubscriberCount(),
         replayed = vecHistory.len(),
         droppedBefore = u64DroppedBefore,
+        frames = bWantsFrames,
         "a traffic monitor attached"
     );
 
@@ -351,9 +375,33 @@ pub async fn GetEvents(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     vecPrelude.extend(vecHistory);
 
     let historyStream = tokio_stream::iter(vecPrelude.into_iter().map(ToSseEvent));
-    let stream = historyStream.chain(BuildEventStream(receiver));
+    let stream = historyStream.chain(BuildEventStream(receiver, bWantsFrames));
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(c_keepAliveInterval))
+}
+
+/// Query string for `GET /events`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsQuery {
+    /// How many past events to replay on attach. Left out, everything held is replayed.
+    ///
+    /// Worth bounding because an EventSource reconnects by itself: a long session with a
+    /// dropped connection replays the whole history again, and a monitor that can only hold a
+    /// few thousand events pays to parse twenty thousand in order to throw most of them away.
+    pub history: Option<usize>,
+    /// Send individual CAN frames as well as decoded exchanges. Defaults to true.
+    ///
+    /// Turning it off is not cosmetic. A flash transfer puts tens of thousands of frames on the
+    /// bus in a minute, and a browser asked to receive, parse and hold all of them stops
+    /// responding to its own buttons — so the choice belongs where the events are, not where
+    /// they land.
+    pub frames: Option<bool>,
+}
+
+/// True for an event describing one CAN frame rather than a decoded exchange.
+fn IsFrameEvent(event: &TrafficEvent) -> bool {
+    matches!(event, TrafficEvent::Frame { .. })
 }
 
 /// Render one event as an SSE frame.
@@ -371,20 +419,29 @@ fn ToSseEvent(event: TrafficEvent) -> Result<Event, Infallible> {
 /// the stream: the monitor stays attached and says what it missed.
 fn BuildEventStream(
     receiver: broadcast::Receiver<TrafficEvent>,
+    bWantsFrames: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    BroadcastStream::new(receiver).map(|result| {
-        let event = match result {
-            Ok(event) => event,
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(uMissed)) => {
-                tracing::warn!(missed = uMissed, "a traffic monitor fell behind");
-                TrafficEvent::Lagged {
-                    at_ms: NowMs(),
-                    missed: uMissed,
+    BroadcastStream::new(receiver)
+        .filter_map(move |result| {
+            let event = match result {
+                Ok(event) => event,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(uMissed)) => {
+                    tracing::warn!(missed = uMissed, "a traffic monitor fell behind");
+                    TrafficEvent::Lagged {
+                        at_ms: NowMs(),
+                        missed: uMissed,
+                    }
                 }
+            };
+
+            // Dropped before it is serialised, so a monitor that does not want frames costs
+            // nothing to serve during a flood rather than merely hiding what it received.
+            if !bWantsFrames && IsFrameEvent(&event) {
+                return None;
             }
-        };
-        ToSseEvent(event)
-    })
+            Some(event)
+        })
+        .map(ToSseEvent)
 }
 
 /// Format a CAN identifier the way the rest of the API does.

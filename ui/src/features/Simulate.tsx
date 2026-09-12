@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Badge, DetailRow, PowerSwitch, type BadgeTone } from '../components/primitives'
-import { NEGATIVE_RESPONSES, UDS_CATALOGUE } from './udsCatalogue'
+import {
+  NEGATIVE_RESPONSES,
+  UDS_CATALOGUE,
+  VARIABLE_TAIL_SERVICES,
+  type CatalogueService,
+  type CatalogueVariant,
+} from './udsCatalogue'
 import { TrafficMonitor } from './TrafficMonitor'
 import {
   api,
   type EcuTiming,
   type NewEcu,
   type ResponseOverride,
+  type SecurityLevel,
   type SimulationEcu,
   type SimulationRequestResult,
   type SimulationResponse,
@@ -31,7 +38,7 @@ export function Simulate() {
   const [state, setState] = useState<SimulationState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [lastResult, setLastResult] = useState<SimulationRequestResult | null>(null)
-  const [canIdHex, setCanIdHex] = useState('')
+  const [canIdHex, setCanIdHex] = useState(RememberedEcu)
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
   const [source, setSource] = useState<VehicleSource>('log')
@@ -48,6 +55,19 @@ export function Simulate() {
   const strSelectedCanId = bIsSelectionValid
     ? canIdHex
     : (vecAddressOptions[0]?.canIdHex ?? '')
+
+  // Switching tabs unmounts this view, so without remembering the choice it comes back on the
+  // first ECU of the list. That reads as "my override disappeared" — the override is on the
+  // server, the panel is just describing a different ECU — and it is the same trap that makes
+  // a timing change look like it was ignored.
+  function selectEcu(strCanIdHex: string) {
+    setCanIdHex(strCanIdHex)
+    RememberEcu(strCanIdHex)
+  }
+
+  useEffect(() => {
+    if (strSelectedCanId) RememberEcu(strSelectedCanId)
+  }, [strSelectedCanId])
 
   async function refreshState() {
     try {
@@ -199,7 +219,7 @@ export function Simulate() {
             <RequestPanel
               options={vecAddressOptions}
               canIdHex={strSelectedCanId}
-              onCanIdChange={setCanIdHex}
+              onCanIdChange={selectEcu}
               hexInput={hexInput}
               onHexInputChange={setHexInput}
               onSend={send}
@@ -210,6 +230,13 @@ export function Simulate() {
             <OverridePanel
               key={`ov-${strSelectedCanId}`}
               ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onError={setError}
+              busy={busy}
+            />
+            <SecurityPanel
+              key={`sec-${strSelectedCanId}`}
+              ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onSaved={refreshState}
               onError={setError}
               busy={busy}
             />
@@ -232,6 +259,193 @@ export function Simulate() {
 // ---------------------------------------------------------------------------------------
 // Where the vehicle comes from
 // ---------------------------------------------------------------------------------------
+
+/**
+ * Turn the ECUs' own gates off for the whole vehicle.
+ *
+ * One switch, not one per ECU: a tester's sequence crosses several ECUs, and having it stop at
+ * whichever one was left strict is the problem this removes.
+ */
+function PermissiveSwitch({
+  state,
+  onChanged,
+  onError,
+  busy,
+}: {
+  state: SimulationState
+  onChanged: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [working, setWorking] = useState(false)
+
+  async function toggle(enabled: boolean) {
+    setWorking(true)
+    try {
+      onChanged(await api.setPermissiveMode(enabled))
+      onError(null)
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  if (!state.loaded) return null
+
+  return (
+    <div className="rounded-md border border-slate-800 bg-slate-900/40 px-3 py-2">
+      <label className="flex items-start gap-2 text-xs text-slate-300">
+        <input
+          type="checkbox"
+          checked={state.permissiveMode}
+          disabled={busy || working}
+          onChange={(e) => void toggle(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Permissive mode
+          <span className="block text-[11px] text-slate-500">
+            {state.permissiveMode
+              ? 'Gates off: session restrictions, security locks and the supported-service list are not enforced, so anything you have configured is reachable. Responses are still only what you configured — nothing is invented.'
+              : 'Gates on: each ECU enforces its sessions, security and declared services, as a real one does.'}
+          </span>
+        </span>
+      </label>
+    </div>
+  )
+}
+
+/**
+ * Write the loaded vehicle out as a simulation file.
+ *
+ * Everything configured here — renames, response overrides, security policies, flow control —
+ * lives only in the running engine until this is pressed. The file it produces goes back in
+ * through Load → Simulation file, so a worked-on vehicle is something you can keep, reload
+ * tomorrow, or hand to someone else.
+ *
+ * A button with a marker rather than a prompt on every change: applying four overrides in a
+ * row is one piece of work, and interrupting each of them would make the editor tiring to use.
+ */
+function SaveVehicleButton({
+  state,
+  onSaved,
+  onError,
+  busy,
+}: {
+  state: SimulationState
+  onSaved: (state: SimulationState) => void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [saving, setSaving] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  async function save() {
+    setSaving(true)
+    try {
+      const exported = await api.simulationExport()
+      DownloadTextFile(exported.fileName, exported.content)
+      setNote(DescribeSavedFile(exported.fileName, exported.content))
+      onError(null)
+      // The engine clears its unsaved marker as it hands the file over, so re-read the state
+      // rather than assuming: what the engine believes is the thing being displayed.
+      onSaved(await api.simulationState())
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!state.loaded) return null
+
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        onClick={save}
+        disabled={busy || saving}
+        className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition hover:border-slate-500 disabled:opacity-40"
+      >
+        {saving ? 'Saving…' : 'Save vehicle to file'}
+      </button>
+      {state.unsavedChanges ? (
+        <span className="text-xs text-amber-400" title="Changes made here are not in any file yet">
+          unsaved changes
+        </span>
+      ) : (
+        <span className="text-xs text-slate-600">{note ?? 'saved'}</span>
+      )}
+    </div>
+  )
+}
+
+/**
+ * What the written file actually contains, counted from the file itself.
+ *
+ * Not decoration. "Did my overrides get saved?" is otherwise unanswerable until the file is
+ * reloaded, and by then the answer arrives too late to do anything about.
+ */
+function DescribeSavedFile(strFileName: string, strContent: string): string {
+  try {
+    const doc = JSON.parse(strContent) as {
+      ecus?: { responses?: unknown[]; security?: unknown[] }[]
+    }
+    const vecEcus = doc.ecus ?? []
+    const uOverrides = vecEcus.reduce((total, ecu) => total + (ecu.responses?.length ?? 0), 0)
+    const uLevels = vecEcus.reduce((total, ecu) => total + (ecu.security?.length ?? 0), 0)
+    return `${strFileName}: ${vecEcus.length} ECUs, ${uOverrides} responses, ${uLevels} security levels`
+  } catch {
+    return strFileName
+  }
+}
+
+/** Hand the browser a file to save. */
+function DownloadTextFile(strFileName: string, strContent: string) {
+  const blob = new Blob([strContent], { type: 'application/json' })
+  const strUrl = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = strUrl
+  anchor.download = strFileName
+
+  // Two things that look unnecessary and are not. A detached anchor's click is ignored by
+  // Firefox, so the element has to be in the document; and revoking the object URL in the same
+  // tick can cancel a download that has not started reading yet. Either one fails silently —
+  // no error, no file — which then looks like the save having lost the work.
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  setTimeout(() => URL.revokeObjectURL(strUrl), 10_000)
+}
+
+const c_strRememberedEcuKey = 'dvsim.simulate.selectedEcu'
+
+/**
+ * The ECU this view was last pointed at.
+ *
+ * Session storage rather than component state because the tab strip unmounts the whole view;
+ * and rather than local storage because an ECU identifier is only meaningful for the vehicle
+ * currently loaded, which does not outlive the tab. A stale value is harmless: the selection is
+ * still validated against the loaded vehicle before use.
+ */
+function RememberedEcu(): string {
+  try {
+    return sessionStorage.getItem(c_strRememberedEcuKey) ?? ''
+  } catch {
+    // Private browsing and blocked site data both throw here. Losing the selection is a far
+    // better outcome than failing to render the tab.
+    return ''
+  }
+}
+
+function RememberEcu(strCanIdHex: string) {
+  try {
+    sessionStorage.setItem(c_strRememberedEcuKey, strCanIdHex)
+  } catch {
+    // Nothing to do, and nothing worth telling the operator about.
+  }
+}
 
 /** A vehicle is either reconstructed from a capture or stated by hand. */
 type VehicleSource = 'log' | 'simfile' | 'pcap' | 'build'
@@ -771,6 +985,10 @@ function EcuList({
         </span>
       </div>
 
+      <PermissiveSwitch state={state} onChanged={onChanged} onError={onError} busy={busy} />
+
+      <SaveVehicleButton state={state} onSaved={onChanged} onError={onError} busy={busy} />
+
       {state.ecus.map((ecu) => (
         <EcuCard
           key={ecu.requestCanIdHex}
@@ -1089,6 +1307,9 @@ function OverridePanel({
   const [requestHex, setRequestHex] = useState(UDS_CATALOGUE[0].variants[0].requestHex)
   const [responseHex, setResponseHex] = useState(UDS_CATALOGUE[0].variants[0].responseHex)
   const [lastApplied, setLastApplied] = useState<string | null>(null)
+  const [matchTrailing, setMatchTrailing] = useState(
+    DefaultMatchTrailing(UDS_CATALOGUE[0], UDS_CATALOGUE[0].variants[0]),
+  )
 
   const requestCanIdHex = ecu?.requestCanIdHex
 
@@ -1117,7 +1338,11 @@ function OverridePanel({
   }
 
   const vecOverrides = overrides ?? []
-  const service = UDS_CATALOGUE.find((entry) => entry.sid === serviceSid) ?? UDS_CATALOGUE[0]
+  // The catalogue lists the well-known identifiers; this ECU's own come from the loaded
+  // vehicle. Without them a simfile that defines 0x0111 offers no way to select it, and the
+  // editor looks as though the engine only knows about VINs and part numbers.
+  const vecServices = ServicesForEcu(ecu)
+  const service = vecServices.find((entry) => entry.sid === serviceSid) ?? vecServices[0]
   const variant = service.variants[variantIndex] ?? service.variants[0]
 
   // Which existing response, if any, this request pattern is. Matching on the pattern is what
@@ -1135,11 +1360,15 @@ function OverridePanel({
   }
 
   function selectService(sid: string) {
-    const next = UDS_CATALOGUE.find((entry) => entry.sid === sid)
+    // The per-ECU list, not the static catalogue: this ECU's own identifiers are folded into
+    // 0x22 and 0x2E, and picking from the catalogue here would fill the fields with a
+    // well-known identifier the operator did not choose.
+    const next = vecServices.find((entry) => entry.sid === sid)
     if (!next) return
     setServiceSid(sid)
     setVariantIndex(0)
     fillFor(next.variants[0].requestHex, next.variants[0].responseHex)
+    setMatchTrailing(DefaultMatchTrailing(next, next.variants[0]))
   }
 
   function selectVariant(index: number) {
@@ -1147,6 +1376,7 @@ function OverridePanel({
     if (!next) return
     setVariantIndex(index)
     fillFor(next.requestHex, next.responseHex)
+    setMatchTrailing(DefaultMatchTrailing(service, next))
   }
 
   async function save(vecNext: ResponseOverride[], strAppliedLabel: string | null) {
@@ -1172,7 +1402,7 @@ function OverridePanel({
   function apply(action: 'substitute' | 'suppress') {
     const rule: ResponseOverride = {
       requestHex,
-      matchTrailingBytes: existing?.matchTrailingBytes ?? false,
+      matchTrailingBytes: matchTrailing,
       action,
       responseHex: action === 'substitute' ? responseHex : null,
       // Echo spans come from the catalogue entry, but only while its request template is
@@ -1239,7 +1469,7 @@ function OverridePanel({
             onChange={(e) => selectService(e.target.value)}
             className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-200 outline-none focus:border-slate-500"
           >
-            {UDS_CATALOGUE.map((entry) => (
+            {vecServices.map((entry) => (
               <option key={entry.sid} value={entry.sid}>
                 0x{entry.sid} {entry.name}
                 {entry.implemented ? '' : ' — override only'}
@@ -1263,6 +1493,30 @@ function OverridePanel({
           </select>
         </label>
       </div>
+
+      <label className="mt-2 flex items-start gap-2 text-[11px] text-slate-400">
+        <input
+          type="checkbox"
+          checked={matchTrailing}
+          onChange={(e) => setMatchTrailing(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Match as a prefix, ignoring anything after it.
+          {matchTrailing ? (
+            <span className="text-slate-500">
+              {' '}
+              A request starting with these bytes matches however long it is.
+            </span>
+          ) : (
+            <span className="text-amber-400/90">
+              {' '}
+              Off: the request must be exactly this length. A WriteDataByIdentifier carries the
+              value it is writing, so an exact template never matches one.
+            </span>
+          )}
+        </span>
+      </label>
 
       {!service.implemented && (
         <p className="mt-2 rounded border border-amber-900/50 bg-amber-950/20 px-2 py-1.5 text-[11px] text-amber-400/90">
@@ -1486,6 +1740,458 @@ function OverrideRow({
 
 // ---------------------------------------------------------------------------------------
 // Timing controls
+// ---------------------------------------------------------------------------------------
+// SecurityAccess levels
+// ---------------------------------------------------------------------------------------
+
+const c_arrKeyPolicies: { value: SecurityLevel['keyPolicy']; label: string; hint: string }[] = [
+  {
+    value: 'acceptAny',
+    label: 'Accept any key',
+    hint: 'Unlock whatever the tester sends. The honest choice for a level taken from a capture — the seed was observed, the key never usefully was.',
+  },
+  {
+    value: 'compare',
+    label: 'Compare with the expected key',
+    hint: 'Unlock only on an exact match, NRC 0x35 otherwise. For a level whose key is genuinely known.',
+  },
+  {
+    value: 'refuse',
+    label: 'Always refuse',
+    hint: 'Never unlock; answer every key with the code below. Fault injection — the tester’s rejected-key path on demand.',
+  },
+]
+
+const c_arrWildcardTokens = ['**', '??', '..', 'xx', 'XX']
+
+/** Split a hex field the way the engine does: whitespace ignored, two characters per byte. */
+function HexTokens(value: string): string[] {
+  const clean = value.replace(/\s+/g, '')
+  const tokens: string[] = []
+  for (let i = 0; i < clean.length; i += 2) tokens.push(clean.slice(i, i + 2))
+  return tokens
+}
+
+/**
+ * What is wrong with a hex field, in the words the engine would use — checked here so the
+ * operator sees it while typing rather than after a rejected round trip.
+ */
+function DescribeHexProblem(value: string, label: string, allowEmpty: boolean): string | null {
+  if (value.trim() === '') {
+    return allowEmpty ? null : `${label} is empty`
+  }
+  for (const token of HexTokens(value)) {
+    if (c_arrWildcardTokens.includes(token)) {
+      return `${label}: ${token} is a wildcard, and this field holds literal bytes. Wildcards match a request pattern, which is a response override's job.`
+    }
+    if (!/^[0-9a-fA-F]{2}$/.test(token)) {
+      return `${label}: "${token}" is not a hex byte`
+    }
+  }
+  return null
+}
+
+/** The one hex byte in a field, or null while it holds anything else. */
+function SingleByteOf(value: string): number | null {
+  const tokens = HexTokens(value)
+  if (tokens.length !== 1 || !/^[0-9a-fA-F]{2}$/.test(tokens[0])) return null
+  return parseInt(tokens[0], 16)
+}
+
+function Hex2(value: number): string {
+  return value.toString(16).toUpperCase().padStart(2, '0')
+}
+
+/**
+ * The requestSeed/sendKey pair a level would cover, or null when the field is not yet a usable
+ * odd sub-function.
+ *
+ * Returns null for an even value rather than pairing it up. Someone who typed 02 meant "the
+ * level for 27 02", and telling them it "handles 27 02 requestSeed and 27 03 sendKey" confirms
+ * the misreading in the same breath the error below denies it.
+ */
+function CoveredPairOf(requestSeedHex: string): { requestSeed: string; sendKey: string } | null {
+  const value = SingleByteOf(requestSeedHex)
+  if (value === null || value % 2 === 0) return null
+  return { requestSeed: Hex2(value), sendKey: Hex2(value + 1) }
+}
+
+/** For an even sub-function, the odd one that names the same level. */
+function OddSubFunctionFor(requestSeedHex: string): string | null {
+  const value = SingleByteOf(requestSeedHex)
+  if (value === null || value % 2 !== 0 || value === 0) return null
+  return Hex2(value - 1)
+}
+
+/** Everything wrong with one level, or null when it would be accepted. */
+function DescribeLevelProblem(level: SecurityLevel): string | null {
+  const seedTokens = HexTokens(level.requestSeedHex)
+  if (seedTokens.length !== 1 || !/^[0-9a-fA-F]{2}$/.test(seedTokens[0])) {
+    return 'requestSeed must be exactly one hex byte, e.g. 01'
+  }
+
+  const value = parseInt(seedTokens[0], 16)
+  if (value % 2 === 0) {
+    return `27 ${Hex2(value)} is the sendKey half of a pair, and a level is named by the requestSeed half — the odd value below it. Naming this level ${Hex2((value - 1 + 256) % 256)} is what makes it answer 27 ${Hex2(value)}.`
+  }
+
+  const seedProblem = DescribeHexProblem(level.seedHex, 'Seed', true)
+  if (seedProblem) return seedProblem
+
+  if (level.keyPolicy === 'compare') {
+    const keyProblem = DescribeHexProblem(level.expectedKeyHex, 'Expected key', false)
+    if (keyProblem) return keyProblem
+  }
+
+  if (level.keyPolicy === 'refuse') {
+    const nrc = level.refusalNrcHex ?? ''
+    const nrcProblem = DescribeHexProblem(nrc, 'Refusal NRC', false)
+    if (nrcProblem) return nrcProblem
+    if (parseInt(HexTokens(nrc)[0], 16) === 0) {
+      return 'Refusal NRC 00 is the positive-response code, not a negative one'
+    }
+  }
+
+  return null
+}
+
+/**
+ * The request pattern of an override that already answers this level's requestSeed, if one
+ * exists.
+ *
+ * Worth surfacing because the two features overlap invisibly: the protocol runs first and sets
+ * the ECU's state, then an override replaces the bytes. So a level plus a matching override
+ * gives a working unlock whose seed field is dead weight — which looks exactly like the level
+ * not having been applied.
+ */
+function ShadowingOverrideOf(
+  overrides: ResponseOverride[],
+  level: SecurityLevel,
+): string | null {
+  const tokens = HexTokens(level.requestSeedHex)
+  if (tokens.length !== 1) return null
+  const wanted = `27 ${tokens[0].toUpperCase()}`
+
+  const match = overrides.find(
+    (rule) => rule.enabled && rule.requestHex.trim().toUpperCase().startsWith(wanted),
+  )
+  return match ? match.requestHex : null
+}
+
+/**
+ * The response-editor catalogue with one ECU's configured data identifiers folded in.
+ *
+ * `UDS_CATALOGUE` carries the identifiers every vehicle shares — VIN, part numbers, the
+ * standard 0xFxxx range. An ECU's *own* identifiers come from whatever populated the model: a
+ * simulation file, a reconstruction, the builder. Those are the ones an operator actually wants
+ * to override, and offering only the well-known ones makes the editor look as if the engine
+ * knows nothing else.
+ *
+ * The ECU's own are listed first, because they are the reason someone opened this dropdown.
+ * Duplicates are dropped so a DID that is both well-known and configured appears once.
+ */
+function ServicesForEcu(ecu: SimulationEcu | null): CatalogueService[] {
+  if (!ecu || ecu.dids.length === 0) return UDS_CATALOGUE
+
+  return UDS_CATALOGUE.map((service) => {
+    if (service.sid !== '22' && service.sid !== '2E') return service
+
+    const bIsRead = service.sid === '22'
+    const vecOwn: CatalogueVariant[] = ecu.dids.map((u16Did) => {
+      const strDid = u16Did.toString(16).toUpperCase().padStart(4, '0')
+      const strRequestHex = `${bIsRead ? '22' : '2E'} ${strDid.slice(0, 2)} ${strDid.slice(2)}`
+      const strResponseHex = `${bIsRead ? '62' : '6E'} ${strDid.slice(0, 2)} ${strDid.slice(2)}${bIsRead ? ' 00' : ''}`
+      return {
+        label: `${FormatDid(u16Did)} — on this ECU`,
+        requestHex: strRequestHex,
+        responseHex: strResponseHex,
+        // A write carries the value after the identifier, and its length is whatever is being
+        // written; a read of one identifier is exactly three bytes.
+        matchTrailingBytes: !bIsRead,
+      }
+    })
+
+    const setOwn = new Set(vecOwn.map((entry) => entry.requestHex))
+    const vecRest = service.variants.filter((entry) => !setOwn.has(entry.requestHex))
+    return { ...service, variants: [...vecOwn, ...vecRest] }
+  })
+}
+
+/**
+ * Whether a template should match as a prefix by default.
+ *
+ * The variant decides if it says so; otherwise the service does. Services in
+ * `VARIABLE_TAIL_SERVICES` carry a tail no template can state — the value being written, the
+ * key being sent, the block being transferred — and an exact-length match there can never fire.
+ */
+function DefaultMatchTrailing(service: CatalogueService, variant: CatalogueVariant): boolean {
+  return variant.matchTrailingBytes ?? VARIABLE_TAIL_SERVICES.includes(service.sid)
+}
+
+function EmptySecurityLevel(): SecurityLevel {
+  return {
+    requestSeedHex: '01',
+    seedHex: '',
+    expectedKeyHex: '',
+    keyPolicy: 'acceptAny',
+    refusalNrcHex: null,
+  }
+}
+
+/**
+ * Edit an ECU's SecurityAccess levels.
+ *
+ * The whole list is replaced on save, matching the endpoint — what is on screen is what the
+ * ECU ends up with.
+ */
+function SecurityPanel({
+  ecu,
+  onSaved,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu | null
+  onSaved: () => Promise<void> | void
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [levels, setLevels] = useState<SecurityLevel[] | null>(null)
+  const [overrides, setOverrides] = useState<ResponseOverride[]>([])
+  const [draft, setDraft] = useState<SecurityLevel[] | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  const handle = ecu?.handle ?? null
+
+  useEffect(() => {
+    let cancelled = false
+    if (!handle) return
+    void (async () => {
+      try {
+        const [loaded, loadedOverrides] = await Promise.all([
+          api.ecuSecurityLevels(handle),
+          api.ecuOverrides(handle),
+        ])
+        if (!cancelled) {
+          setLevels(loaded)
+          setOverrides(loadedOverrides)
+        }
+      } catch (e) {
+        if (!cancelled) onError(DescribeError(e))
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // onError is stable enough for this panel's lifetime; re-running on it would refetch on
+    // every parent render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handle])
+
+  if (!ecu) return null
+
+  const shown = draft ?? levels
+  if (shown === null) return null
+
+  function update(index: number, patch: Partial<SecurityLevel>) {
+    setNote(null)
+    setDraft(shown!.map((level, i) => (i === index ? { ...level, ...patch } : level)))
+  }
+
+  async function save() {
+    if (!handle) return
+    setSaving(true)
+    try {
+      const saved = await api.setEcuSecurityLevels(handle, shown!)
+      setLevels(saved)
+      setDraft(null)
+      onError(null)
+      setNote('Saved. The change applies to the next SecurityAccess request.')
+      await onSaved()
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const bIsDirty = draft !== null
+  const arrProblems = shown.map(DescribeLevelProblem)
+  const firstProblem = arrProblems.find((problem) => problem !== null) ?? null
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Security — {ecu.name}
+        </h3>
+        <span className="text-xs text-slate-500">ISO 14229-1 · 0x27</span>
+      </div>
+
+      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+        A simulator cannot compute a real key — the algorithm lives in the manufacturer&rsquo;s
+        tooling, and a capture yields at best a seed. Say what each level should do instead. A
+        key arriving with no preceding requestSeed is always refused with NRC 0x24, whichever
+        policy is set.
+      </p>
+
+      {shown.length === 0 && (
+        <p className="mt-3 rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">
+          No security levels. This ECU answers <span className="font-mono">27 02</span> with NRC
+          0x12 (subFunctionNotSupported), because there is no level to send a key to.
+        </p>
+      )}
+
+      <div className="mt-3 space-y-3">
+        {shown.map((level, index) => (
+          <div key={index} className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <TextField
+                  label="requestSeed sub-function"
+                  placeholder="01"
+                  value={level.requestSeedHex}
+                  onChange={(v) => update(index, { requestSeedHex: v })}
+                  mono
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  {CoveredPairOf(level.requestSeedHex) === null ? (
+                    'One hex byte, odd — e.g. 01'
+                  ) : (
+                    <>
+                      handles{' '}
+                      <span className="font-mono text-slate-400">
+                        27 {CoveredPairOf(level.requestSeedHex)!.requestSeed}
+                      </span>{' '}
+                      requestSeed and{' '}
+                      <span className="font-mono text-slate-400">
+                        27 {CoveredPairOf(level.requestSeedHex)!.sendKey}
+                      </span>{' '}
+                      sendKey
+                    </>
+                  )}
+                </p>
+              </div>
+              <label className="block">
+                <span className="text-xs text-slate-400">On sendKey</span>
+                <select
+                  value={level.keyPolicy}
+                  onChange={(e) =>
+                    update(index, { keyPolicy: e.target.value as SecurityLevel['keyPolicy'] })
+                  }
+                  className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+                >
+                  {c_arrKeyPolicies.map((policy) => (
+                    <option key={policy.value} value={policy.value}>
+                      {policy.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <p className="mt-2 text-xs text-slate-500">
+              {c_arrKeyPolicies.find((p) => p.value === level.keyPolicy)?.hint}
+            </p>
+
+            <div className="mt-3">
+              <TextField
+                label="Seed returned on requestSeed"
+                placeholder="11 22 33 44 (literal bytes — no ** wildcards)"
+                value={level.seedHex}
+                onChange={(v) => update(index, { seedHex: v })}
+                mono
+              />
+              {ShadowingOverrideOf(overrides, level) && (
+                <p className="mt-1 text-xs text-amber-400">
+                  A response override for{' '}
+                  <span className="font-mono">{ShadowingOverrideOf(overrides, level)}</span>{' '}
+                  already answers requestSeed on this ECU, and an override replaces the response
+                  bytes. This seed will not reach the wire — leave it blank unless you delete
+                  that override. The level is still what makes sendKey work.
+                </p>
+              )}
+            </div>
+
+            {level.keyPolicy === 'compare' && (
+              <div className="mt-3">
+                <TextField
+                  label="Expected key"
+                  placeholder="AA BB CC DD"
+                  value={level.expectedKeyHex}
+                  onChange={(v) => update(index, { expectedKeyHex: v })}
+                  mono
+                />
+              </div>
+            )}
+
+            {level.keyPolicy === 'refuse' && (
+              <div className="mt-3">
+                <TextField
+                  label="Refuse with NRC"
+                  placeholder="35"
+                  value={level.refusalNrcHex ?? ''}
+                  onChange={(v) => update(index, { refusalNrcHex: v })}
+                  mono
+                />
+              </div>
+            )}
+
+            {arrProblems[index] && (
+              <div className="mt-3 rounded-md border border-rose-900/60 bg-rose-950/40 px-3 py-2 text-xs text-rose-300">
+                <p>{arrProblems[index]}</p>
+                {OddSubFunctionFor(level.requestSeedHex) && (
+                  <button
+                    onClick={() =>
+                      update(index, { requestSeedHex: OddSubFunctionFor(level.requestSeedHex)! })
+                    }
+                    className="mt-2 rounded border border-rose-700 px-2 py-1 font-mono text-xs text-rose-200 transition hover:border-rose-500"
+                  >
+                    Use {OddSubFunctionFor(level.requestSeedHex)} instead
+                  </button>
+                )}
+              </div>
+            )}
+
+            <button
+              onClick={() => {
+                setNote(null)
+                setDraft(shown.filter((_, i) => i !== index))
+              }}
+              className="mt-3 text-xs text-rose-400 transition hover:text-rose-300"
+            >
+              Remove this level
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          onClick={() => {
+            setNote(null)
+            setDraft([...shown, EmptySecurityLevel()])
+          }}
+          className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-300 transition hover:border-slate-500"
+        >
+          Add a level
+        </button>
+        <button
+          onClick={save}
+          disabled={busy || saving || !bIsDirty || firstProblem !== null}
+          className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-600 disabled:opacity-40"
+        >
+          Apply security
+        </button>
+        {bIsDirty && firstProblem === null && (
+          <span className="text-xs text-amber-400">unsaved</span>
+        )}
+        {note && <span className="text-xs text-slate-400">{note}</span>}
+      </div>
+    </section>
+  )
+}
+
 // ---------------------------------------------------------------------------------------
 
 /**

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   FormatEventTime,
   SaveTrafficLog,
+  SearchTextOf,
   useTrafficFeed,
   type TrafficEntry,
   type TrafficEvent,
@@ -51,11 +52,12 @@ export function OpenMonitorWindow(): void {
  * make the app itself stutter.
  */
 export function TrafficMonitor({ standalone = false }: { standalone?: boolean }) {
-  const { entries, status, isPaused, setPaused, totalSeen, replay, clear } = useTrafficFeed(
-    standalone ? WINDOW_BUFFER : PANEL_BUFFER,
-  )
   const [filter, setFilter] = useState('')
   const [showFrames, setShowFrames] = useState(true)
+  const { entries, status, isPaused, setPaused, totalSeen, replay, clear, reconnects } = useTrafficFeed(
+    standalone ? WINDOW_BUFFER : PANEL_BUFFER,
+    showFrames,
+  )
 
   const vecVisible = useMemo(
     () => FilterEntries(entries, filter, showFrames),
@@ -78,6 +80,7 @@ export function TrafficMonitor({ standalone = false }: { standalone?: boolean })
 
         <span className="text-xs text-slate-500">
           {entries.length} held · {totalSeen} seen
+          {reconnects > 1 && ` · reattached ${reconnects - 1}×`}
           {uDropped > 0 && ` · ${uDropped} dropped`}
           {vecVisible.length !== entries.length && ` · ${vecVisible.length} shown`}
         </span>
@@ -98,6 +101,11 @@ export function TrafficMonitor({ standalone = false }: { standalone?: boolean })
             />
             frames
           </label>
+          {!showFrames && (
+            <span className="text-[11px] text-slate-500" title="The engine stops sending them">
+              not requested
+            </span>
+          )}
           <SmallButton onClick={() => setPaused(!isPaused)}>
             {isPaused ? 'Resume' : 'Pause'}
           </SmallButton>
@@ -110,6 +118,14 @@ export function TrafficMonitor({ standalone = false }: { standalone?: boolean })
           )}
         </div>
       </div>
+
+      {status === 'offline' && (
+        <p className="rounded border border-rose-900/60 bg-rose-950/40 px-2 py-1.5 text-[11px] text-rose-300">
+          The feed is not connected, so nothing here is live. The browser retries on its own; if
+          it stays like this the engine or the dev server has stopped — restart with{' '}
+          <span className="font-mono">./scripts/dev.sh</span> and reload this page.
+        </p>
+      )}
 
       {uDropped > 0 && standalone && (
         <p className="rounded border border-amber-900/50 bg-amber-950/20 px-2 py-1 text-[11px] text-amber-400/90">
@@ -424,6 +440,13 @@ function FilterEntries(
 ): TrafficEntry[] {
   const strNeedle = filter.trim().toUpperCase()
 
+  // Nothing to exclude: hand back the same array rather than a copy of it. The buffer changes
+  // several times a second, and copying twenty thousand entries each time to reach an
+  // identical list is pure waste — and re-renders everything downstream for nothing.
+  if (showFrames && strNeedle.length === 0) {
+    return entries
+  }
+
   return entries.filter((entry) => {
     if (!showFrames && entry.event.kind === 'frame') {
       return false
@@ -431,7 +454,8 @@ function FilterEntries(
     if (strNeedle.length === 0) {
       return true
     }
-    return JSON.stringify(entry.event).toUpperCase().includes(strNeedle)
+    // Built on first use and kept. See TrafficEntry.search.
+    return SearchTextOf(entry).includes(strNeedle)
   })
 }
 

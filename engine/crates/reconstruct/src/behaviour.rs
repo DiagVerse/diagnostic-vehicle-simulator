@@ -7,7 +7,9 @@
 //!
 //! Extracted from `pipeline.rs` unchanged when the DoIP pipeline was added.
 
-use core_domain::model::{DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityLevel, SessionType};
+use core_domain::model::{
+    DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityKeyPolicy, SecurityLevel, SessionType,
+};
 use core_domain::Confidence;
 
 /// Offset between a request SID and its positive-response SID (ISO 14229).
@@ -122,6 +124,13 @@ pub(crate) fn ApplySecurityAccess(ecu: &mut Ecu, vecRequest: &[u8], vecResponse:
             m_byRequestSeedSubFunction: bySubFunction,
             m_vecSeed: vecSeed,
             m_vecExpectedKey: Vec::new(),
+            // A capture never yields a usable key. Even when the trace contains the sendKey a
+            // tester sent, that key answered *that* seed; a fresh session issues a fresh seed
+            // and the recorded key is wrong by construction. Comparing against an empty key
+            // would refuse every tester with NRC 0x35 and look like a simulator bug, so a
+            // reconstructed level accepts instead — and says so through its policy rather than
+            // by pretending to hold a key it does not have.
+            m_keyPolicy: SecurityKeyPolicy::AcceptAnyKey,
         });
     }
 }

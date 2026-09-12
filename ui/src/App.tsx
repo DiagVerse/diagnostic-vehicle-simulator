@@ -71,7 +71,17 @@ function Workbench() {
             <h1 className="text-lg font-semibold tracking-tight">Diagnostic Vehicle Simulator</h1>
             <p className="text-sm text-slate-400">Reconstruct · Simulate · Diagnose</p>
           </div>
-          <StatusPill status={status} version={health?.engine_version} />
+          <div className="flex flex-col items-end gap-1">
+            <StatusPill status={status} version={health?.engine_version} />
+            {health && (
+              <span
+                className="font-mono text-[11px] text-slate-500"
+                title={`Engine built ${new Date(health.built_at_secs * 1000).toLocaleString()}. A trailing + means the tree had uncommitted changes.`}
+              >
+                build {health.build_commit} · {DescribeBuildAge(health.built_at_secs)}
+              </span>
+            )}
+          </div>
         </div>
         <nav className="mx-auto mt-4 flex max-w-6xl gap-1">
           <TabButton active={tab === 'simulate'} onClick={() => setTab('simulate')}>
@@ -105,6 +115,26 @@ function Workbench() {
       </main>
     </div>
   )
+}
+
+/**
+ * How long ago the running engine was built, in words.
+ *
+ * Worth the space in the header: a fix that is not in the running binary behaves exactly like
+ * a fix that does not work, and three separate reports turned out to be a stale build rather
+ * than the change being wrong. An engine built days ago while the source moved this morning is
+ * now visible rather than something to deduce.
+ */
+function DescribeBuildAge(builtAtSecs: number): string {
+  if (!builtAtSecs) return 'build time unknown'
+
+  const uMinutes = Math.floor((Date.now() / 1000 - builtAtSecs) / 60)
+  if (uMinutes < 1) return 'built just now'
+  if (uMinutes < 60) return `built ${uMinutes}m ago`
+
+  const uHours = Math.floor(uMinutes / 60)
+  if (uHours < 24) return `built ${uHours}h ago`
+  return `built ${Math.floor(uHours / 24)}d ago`
 }
 
 function TabButton({

@@ -41,8 +41,29 @@ pub struct RSecurityLevel {
     pub m_byRequestSeedSubFunction: u8,
     /// Seed returned on requestSeed.
     pub m_vecSeed: RVec<u8>,
-    /// Key expected on sendKey.
+    /// Key expected on sendKey. Empty unless the policy is to compare against it.
     pub m_vecExpectedKey: RVec<u8>,
+    /// What to do with the key a tester sends.
+    pub m_keyPolicy: RKeyPolicy,
+    /// The code to refuse with under [`RKeyPolicy::RefuseWith`]. Ignored by every other policy.
+    ///
+    /// A plain byte alongside the discriminant rather than a payload inside it: an ABI boundary
+    /// is the wrong place for a data-carrying enum, and the pair survives a plugin built
+    /// against an older header far more gracefully.
+    pub m_byRefusalNrc: u8,
+}
+
+/// FFI-safe mirror of `core-domain`'s `SecurityKeyPolicy`.
+#[repr(u8)]
+#[derive(StableAbi, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RKeyPolicy {
+    /// Compare the key against `m_vecExpectedKey`; unlock on a match, NRC 0x35 otherwise.
+    #[default]
+    CompareWithExpectedKey,
+    /// Accept whatever arrives and unlock.
+    AcceptAnyKey,
+    /// Never unlock; answer with `m_byRefusalNrc`.
+    RefuseWith,
 }
 
 /// FFI-safe snapshot of the ECU state a protocol plugin needs to compute a response.
@@ -65,6 +86,23 @@ pub struct REcuSnapshot {
     pub m_vecDtcs: RVec<RDtc>,
     /// Security levels.
     pub m_vecSecurityLevels: RVec<RSecurityLevel>,
+    /// The block sequence counter the next TransferData must carry (ISO 14229-1 clause 14.2).
+    /// Meaningless unless `m_bIsTransferInProgress`.
+    pub m_byExpectedBlockSequenceCounter: u8,
+    /// Whether a RequestDownload or RequestUpload is open.
+    ///
+    /// Separate from the counter rather than folded into it as a zero sentinel: the counter
+    /// wraps 0xFF to 0x00, so 0x00 is a perfectly ordinary block number and a transfer that
+    /// used it as "idle" would die at the wrap — one block short of 256.
+    pub m_bIsTransferInProgress: bool,
+    /// True when the vehicle is in permissive mode: the server's own gates — session
+    /// restrictions, security locks, services absent from the supported list — are not
+    /// enforced, so a response the operator configured is always reachable.
+    ///
+    /// It does not invent answers. A request with nothing configured still gets the honest
+    /// refusal, because claiming success for something nobody stated is the one thing a
+    /// simulator must not do.
+    pub m_bIsPermissive: bool,
 }
 
 // Kinds of state change a plugin can request. A small tag+value struct is used instead of a
@@ -77,6 +115,10 @@ pub const c_byStateChangeSetActiveSeedLevel: u8 = 2;
 pub const c_byStateChangeUnlockSecurity: u8 = 3;
 /// Return the ECU to the default session (`m_byValue` ignored).
 pub const c_byStateChangeResetToDefaultSession: u8 = 4;
+/// Open a transfer, or advance it: the value is the counter the next TransferData must carry.
+pub const c_byStateChangeSetBlockSequenceCounter: u8 = 5;
+/// Close a transfer. The value is ignored.
+pub const c_byStateChangeEndTransfer: u8 = 6;
 
 /// A single mutation for the engine to apply to the ECU's live state after responding.
 #[repr(C)]

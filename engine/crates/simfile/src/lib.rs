@@ -13,11 +13,12 @@
 
 pub mod dto;
 pub mod encode;
+pub mod export;
 
 use core_domain::model::{
     CanAddress, CanAddressingMode, DataIdentifier, DiagnosticTroubleCode, EchoSpan, Ecu, EcuTiming,
-    Network, NetworkKind, OverrideAction, ResponseOverride, SecurityLevel, SessionType, Vehicle,
-    VehicleIdentity,
+    Network, NetworkKind, OverrideAction, ResponseOverride, SecurityKeyPolicy, SecurityLevel,
+    SessionType, Vehicle, VehicleIdentity,
 };
 use core_domain::Confidence;
 
@@ -292,7 +293,7 @@ fn BuildEcu(dto: &EcuDto, vecNetworks: &[Network]) -> Result<Ecu, SimFileError> 
     ecu.m_mapDids = BuildDids(dto, &strWhere)?;
     ecu.m_vecDtcs = BuildDtcs(dto, &strWhere)?;
     ecu.m_vecSecurityLevels = BuildSecurityLevels(dto, &strWhere)?;
-    ecu.m_timing = BuildTiming(dto.timing.as_ref());
+    ecu.m_timing = BuildTiming(dto.timing.as_ref(), &strWhere)?;
     ecu.m_vecResponseOverrides = BuildOverrides(&dto.responses, &strWhere)?;
 
     Ok(ecu)
@@ -652,6 +653,9 @@ fn BuildDtcs(dto: &EcuDto, strWhere: &str) -> Result<Vec<DiagnosticTroubleCode>,
     Ok(vecDtcs)
 }
 
+/// NRC 0x35 invalidKey — what a level refuses with unless the file names another code.
+const c_byNrcInvalidKey: u8 = 0x35;
+
 /// Read the security levels an ECU offers.
 fn BuildSecurityLevels(dto: &EcuDto, strWhere: &str) -> Result<Vec<SecurityLevel>, SimFileError> {
     let mut vecLevels = Vec::with_capacity(dto.security.len());
@@ -694,30 +698,92 @@ fn BuildSecurityLevels(dto: &EcuDto, strWhere: &str) -> Result<Vec<SecurityLevel
             strReason: format!("security key: {strReason}"),
         })?;
 
-        vecLevels.push(SecurityLevel {
+        let keyPolicy = BuildKeyPolicy(entry, strWhere)?;
+
+        let level = SecurityLevel {
             m_byRequestSeedSubFunction: bySubFunction,
             m_vecSeed: vecSeed,
             m_vecExpectedKey: vecKey,
-        });
+            m_keyPolicy: keyPolicy,
+        };
+        level.Validate().map_err(|error| SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!("security: {error}"),
+        })?;
+
+        vecLevels.push(level);
     }
     Ok(vecLevels)
 }
 
+/// Read one level's key policy, defaulting to the comparison a file written before this
+/// existed implied.
+fn BuildKeyPolicy(
+    entry: &crate::dto::SecurityDto,
+    strWhere: &str,
+) -> Result<SecurityKeyPolicy, SimFileError> {
+    let strPolicy = match entry.key_policy.as_deref() {
+        Some(strPolicy) => strPolicy.trim().to_ascii_lowercase(),
+        None => return Ok(SecurityKeyPolicy::CompareWithExpectedKey),
+    };
+
+    match strPolicy.as_str() {
+        "compare" => Ok(SecurityKeyPolicy::CompareWithExpectedKey),
+        "acceptany" => Ok(SecurityKeyPolicy::AcceptAnyKey),
+        "refuse" => {
+            let byNrc = match entry.refusal_nrc.as_deref() {
+                Some(strNrc) => {
+                    ParseHexByte(strNrc).map_err(|strReason| SimFileError::BadField {
+                        strWhere: strWhere.to_string(),
+                        strReason: format!("security refusalNrc: {strReason}"),
+                    })?
+                }
+                None => c_byNrcInvalidKey,
+            };
+            Ok(SecurityKeyPolicy::RefuseWith { m_byNrc: byNrc })
+        }
+        _ => Err(SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!(
+                "security keyPolicy '{strPolicy}' is not one of: compare, acceptAny, refuse"
+            ),
+        }),
+    }
+}
+
 /// Read timing overrides onto the defaults.
-fn BuildTiming(optTiming: Option<&TimingDto>) -> EcuTiming {
+fn BuildTiming(optTiming: Option<&TimingDto>, strWhere: &str) -> Result<EcuTiming, SimFileError> {
     let timing = match optTiming {
         Some(timing) => timing,
-        None => return EcuTiming::default(),
+        None => return Ok(EcuTiming::default()),
+    };
+
+    let bySeparationTime = match timing.iso_tp_separation_time_min.as_deref() {
+        Some(strValue) => ParseHexByte(strValue).map_err(|strReason| SimFileError::BadField {
+            strWhere: strWhere.to_string(),
+            strReason: format!("timing isoTpSeparationTimeMin: {strReason}"),
+        })?,
+        None => 0,
     };
 
     let defaults = EcuTiming::default();
-    EcuTiming {
+    let built = EcuTiming {
         m_u32P2ServerMaxMs: timing.p2_ms.unwrap_or(defaults.m_u32P2ServerMaxMs),
         m_u32P2StarServerMaxMs: timing.p2_star_ms.unwrap_or(defaults.m_u32P2StarServerMaxMs),
         m_u32P4ServerMaxMs: timing.p4_ms.unwrap_or(defaults.m_u32P4ServerMaxMs),
         m_u32ResponseDelayMs: timing.response_delay_ms.unwrap_or(0),
+        m_u8IsoTpBlockSize: timing
+            .iso_tp_block_size
+            .unwrap_or(defaults.m_u8IsoTpBlockSize),
+        m_byIsoTpSeparationTimeMin: bySeparationTime,
         ..defaults
-    }
+    };
+
+    built.Validate().map_err(|error| SimFileError::BadField {
+        strWhere: strWhere.to_string(),
+        strReason: format!("timing: {error}"),
+    })?;
+    Ok(built)
 }
 
 /// Read the answers an ECU gives to particular requests.

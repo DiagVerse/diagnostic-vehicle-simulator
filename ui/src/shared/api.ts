@@ -4,6 +4,15 @@
 export interface Health {
   status: string
   engine_version: string
+  /**
+   * The commit the running engine was built from, with a `+` when the tree was dirty.
+   *
+   * Shown in the header because a fix that is not in the running binary looks exactly like a
+   * fix that does not work, and there was no way to tell those apart from the browser.
+   */
+  build_commit: string
+  /** When that binary was built, as seconds since the epoch. */
+  built_at_secs: number
   plugin_count: number
 }
 
@@ -112,6 +121,17 @@ export interface SimulationState {
   vehicleName: string | null
   protocolLoaded: boolean
   ecus: SimulationEcu[]
+  /**
+   * True when the ECUs are not enforcing their own gates — session restrictions, security
+   * locks, services absent from the supported list — so a configured response is always
+   * reachable. It never fabricates an answer.
+   */
+  permissiveMode: boolean
+  /**
+   * True when the vehicle has been edited since it was last written to a file. A freshly
+   * loaded one is not unsaved — it came from somewhere you still have.
+   */
+  unsavedChanges: boolean
 }
 
 /** One message an ECU put on the wire, with both its scheduled and its measured offset. */
@@ -249,6 +269,37 @@ export interface EchoSpan {
  * Declaring a service supported does not implement it — the engine's UDS plugin answers seven
  * services, and an override is the only way to get a positive response out of the rest.
  */
+/** A vehicle written out as a simulation file. */
+export interface SimFileExport {
+  fileName: string
+  content: string
+}
+
+/**
+ * One SecurityAccess level.
+ *
+ * `keyPolicy` says what the ECU does with the key a tester sends:
+ * - `compare`   — check it against `expectedKeyHex`; NRC 0x35 on a mismatch. For a level whose
+ *                 key is genuinely known.
+ * - `acceptAny` — unlock whatever arrives. The honest choice for a level taken from a capture:
+ *                 the seed was observed, the key never usefully was, and a fresh session issues
+ *                 a fresh seed that any recorded key is wrong for.
+ * - `refuse`    — never unlock; answer every key with `refusalNrcHex`. Fault injection.
+ *
+ * A key that arrives with no preceding requestSeed is refused with NRC 0x24 under every policy:
+ * ISO 14229-1 makes that a sequence rule, not a key rule.
+ */
+export interface SecurityLevel {
+  /** requestSeed sub-function in hex, e.g. "01". Odd; the even value above it is sendKey. */
+  requestSeedHex: string
+  seedHex: string
+  /** Only meaningful under `compare`. */
+  expectedKeyHex: string
+  keyPolicy: 'compare' | 'acceptAny' | 'refuse'
+  /** The code `refuse` answers with, in hex. Defaults to 35 (invalidKey). */
+  refusalNrcHex: string | null
+}
+
 export interface ResponseOverride {
   /** Bytes to match; a byte written `**` is a wildcard, e.g. `22 ** **`. */
   requestHex: string
@@ -481,6 +532,14 @@ export const api = {
   hardwareStart: (port: string, bitrateBps: number, serialBaudBps?: number) =>
     postJson<HardwareStatus>('/hw/start', { port, bitrateBps, serialBaudBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
+  /** The loaded vehicle as simulation-file text, ready to save. Clears the unsaved marker. */
+  simulationExport: () => getJson<SimFileExport>('/simulation/export'),
+  setPermissiveMode: (enabled: boolean) =>
+    postJson<SimulationState>('/simulation/permissive', { enabled }),
+  ecuSecurityLevels: (handle: string) =>
+    getJson<SecurityLevel[]>(`/simulation/ecus/${handle}/security`),
+  setEcuSecurityLevels: (handle: string, levels: SecurityLevel[]) =>
+    putJson<SecurityLevel[]>(`/simulation/ecus/${handle}/security`, { levels }),
   ecuOverrides: (handle: string) =>
     getJson<ResponseOverride[]>(`/simulation/ecus/${handle}/overrides`),
   setEcuOverrides: (handle: string, overrides: ResponseOverride[]) =>

@@ -93,13 +93,103 @@ pub struct SecurityLevel {
     /// The seed the ECU returns when this level's seed is requested.
     pub m_vecSeed: Vec<u8>,
     /// The key the ECU expects back to unlock this level.
+    ///
+    /// Only consulted under [`SecurityKeyPolicy::CompareWithExpectedKey`]; the other policies
+    /// never look at it, and for those it is legitimately empty.
     pub m_vecExpectedKey: Vec<u8>,
+    /// What to do with the key a tester actually sends.
+    ///
+    /// Defaulted so every vehicle model written before this field existed keeps comparing, as
+    /// it always did.
+    #[serde(default)]
+    pub m_keyPolicy: SecurityKeyPolicy,
+}
+
+/// What an ECU does with the key a tester sends it.
+///
+/// A simulator cannot compute a real key. The algorithm lives in the manufacturer's tooling,
+/// and a vehicle reconstructed from a capture has at best a recorded *seed* — the key that
+/// answered it was either never recorded or is useless, because a fresh seed demands a fresh
+/// key. Comparing against a recorded key therefore fails by construction, which is exactly the
+/// `7F 27 35` a reconstruction produces today.
+///
+/// So the operator says what the level should do instead. Refusing is as useful as accepting:
+/// a tester's handling of a rejected key is a path worth exercising deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SecurityKeyPolicy {
+    /// Compare the key against [`SecurityLevel::m_vecExpectedKey`]: unlock on a match, answer
+    /// NRC 0x35 `invalidKey` otherwise. What an ECU with a known key does, and the default.
+    #[default]
+    CompareWithExpectedKey,
+
+    /// Accept whatever arrives and unlock. For a level whose key was never recorded, which is
+    /// every level reconstructed from a capture.
+    AcceptAnyKey,
+
+    /// Never unlock. Answer every key with this code, whatever it is.
+    RefuseWith {
+        /// The negative response code to send.
+        #[serde(rename = "nrc")]
+        m_byNrc: u8,
+    },
+}
+
+/// Why a security level was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SecurityLevelValidationError {
+    /// Even sub-functions send a key; a level identified by one could never be reached.
+    #[error("requestSeed sub-function is 0x{bySubFunction:02X}; requestSeed sub-functions are odd, and sendKey is the next value up")]
+    RequestSeedSubFunctionIsEven { bySubFunction: u8 },
+
+    /// ISO 14229-1: an all-zero seed is how a server says it is already unlocked.
+    #[error("the seed is all zeroes, which is how an ECU says it is already unlocked; use a non-zero seed")]
+    SeedIsAllZeroes,
+
+    /// A level that compares has nothing to compare against.
+    #[error("the policy compares the key against an expected one, but no expected key is set")]
+    ComparingWithoutAnExpectedKey,
+
+    /// `0x00` is the positive-response code, so refusing with it says the opposite.
+    #[error("the refusal code is 0x00, which is not a negative response code")]
+    RefusalNrcIsZero,
 }
 
 impl SecurityLevel {
     /// The sendKey sub-function paired with this level (requestSeed + 1, per ISO 14229).
     pub fn SendKeySubFunction(&self) -> u8 {
         self.m_byRequestSeedSubFunction.wrapping_add(1)
+    }
+
+    /// Check that this level describes something an ECU could actually do.
+    pub fn Validate(&self) -> Result<(), SecurityLevelValidationError> {
+        if self.m_byRequestSeedSubFunction.is_multiple_of(2) {
+            return Err(SecurityLevelValidationError::RequestSeedSubFunctionIsEven {
+                bySubFunction: self.m_byRequestSeedSubFunction,
+            });
+        }
+
+        if !self.m_vecSeed.is_empty() && self.m_vecSeed.iter().all(|byByte| *byByte == 0) {
+            return Err(SecurityLevelValidationError::SeedIsAllZeroes);
+        }
+
+        match self.m_keyPolicy {
+            SecurityKeyPolicy::CompareWithExpectedKey => {
+                if self.m_vecExpectedKey.is_empty() {
+                    return Err(SecurityLevelValidationError::ComparingWithoutAnExpectedKey);
+                }
+            }
+            // Neither of these reads the expected key, so an empty one is correct rather than
+            // merely tolerated.
+            SecurityKeyPolicy::AcceptAnyKey => {}
+            SecurityKeyPolicy::RefuseWith { m_byNrc } => {
+                if m_byNrc == 0 {
+                    return Err(SecurityLevelValidationError::RefusalNrcIsZero);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -246,10 +336,13 @@ impl Default for EcuTiming {
             m_bForceResponsePending: false,
             m_u8ForcedResponsePendingCount: DefaultForcedResponsePendingCount(),
             m_bDropFinalResponse: false,
-            // No pacing, matching what this engine advertised before these knobs existed. It
-            // is the correct default for a model that is not on a wire and for a link with
-            // bandwidth to spare; a slow adapter needs it raised. See the field docs.
-            m_u8IsoTpBlockSize: 0,
+            // One frame per FlowControl. Not the fastest choice — that is 0, "send them all"
+            // — but the only one that works on every link without being told about it. An
+            // SLCAN dongle on a 115200 baud line carries about an eighth of what a 500 kbit/s
+            // bus delivers, and a default of 0 loses the middle of every long request there,
+            // which is a silent wrong answer rather than a slow one. Raise it, or set it to 0,
+            // once the link is known to keep up.
+            m_u8IsoTpBlockSize: 1,
             m_byIsoTpSeparationTimeMin: 0,
         }
     }
@@ -1286,8 +1379,10 @@ mod tests {
     fn flow_control_defaults_to_no_pacing_and_accepts_both_stmin_units() {
         // The default is what this engine advertised before these knobs existed; changing it
         // would alter every link that never asked for pacing.
+        // One frame per flow control: the pacing every link can carry, rather than the
+        // fastest one, which silently loses frames on a slow serial adapter.
         let timing = EcuTiming::default();
-        assert_eq!(timing.m_u8IsoTpBlockSize, 0);
+        assert_eq!(timing.m_u8IsoTpBlockSize, 1);
         assert_eq!(timing.m_byIsoTpSeparationTimeMin, 0);
         assert!(timing.Validate().is_ok());
 
@@ -1366,6 +1461,7 @@ mod tests {
             m_byRequestSeedSubFunction: 0x01,
             m_vecSeed: vec![0x11, 0x22],
             m_vecExpectedKey: vec![0x33, 0x44],
+            m_keyPolicy: SecurityKeyPolicy::CompareWithExpectedKey,
         };
         assert_eq!(level.SendKeySubFunction(), 0x02);
     }

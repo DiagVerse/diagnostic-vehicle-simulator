@@ -3,7 +3,9 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use core_domain::model::{DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityLevel, SessionType};
+use core_domain::model::{
+    DataIdentifier, DiagnosticTroubleCode, Ecu, SecurityKeyPolicy, SecurityLevel, SessionType,
+};
 use core_domain::Confidence;
 
 /// Build a representative engine ECU: the Phase 1 service set, one DID (VIN), one DTC, and
@@ -44,6 +46,7 @@ pub fn BuildEngineEcu() -> Ecu {
         m_byRequestSeedSubFunction: 0x01,
         m_vecSeed: vec![0x11, 0x22, 0x33, 0x44],
         m_vecExpectedKey: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        m_keyPolicy: SecurityKeyPolicy::CompareWithExpectedKey,
     });
 
     ecu
