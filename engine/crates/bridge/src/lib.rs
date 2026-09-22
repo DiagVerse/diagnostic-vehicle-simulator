@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use crate::observer::{FrameDirection, FrameObserver};
 use application::ProtocolHandler;
+use can::busload::BusLoadMeter;
 use can::CanFrame;
 use isotp::params::{c_timeoutFlowControl, IsoTpParameters};
 use isotp::rx::{IsoTpReceiver, ReceiveOutcome};
@@ -36,6 +37,10 @@ use crate::bus::CanBusPort;
 /// How long to wait between polls of a quiet bus. Short enough to stay responsive, long enough
 /// not to spin a core.
 const c_pollInterval: Duration = Duration::from_millis(2);
+
+/// Bitrate a bus-load meter starts with before anyone says what the bus runs at. Load against
+/// an unknown capacity is meaningless, so it reports zero until a real rate replaces it.
+const c_u32UnknownBitrateBps: u32 = 0;
 
 /// How much has crossed the link, for a status display.
 ///
@@ -89,6 +94,9 @@ pub struct CanBridge {
     /// answering — and the hole then shows up as a sequence error on hardware that sent
     /// everything correctly.
     m_vecDeferred: Vec<CanFrame>,
+    /// How busy the bus has been, second by second. Fed from every frame crossing the link in
+    /// either direction, which is the honest scope of what this engine can observe.
+    m_arcMtxBusLoad: Arc<Mutex<BusLoadMeter>>,
     m_arcStats: Arc<BridgeStats>,
     m_startedAt: Instant,
     /// What the link between host and adapter can carry, when that is known.
@@ -117,6 +125,7 @@ impl CanBridge {
             m_mapEndpoints: BTreeMap::new(),
             m_queueInbound: VecDeque::new(),
             m_vecDeferred: Vec::new(),
+            m_arcMtxBusLoad: Arc::new(Mutex::new(BusLoadMeter::New(c_u32UnknownBitrateBps))),
             m_arcStats: Arc::new(BridgeStats::default()),
             m_startedAt: Instant::now(),
             m_optLinkCapacity: None,
@@ -134,8 +143,23 @@ impl CanBridge {
     /// [`LinkCapacity::SafeSeparationTime`].
     pub fn WithLinkCapacity(mut self, u32SerialBaud: u32, u32CanBitrateBps: u32) -> Self {
         self.m_optLinkCapacity = Some(LinkCapacity::New(u32SerialBaud, u32CanBitrateBps));
+        // Load is a share of capacity, so the meter is useless until it knows the bitrate.
+        self.m_arcMtxBusLoad = Arc::new(Mutex::new(BusLoadMeter::New(u32CanBitrateBps)));
         self.RebuildEndpoints();
         self
+    }
+
+    /// The bus-load history, shared so an HTTP handler can read it while the bridge runs.
+    pub fn BusLoad(&self) -> Arc<Mutex<BusLoadMeter>> {
+        Arc::clone(&self.m_arcMtxBusLoad)
+    }
+
+    /// Count a frame towards the bus load.
+    fn RecordBusLoad(&self, frame: &CanFrame) {
+        self.m_arcMtxBusLoad
+            .lock()
+            .expect("bus load mutex poisoned")
+            .Record(frame);
     }
 
     /// Attach something that wants to see every frame crossing this bridge.
@@ -333,6 +357,7 @@ impl CanBridge {
                     .m_atomicFramesReceived
                     .fetch_add(vecFrames.len() as u64, Ordering::Relaxed);
                 for frame in &vecFrames {
+                    self.RecordBusLoad(frame);
                     self.AnnounceFrame(FrameDirection::Received, frame);
                 }
                 self.m_queueInbound.extend(vecFrames);
@@ -583,6 +608,7 @@ impl CanBridge {
     /// Put one frame on the bus, logging rather than failing if the link is gone.
     fn SendRaw(&mut self, u32CanId: u32, vecData: Vec<u8>, f64TimestampSec: f64) {
         let frame = CanFrame::NewClassic(f64TimestampSec, u32CanId, vecData);
+        self.RecordBusLoad(&frame);
         self.m_arcStats
             .m_atomicFramesSent
             .fetch_add(1, Ordering::Relaxed);

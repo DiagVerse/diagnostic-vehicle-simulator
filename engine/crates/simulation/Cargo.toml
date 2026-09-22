@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Simulation use case: hold a loaded vehicle and route UDS requests to virtual ECUs by CAN address."
 
 [dependencies]
+can.workspace = true
 core-domain.workspace = true
 application.workspace = true
 ecu.workspace = true

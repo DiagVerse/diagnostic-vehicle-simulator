@@ -7,3 +7,4 @@ rust-version.workspace = true
 description = "CAN / CAN-FD frame types (OSI L2 data-link building block)."
 
 [dependencies]
+serde.workspace = true

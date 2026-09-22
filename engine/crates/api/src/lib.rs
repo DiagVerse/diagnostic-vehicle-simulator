@@ -104,6 +104,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/simulation/stop", post(simulation::PostSimulationStop))
         .route("/hw/ports", get(hardware::GetSerialPorts))
         .route("/hw/status", get(hardware::GetHardwareStatus))
+        .route("/hw/busload", get(hardware::GetBusLoad))
         .route("/hw/start", post(hardware::PostHardwareStart))
         .route("/hw/stop", post(hardware::PostHardwareStop))
         .route("/events", get(traffic::GetEvents))
@@ -145,6 +146,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(simulation::GetEcuOverrides).put(simulation::PutEcuOverrides),
         )
         .route("/simulation/export", get(simulation::GetSimulationExport))
+        .route(
+            "/simulation/ecus/:requestCanIdHex/bus-state",
+            get(simulation::GetEcuBusState).put(simulation::PutEcuBusState),
+        )
         .route(
             "/simulation/permissive",
             post(simulation::PostSimulationPermissive),

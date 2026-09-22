@@ -17,6 +17,7 @@ pub mod schedule;
 
 use abi_stable::std_types::RVec;
 use application::ProtocolHandler;
+use can::confinement::FaultConfinement;
 use core_domain::model::{
     c_byNegativeResponseSid, c_u32P2StarResolutionMs, Ecu, EcuTiming, SecurityKeyPolicy,
 };
@@ -117,6 +118,12 @@ pub struct VirtualEcu {
     /// is answered, but set for the whole vehicle at once — see
     /// `SimulationService::SetPermissiveMode`.
     m_bIsPermissive: bool,
+    /// The ECU's CAN error counters and the bus state they put it in (ISO 11898-1 clause 12.1).
+    ///
+    /// Bus state, not diagnostic state: a node that has been taken off the bus by errors is not
+    /// put back by a DiagnosticSessionControl, and a tester cannot talk it back on. Only a
+    /// recovery does that.
+    m_faultConfinement: FaultConfinement,
 }
 
 impl VirtualEcu {
@@ -133,6 +140,30 @@ impl VirtualEcu {
             m_bySeedLevelBeforeRequest: 0,
             m_optByExpectedBlockSequenceCounter: None,
             m_bIsPermissive: false,
+            m_faultConfinement: FaultConfinement::default(),
+        }
+    }
+
+    /// The ECU's error counters and bus state.
+    pub fn FaultConfinement(&self) -> FaultConfinement {
+        self.m_faultConfinement
+    }
+
+    /// Replace them, for an operator provoking a bus condition.
+    pub fn SetFaultConfinement(&mut self, confinement: FaultConfinement) {
+        let stateBefore = self.m_faultConfinement.State();
+        self.m_faultConfinement = confinement;
+        let stateAfter = confinement.State();
+
+        if stateBefore != stateAfter {
+            tracing::info!(
+                ecu = %self.m_config.m_strName,
+                from = stateBefore.Describe(),
+                to = stateAfter.Describe(),
+                tec = confinement.m_u16TransmitErrorCount,
+                rec = confinement.m_u16ReceiveErrorCount,
+                "bus state changed"
+            );
         }
     }
 

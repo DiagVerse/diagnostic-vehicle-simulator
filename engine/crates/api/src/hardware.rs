@@ -6,11 +6,12 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{extract::State, Json};
 use bridge::probe::{DetectSerialLinkSpeed, RequestedSerialLinkSpeed, SerialLinkSpeed};
 use bridge::{BridgeStats, CanBridge};
+use can::busload::{BusLoadMeter, BusLoadSample};
 use isotp::params::IsoTpParameters;
 use serde::{Deserialize, Serialize};
 use slcan::SlcanBitrate;
@@ -72,6 +73,8 @@ pub struct HardwareState {
     pub m_optLinkSpeed: Option<SerialLinkSpeed>,
     /// Its frame counters.
     pub m_optStats: Option<Arc<BridgeStats>>,
+    /// Its bus-load history, shared with the running bridge.
+    pub m_optBusLoad: Option<Arc<Mutex<BusLoadMeter>>>,
 }
 
 /// Request body for `POST /hw/start`.
@@ -122,6 +125,75 @@ fn ResolveSerialLinkSpeed(strPortName: &str, optU32Requested: Option<u32>) -> Se
     match optU32Requested {
         Some(u32Requested) => RequestedSerialLinkSpeed(u32Requested),
         None => DetectSerialLinkSpeed(strPortName),
+    }
+}
+
+/// One second of bus activity, as the UI plots it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusLoadSampleDto {
+    pub at_sec: f64,
+    pub frames: usize,
+    /// Share of the bus occupied, 0.0–1.0, with bit stuffing excluded.
+    pub load_nominal: f64,
+    /// The same with every frame stuffed as heavily as the standard allows.
+    pub load_worst_case: f64,
+}
+
+/// What `GET /hw/busload` answers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusLoadDto {
+    /// The bitrate load is measured against. Zero when no link is open, in which case the
+    /// series is empty rather than misleading.
+    pub bitrate_bps: u32,
+    /// One entry per second, oldest first, at most two minutes of history.
+    pub samples: Vec<BusLoadSampleDto>,
+    /// The second currently being filled — incomplete by definition, so reported apart from
+    /// the finished ones rather than plotted as though it were one of them.
+    pub current: Option<BusLoadSampleDto>,
+    /// The busiest finished second in the history.
+    pub peak: Option<BusLoadSampleDto>,
+    /// True while a load figure is a floor rather than a measurement, which it always is: bit
+    /// stuffing cannot be recovered from a decoded frame, so the honest answer is a range.
+    pub is_nominal_a_floor: bool,
+}
+
+/// GET /hw/busload — how busy the bus has been, second by second.
+pub async fn GetBusLoad(State(state): State<Arc<AppState>>) -> Json<BusLoadDto> {
+    let hardware = state.hardware.lock().expect("hardware mutex poisoned");
+
+    let arcMeter = match hardware.m_optBusLoad.as_ref() {
+        Some(arcMeter) => arcMeter,
+        // No link open: an empty series, not a flat line at zero, which would claim a quiet bus
+        // was observed when nothing was observed at all.
+        None => {
+            return Json(BusLoadDto {
+                bitrate_bps: 0,
+                samples: Vec::new(),
+                current: None,
+                peak: None,
+                is_nominal_a_floor: true,
+            })
+        }
+    };
+
+    let meter = arcMeter.lock().expect("bus load mutex poisoned");
+    Json(BusLoadDto {
+        bitrate_bps: meter.BitrateBps(),
+        samples: meter.Samples().iter().map(BuildSampleDto).collect(),
+        current: meter.Current().as_ref().map(BuildSampleDto),
+        peak: meter.Peak().as_ref().map(BuildSampleDto),
+        is_nominal_a_floor: true,
+    })
+}
+
+fn BuildSampleDto(sample: &BusLoadSample) -> BusLoadSampleDto {
+    BusLoadSampleDto {
+        at_sec: sample.m_f64AtSec,
+        frames: sample.m_uFrames,
+        load_nominal: sample.m_f64LoadNominal,
+        load_worst_case: sample.m_f64LoadWorstCase,
     }
 }
 
@@ -181,6 +253,7 @@ pub async fn PostHardwareStart(
     // something this link can actually deliver.
     .WithLinkCapacity(linkSpeed.m_u32BaudRate, body.bitrate_bps);
     let arcStats = canBridge.Stats();
+    let arcBusLoad = canBridge.BusLoad();
 
     let task = tokio::spawn(async move {
         canBridge.Run(&protocol).await;
@@ -191,6 +264,7 @@ pub async fn PostHardwareStart(
     hardware.m_u32BitrateBps = body.bitrate_bps;
     hardware.m_optLinkSpeed = Some(linkSpeed.clone());
     hardware.m_optStats = Some(arcStats);
+    hardware.m_optBusLoad = Some(arcBusLoad);
 
     tracing::info!(
         port = %body.port,
@@ -224,6 +298,7 @@ pub async fn PostHardwareStop(State(state): State<Arc<AppState>>) -> Json<Hardwa
     hardware.m_strPortName.clear();
     hardware.m_u32BitrateBps = 0;
     hardware.m_optLinkSpeed = None;
+    hardware.m_optBusLoad = None;
 
     Json(BuildStatusDto(&hardware))
 }

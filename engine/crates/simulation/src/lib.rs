@@ -19,6 +19,7 @@ pub mod execute;
 use std::collections::BTreeMap;
 
 use application::ProtocolHandler;
+use can::confinement::FaultConfinement;
 use core_domain::model::{
     CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, Vehicle, VehicleIdentity,
 };
@@ -733,6 +734,35 @@ impl SimulationService {
         Ok(())
     }
 
+    /// One ECU's CAN error counters and bus state.
+    pub fn EcuFaultConfinementOf(&self, key: EcuKey) -> Result<FaultConfinement, SimulationError> {
+        self.m_mapEcus
+            .get(&key)
+            .map(|runningEcu| runningEcu.FaultConfinement())
+            .ok_or_else(|| SimulationError::EcuNotFound {
+                strHandle: DescribeKey(key),
+            })
+    }
+
+    /// Put an ECU into a bus state, or set its counters directly.
+    ///
+    /// Not recorded as an unsaved model change: this is a live bus condition an operator is
+    /// provoking, like pressing stop, and not a property of the vehicle worth writing to a file.
+    pub fn SetEcuFaultConfinement(
+        &mut self,
+        key: EcuKey,
+        confinement: FaultConfinement,
+    ) -> Result<(), SimulationError> {
+        let runningEcu =
+            self.m_mapEcus
+                .get_mut(&key)
+                .ok_or_else(|| SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })?;
+        runningEcu.SetFaultConfinement(confinement);
+        Ok(())
+    }
+
     /// One ECU's current timing parameters.
     pub fn EcuTimingOf(&self, key: EcuKey) -> Result<EcuTiming, SimulationError> {
         self.m_mapEcus
@@ -1080,6 +1110,17 @@ impl SimulationService {
 
         if !config.m_bIsEnabled {
             return Some(format!("'{}' is switched off", config.m_strName));
+        }
+
+        // Bus-off is not a refusal, it is an absence. The node has taken itself off the wire,
+        // so it neither answers nor acknowledges — and a tester must see a timeout, because a
+        // negative response would prove something was still there to send it.
+        if !runningEcu.FaultConfinement().State().CanTransmit() {
+            return Some(format!(
+                "'{}' is bus off (transmit error count {}), so it is not on the wire at all",
+                config.m_strName,
+                runningEcu.FaultConfinement().m_u16TransmitErrorCount
+            ));
         }
 
         let vehicle = self.m_optVehicle.as_ref()?;

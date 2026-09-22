@@ -12,8 +12,10 @@ import {
   api,
   type EcuTiming,
   type NewEcu,
+  type BusState,
   type ResponseOverride,
   type SecurityLevel,
+  type SetBusState,
   type SimulationEcu,
   type SimulationRequestResult,
   type SimulationResponse,
@@ -233,6 +235,12 @@ export function Simulate() {
               onError={setError}
               busy={busy}
             />
+            <BusStatePanel
+              key={`bus-${strSelectedCanId}`}
+              ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
+              onError={setError}
+              busy={busy}
+            />
             <SecurityPanel
               key={`sec-${strSelectedCanId}`}
               ecu={FindEcuByRequestCanId(state, strSelectedCanId)}
@@ -259,6 +267,126 @@ export function Simulate() {
 // ---------------------------------------------------------------------------------------
 // Where the vehicle comes from
 // ---------------------------------------------------------------------------------------
+
+const c_arrBusStates: { value: BusState['state']; label: string; hint: string }[] = [
+  {
+    value: 'errorActive',
+    label: 'Error active',
+    hint: 'Normal. Transmits, receives and signals errors actively.',
+  },
+  {
+    value: 'errorPassive',
+    label: 'Error passive',
+    hint: 'Still on the bus and still answering, but signalling errors passively and waiting longer before starting a frame — so it loses arbitration it would otherwise win.',
+  },
+  {
+    value: 'busOff',
+    label: 'Bus off',
+    hint: 'Off the wire entirely. Sends nothing and acknowledges nothing, so requests to it time out rather than being refused — which is the difference a tester has to handle.',
+  },
+]
+
+/**
+ * Drive one ECU into a CAN bus condition.
+ *
+ * Fault injection at the data-link layer, below anything UDS can express. The states are
+ * ISO 11898-1's, and so are the counters behind them: sixteen transmit errors reach
+ * error-passive, thirty-two reach bus-off. Setting a state sets counters consistent with it, so
+ * an ECU forced passive and then given one more error behaves exactly as one that counted its
+ * way there.
+ */
+function BusStatePanel({
+  ecu,
+  onError,
+  busy,
+}: {
+  ecu: SimulationEcu | null
+  onError: (message: string | null) => void
+  busy: boolean
+}) {
+  const [bus, setBus] = useState<BusState | null>(null)
+  const [working, setWorking] = useState(false)
+  const handle = ecu?.handle ?? null
+
+  useEffect(() => {
+    let cancelled = false
+    if (!handle) return
+    api
+      .ecuBusState(handle)
+      .then((next) => {
+        if (!cancelled) setBus(next)
+      })
+      .catch(() => {
+        /* Not worth an error banner; the panel simply does not render. */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [handle])
+
+  if (!ecu || !bus) return null
+
+  async function apply(next: SetBusState) {
+    if (!handle) return
+    setWorking(true)
+    try {
+      setBus(await api.setEcuBusState(handle, next))
+      onError(null)
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const tone =
+    bus.state === 'busOff'
+      ? 'border-rose-800 bg-rose-950/30 text-rose-300'
+      : bus.state === 'errorPassive'
+        ? 'border-amber-800 bg-amber-950/30 text-amber-300'
+        : 'border-emerald-900 bg-emerald-950/30 text-emerald-300'
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Bus state — {ecu.name}
+        </h3>
+        <span className="text-xs text-slate-500">ISO 11898-1 · §12.1</span>
+      </div>
+
+      <div className={`mt-3 rounded-md border px-3 py-2 text-xs ${tone}`}>
+        <span className="font-mono">
+          {c_arrBusStates.find((s) => s.value === bus.state)?.label ?? bus.state}
+        </span>
+        <span className="ml-2 font-mono text-[11px] opacity-80 tabular-nums">
+          TEC {bus.transmitErrorCount} · REC {bus.receiveErrorCount}
+        </span>
+        {!bus.canTransmit && (
+          <span className="ml-2 text-[11px]">— not on the wire; requests will time out</span>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        {c_arrBusStates.map((entry) => (
+          <button
+            key={entry.value}
+            title={entry.hint}
+            disabled={busy || working || bus.state === entry.value}
+            onClick={() => void apply({ state: entry.value })}
+            className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition hover:border-slate-500 disabled:opacity-40"
+          >
+            {entry.label}
+          </button>
+        ))}
+      </div>
+
+      <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
+        {c_arrBusStates.find((s) => s.value === bus.state)?.hint}
+      </p>
+    </section>
+  )
+}
 
 /**
  * Turn the ECUs' own gates off for the whole vehicle.

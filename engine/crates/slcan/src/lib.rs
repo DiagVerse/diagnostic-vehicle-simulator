@@ -122,15 +122,25 @@ pub enum SlcanDecodeError {
 pub fn EncodeFrame(frame: &CanFrame) -> String {
     let mut strLine = String::with_capacity(c_uMaxLineLength);
 
+    // Upper case for a 29-bit identifier, and `r`/`R` rather than `t`/`T` for a remote frame:
+    // four kinds of line, one per combination, which is what lets a round trip give back the
+    // frame that went in rather than a data frame with nothing in it.
+    let byKind = match (frame.m_bIsExtended, frame.m_bIsRemote) {
+        (false, false) => 't',
+        (true, false) => 'T',
+        (false, true) => 'r',
+        (true, true) => 'R',
+    };
+    strLine.push(byKind);
+
     if frame.m_bIsExtended {
-        strLine.push('T');
         strLine.push_str(&format!("{:08X}", frame.m_u32CanId));
     } else {
-        strLine.push('t');
         strLine.push_str(&format!("{:03X}", frame.m_u32CanId));
     }
 
-    strLine.push_str(&format!("{:X}", frame.m_vecData.len()));
+    strLine.push_str(&format!("{:X}", frame.DataLengthCode()));
+    // A remote frame stops at its length: it is asking for that many bytes, not carrying them.
     for byByte in &frame.m_vecData {
         strLine.push_str(&format!("{byByte:02X}"));
     }

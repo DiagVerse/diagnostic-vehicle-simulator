@@ -163,6 +163,11 @@ fn DecodeFrameLine(strLine: &str, f64TimestampSec: f64) -> Result<CanFrame, Slca
         m_bIsExtended: bIsExtended,
         m_bIsFd: false,
         m_vecData: vecData,
+        // Kept rather than flattened into an empty data frame. A remote frame asks for data;
+        // a zero-length data frame supplies none. Reporting the first as the second is a claim
+        // the bus never made, and it is the difference between "who has this?" and "nobody".
+        m_bIsRemote: bIsRemote,
+        m_uRemoteLength: if bIsRemote { uLength } else { 0 },
         m_optBIsRequest: None,
     })
 }
@@ -393,5 +398,41 @@ mod tests {
             crate::DescribeStatusFlags(0x0C),
             vec!["error warning", "data overrun"]
         );
+    }
+
+    #[test]
+    fn a_remote_frame_round_trips_as_a_remote_frame() {
+        // It used to come back as a data frame with an empty payload, which says "nobody has
+        // this identifier" where the bus said "who has this identifier?".
+        for (u32CanId, strExpected) in [(0x7E0u32, "r7E08\r"), (0x18DAF110, "R18DAF1108\r")] {
+            let frame = CanFrame::NewRemote(0.0, u32CanId, 8);
+            let strLine = crate::EncodeFrame(&frame);
+            assert_eq!(strLine, strExpected);
+
+            let mut decoder = SlcanDecoder::New();
+            let vecDecoded = FramesOf(decoder.Feed(strLine.as_bytes(), 0.0));
+            assert_eq!(vecDecoded.len(), 1);
+            assert!(
+                vecDecoded[0].m_bIsRemote,
+                "the RTR bit must survive the trip"
+            );
+            assert_eq!(
+                vecDecoded[0].m_uRemoteLength, 8,
+                "and so must the length asked for"
+            );
+            assert!(vecDecoded[0].m_vecData.is_empty());
+            assert_eq!(vecDecoded[0].m_u32CanId, u32CanId);
+        }
+    }
+
+    #[test]
+    fn a_remote_frame_is_not_an_empty_data_frame() {
+        let mut decoder = SlcanDecoder::New();
+        let vecRemote = FramesOf(decoder.Feed(b"r7E00\r", 0.0));
+        let vecEmptyData = FramesOf(decoder.Feed(b"t7E00\r", 0.0));
+
+        assert!(vecRemote[0].m_bIsRemote);
+        assert!(!vecEmptyData[0].m_bIsRemote);
+        assert_ne!(vecRemote[0], vecEmptyData[0]);
     }
 }
