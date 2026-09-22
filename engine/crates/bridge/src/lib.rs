@@ -401,7 +401,18 @@ impl CanBridge {
                 None
             }
             ReceiveOutcome::Aborted(error) => {
-                tracing::warn!(%error, canId = format!("{u32RequestCanId:03X}"), "inbound message abandoned");
+                // Named rather than left to be deduced. Frames going missing between a tester
+                // and this engine is not the tester sending them out of order — a VCI that
+                // works against real ECUs is sending them correctly, and the difference is
+                // everything in between, which on a serial adapter is a link far slower than
+                // the bus feeding it.
+                tracing::warn!(
+                    %error,
+                    canId = format!("{u32RequestCanId:03X}"),
+                    "inbound message abandoned; frames went missing on the way here rather than \
+                     arriving out of order, so look at what carries them — over a serial adapter \
+                     that is the host link speed and the flow control this ECU advertises"
+                );
                 None
             }
             ReceiveOutcome::Nothing => None,
