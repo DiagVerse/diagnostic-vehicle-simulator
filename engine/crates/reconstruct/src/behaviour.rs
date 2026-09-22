@@ -16,12 +16,42 @@ use core_domain::Confidence;
 pub(crate) const c_byPositiveResponseOffset: u8 = 0x40;
 /// First byte of a negative response.
 pub(crate) const c_byNegativeResponseSid: u8 = 0x7F;
-/// Lowest and highest UDS request service identifiers (ISO 14229-1 clause 7.3). Requests fall
-/// in two ranges; everything else on the bus is not a diagnostic request.
-pub(crate) const c_bySidRequestLowFirst: u8 = 0x10;
-pub(crate) const c_bySidRequestLowLast: u8 = 0x3E;
-pub(crate) const c_bySidRequestHighFirst: u8 = 0x83;
-pub(crate) const c_bySidRequestHighLast: u8 = 0x88;
+/// Every request service identifier ISO 14229-1 defines (Table 2), and nothing else.
+///
+/// A list rather than the two contiguous ranges this used to test. The ranges include values
+/// the standard leaves undefined — 0x13, 0x15, 0x3A and a dozen more — and on a bus carrying
+/// thousands of periodic frames a second, every undefined value in the range is another way for
+/// an ordinary powertrain frame to be mistaken for a diagnostic request. A real CANoe capture
+/// of a vehicle with no diagnostics on it at all reconstructed into four ECUs that way.
+pub(crate) const c_arrRequestSids: [u8; 27] = [
+    0x10, // DiagnosticSessionControl
+    0x11, // ECUReset
+    0x14, // ClearDiagnosticInformation
+    0x19, // ReadDTCInformation
+    0x22, // ReadDataByIdentifier
+    0x23, // ReadMemoryByAddress
+    0x24, // ReadScalingDataByIdentifier
+    0x27, // SecurityAccess
+    0x28, // CommunicationControl
+    0x29, // Authentication
+    0x2A, // ReadDataByPeriodicIdentifier
+    0x2C, // DynamicallyDefineDataIdentifier
+    0x2E, // WriteDataByIdentifier
+    0x2F, // InputOutputControlByIdentifier
+    0x31, // RoutineControl
+    0x34, // RequestDownload
+    0x35, // RequestUpload
+    0x36, // TransferData
+    0x37, // RequestTransferExit
+    0x38, // RequestFileTransfer
+    0x3D, // WriteMemoryByAddress
+    0x3E, // TesterPresent
+    0x83, // AccessTimingParameter
+    0x84, // SecuredDataTransmission
+    0x85, // ControlDTCSetting
+    0x86, // ResponseOnEvent
+    0x87, // LinkControl
+];
 
 /// Apply one correlated request/response pair to an ECU record.
 pub(crate) fn ApplyPair(ecu: &mut Ecu, vecRequest: &[u8], vecResponse: &[u8]) {
@@ -142,7 +172,5 @@ pub(crate) fn ApplySecurityAccess(ecu: &mut Ecu, vecRequest: &[u8], vecResponse:
 /// correlation. The high range 0x83..=0x88 (AccessTimingParameter, ControlDTCSetting,
 /// LinkControl, …) is included; it appears in real flashing sequences.
 pub(crate) fn IsRequestSid(byFirst: u8) -> bool {
-    let bIsLowRange = (c_bySidRequestLowFirst..=c_bySidRequestLowLast).contains(&byFirst);
-    let bIsHighRange = (c_bySidRequestHighFirst..=c_bySidRequestHighLast).contains(&byFirst);
-    bIsLowRange || bIsHighRange
+    c_arrRequestSids.contains(&byFirst)
 }

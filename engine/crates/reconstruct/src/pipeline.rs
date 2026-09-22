@@ -5,7 +5,7 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::behaviour::*;
 use can::CanFrame;
@@ -57,6 +57,9 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
     // Requests seen but not yet answered, oldest first. A log can interleave exchanges with
     // several ECUs, so more than one request may be outstanding at a time.
     let mut vecPending: Vec<PendingRequest> = Vec::new();
+    // How many exchanges each ECU was actually seen to answer, for the evidence test below.
+    // ECUs that answered something sent to an address reserved for diagnostics.
+    let mut setDiagnosticAddressed: BTreeSet<u32> = BTreeSet::new();
 
     for pdu in &vecPdus {
         if pdu.m_vecBytes.is_empty() {
@@ -65,7 +68,14 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
 
         // A PDU is first tested as an answer to something outstanding; only if it answers
         // nothing is it considered as a new request.
-        if !IsRequest(pdu) && TryApplyAsResponse(pdu, &mut vecPending, &mut mapEcus) {
+        if !IsRequest(pdu)
+            && TryApplyAsResponse(
+                pdu,
+                &mut vecPending,
+                &mut mapEcus,
+                &mut setDiagnosticAddressed,
+            )
+        {
             continue;
         }
 
@@ -77,7 +87,22 @@ pub fn ReconstructFromFrames(vecFrames: &[CanFrame]) -> Vehicle {
 
     Vehicle {
         m_strName: "Reconstructed Vehicle".to_string(),
-        m_vecEcus: mapEcus.into_values().collect(),
+        m_vecEcus: mapEcus
+            .into_iter()
+            .filter(|(u32ResponseCanId, ecu)| {
+                let bKeep =
+                    IsSupportedByEvidence(ecu, setDiagnosticAddressed.contains(u32ResponseCanId));
+                if !bKeep {
+                    tracing::debug!(
+                        responseCanId = format!("{u32ResponseCanId:03X}"),
+                        "discarding a candidate ECU: nothing was learned and nothing was sent to \
+                         a diagnostic address, so the pairing was a coincidence"
+                    );
+                }
+                bKeep
+            })
+            .map(|(_, ecu)| ecu)
+            .collect(),
         // No networks: a tester-side capture sees one connector and cannot tell whether these
         // ECUs share a wire or sit behind a gateway. Inventing a bus here would turn "we do
         // not know" into a claim.
@@ -105,6 +130,7 @@ fn TryApplyAsResponse(
     pdu: &PduRecord,
     vecPending: &mut Vec<PendingRequest>,
     mapEcus: &mut BTreeMap<u32, Ecu>,
+    setDiagnosticAddressed: &mut BTreeSet<u32>,
 ) -> bool {
     let uIndex = match FindPendingRequestFor(vecPending, pdu) {
         Some(uIndex) => uIndex,
@@ -124,7 +150,41 @@ fn TryApplyAsResponse(
     let ecu = EcuFor(mapEcus, pdu.m_u32CanId);
     RecordCanAddress(ecu, pending.m_u32RequestCanId, pdu.m_u32CanId);
     ApplyPair(ecu, &pending.m_vecBytes, &pdu.m_vecBytes);
+    if IsDiagnosticRequestCanId(pending.m_u32RequestCanId) {
+        setDiagnosticAddressed.insert(pdu.m_u32CanId);
+    }
     true
+}
+
+/// Whether what was learned about this ECU is enough to claim it exists.
+///
+/// Correlation pairs a request with an answer on the strength of one byte — a positive response
+/// is the service identifier plus 0x40 — and on a bus carrying thousands of periodic frames a
+/// second that coincidence is not rare, it is routine. A single such pairing is not evidence of
+/// a diagnostic ECU; it is evidence of two unrelated frames.
+///
+/// So something has to have been *learned*: a data identifier read, a trouble code reported, a
+/// session entered, a security level seen — or, failing all of those, the same identifier pair
+/// answering repeatedly, which coincidence does not do.
+fn IsSupportedByEvidence(ecu: &Ecu, bSawDiagnosticAddress: bool) -> bool {
+    // Sessions are counted only beyond the first: every ECU is constructed already holding the
+    // default session, so treating the list as non-empty would call a constructor default
+    // "evidence" and wave through the very candidates this test exists to reject.
+    let bLearnedSomething = !ecu.m_mapDids.is_empty()
+        || !ecu.m_vecDtcs.is_empty()
+        || !ecu.m_vecSecurityLevels.is_empty()
+        || ecu.m_vecSupportedSessions.len() > 1;
+
+    // Otherwise the request has to have been sent to a diagnostic address. Repetition is no
+    // help here: periodic frames repeat by the thousand, so a coincidence between two adjacent
+    // powertrain identifiers recurs exactly as reliably as a real exchange. What a coincidence
+    // cannot do is occur on an identifier reserved for diagnostics — nothing else transmits on
+    // 0x7DF, on 0x7E0..=0x7E7, or on a normal-fixed 29-bit request address.
+    //
+    // An OEM request identifier is deliberately not enough on its own, because that is exactly
+    // what an ordinary powertrain frame looks like. Such an ECU is kept on what it revealed
+    // instead, which is how a real OEM capture earns its place.
+    bLearnedSomething || bSawDiagnosticAddress
 }
 
 /// Reassemble every CAN-ID stream and return all PDUs in global time order.
@@ -222,8 +282,16 @@ fn FindPendingRequestFor(vecPending: &[PendingRequest], pdu: &PduRecord) -> Opti
         }
     }
 
-    // Most recently seen request first.
-    vecCandidates.last().copied()
+    // Most recently seen request first — but never one sent on the identifier the answer
+    // arrived on. A diagnostic pair is always two identifiers: a tester transmits on one and
+    // the ECU answers on another, and nothing legitimate produces a request and its response on
+    // the same one. Without this an ordinary periodic frame whose first byte happens to be
+    // another frame's service identifier plus 0x40 pairs with itself, and a bus with no
+    // diagnostics on it at all reconstructs into ECUs.
+    vecCandidates
+        .into_iter()
+        .rev()
+        .find(|uIndex| vecPending[*uIndex].m_u32RequestCanId != pdu.m_u32CanId)
 }
 
 /// Whether this PDU could physically be an answer to that request.
@@ -234,6 +302,16 @@ fn FindPendingRequestFor(vecPending: &[PendingRequest], pdu: &PduRecord) -> Opti
 /// which is a gap of whole frames, not of rounding.
 fn CouldHaveAnswered(pending: &PendingRequest, pdu: &PduRecord) -> bool {
     pdu.m_f64StartedAtSec >= pending.m_f64CompletedAtSec
+}
+
+/// True for an identifier reserved for diagnostic requests, where an exchange cannot be a
+/// coincidence: the legislated broadcast, the legislated 11-bit range, or a normal-fixed 29-bit
+/// request address. An OEM identifier is not one of these — it is indistinguishable from any
+/// other frame on the bus.
+fn IsDiagnosticRequestCanId(u32CanId: u32) -> bool {
+    IsFunctionalRequestCanId(u32CanId)
+        || IsNormal11BitRequestId(u32CanId)
+        || SplitNormalFixed29BitId(u32CanId).is_some()
 }
 
 /// The response identifier conventionally paired with a request identifier, or `None` when no
@@ -801,6 +879,88 @@ mod tests {
             address.m_optU32FunctionalCanId,
             Some(c_u32Functional11BitCanId)
         );
+    }
+
+    #[test]
+    fn periodic_traffic_with_no_diagnostics_reconstructs_nothing() {
+        // Taken from a real CANoe capture of a powertrain bus: 127,000 frames, two channels,
+        // not one diagnostic identifier anywhere. It used to reconstruct into four ECUs —
+        // including one whose request and response were the same identifier — because
+        // correlation pairs on a single byte, a positive response being the service identifier
+        // plus 0x40, and on a bus this busy that coincidence is routine rather than rare.
+        //
+        // Identifiers and payloads below are lifted from that file.
+        let frames = vec![
+            f(
+                0x0AA,
+                0.010900,
+                vec![0xB1, 0x95, 0x01, 0x0D, 0x40, 0x1F, 0x04, 0x00],
+            ),
+            f(
+                0x0A8,
+                0.010421,
+                vec![0xEE, 0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+            ),
+            f(
+                0x0AA,
+                0.020900,
+                vec![0xB1, 0x95, 0x01, 0x0D, 0x40, 0x1F, 0x04, 0x00],
+            ),
+            f(
+                0x0A8,
+                0.020421,
+                vec![0xEE, 0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+            ),
+            f(
+                0x2B2,
+                0.030000,
+                vec![0x10, 0x00, 0x20, 0xFF, 0xE7, 0x00, 0x00, 0x00],
+            ),
+            f(
+                0x0C9,
+                0.031000,
+                vec![0x50, 0x00, 0x20, 0xFF, 0xE7, 0x00, 0x00, 0x00],
+            ),
+        ];
+
+        let vehicle = ReconstructFromFrames(&frames);
+        assert!(
+            vehicle.m_vecEcus.is_empty(),
+            "a bus with no diagnostics on it must reconstruct to nothing, got {:?}",
+            vehicle
+                .m_vecEcus
+                .iter()
+                .map(|ecu| ecu.m_strName.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_request_and_its_response_are_never_the_same_identifier() {
+        // Structurally impossible for a diagnostic pair, and the shape a single periodic
+        // identifier takes when two of its own frames are mistaken for an exchange.
+        let frames = vec![
+            f(0x0AA, 0.001, vec![0x02, 0x10, 0x01]),
+            f(0x0AA, 0.002, vec![0x06, 0x50, 0x01, 0x00, 0x32, 0x01, 0xF4]),
+        ];
+        let vehicle = ReconstructFromFrames(&frames);
+        assert!(vehicle.m_vecEcus.is_empty());
+    }
+
+    #[test]
+    fn an_undefined_service_identifier_is_not_a_diagnostic_request() {
+        // 0x13 and 0x3A sit inside the old contiguous range and are defined by nothing. Every
+        // undefined value in that range was another way for an ordinary frame to be read as a
+        // request.
+        for byUndefined in [0x13u8, 0x15, 0x1A, 0x3A, 0x3C] {
+            assert!(
+                !crate::behaviour::IsRequestSid(byUndefined),
+                "0x{byUndefined:02X} is not a service ISO 14229-1 defines"
+            );
+        }
+        for byDefined in [0x10u8, 0x22, 0x27, 0x2E, 0x31, 0x36, 0x3E, 0x85] {
+            assert!(crate::behaviour::IsRequestSid(byDefined));
+        }
     }
 
     #[test]
