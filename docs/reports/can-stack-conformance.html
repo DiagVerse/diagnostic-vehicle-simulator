@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; }
+  img { max-width: 100%; }
+  [hidden] { display: none !important; }
+</style>
+<title>CAN Stack Conformance</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --ground: #f4f6f8;
+    --surface: #ffffff;
+    --surface-sunk: #eef1f5;
+    --ink: #121820;
+    --ink-soft: #5a6674;
+    --ink-faint: #8b96a3;
+    --rule: #dde2e8;
+    --rule-soft: #e9edf1;
+    --accent: #2f4b8f;
+    --accent-soft: #e6ebf6;
+    --pass: #1a7f5a;
+    --pass-soft: #e3f3ec;
+    --warn: #9a6400;
+    --warn-soft: #f9efd9;
+    --gap: #8a4a3c;
+    --gap-soft: #f6e8e4;
+    --measure: 74ch;
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0e1319;
+      --surface: #151c25;
+      --surface-sunk: #11171f;
+      --ink: #e4e9ef;
+      --ink-soft: #9aa6b4;
+      --ink-faint: #6b7787;
+      --rule: #263140;
+      --rule-soft: #1d2530;
+      --accent: #8aa6ee;
+      --accent-soft: #1b2438;
+      --pass: #4fc99a;
+      --pass-soft: #12241d;
+      --warn: #d9a441;
+      --warn-soft: #251e10;
+      --gap: #e08a76;
+      --gap-soft: #2a1a16;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0e1319;
+    --surface: #151c25;
+    --surface-sunk: #11171f;
+    --ink: #e4e9ef;
+    --ink-soft: #9aa6b4;
+    --ink-faint: #6b7787;
+    --rule: #263140;
+    --rule-soft: #1d2530;
+    --accent: #8aa6ee;
+    --accent-soft: #1b2438;
+    --pass: #4fc99a;
+    --pass-soft: #12241d;
+    --warn: #d9a441;
+    --warn-soft: #251e10;
+    --gap: #e08a76;
+    --gap-soft: #2a1a16;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1080px; margin: 0 auto; padding: 0 28px 96px; }
+  .measure { max-width: var(--measure); }
+
+  /* ---- masthead ---- */
+  header.masthead {
+    padding: 56px 0 28px;
+    border-bottom: 2px solid var(--ink);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px 40px;
+    align-items: flex-end;
+    justify-content: space-between;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(30px, 4.4vw, 42px);
+    line-height: 1.12;
+    font-weight: 600;
+    letter-spacing: -0.021em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .masthead dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 3px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  .masthead dt { color: var(--ink-faint); }
+  .masthead dd { margin: 0; color: var(--ink); }
+
+  .lede {
+    font-size: 18.5px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    margin: 28px 0 0;
+  }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  /* ---- verdict row ---- */
+  .verdicts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 40px 0 0;
+  }
+  .verdict { background: var(--surface); padding: 18px 20px; }
+  .verdict .n {
+    font-family: var(--mono);
+    font-size: 27px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    display: block;
+    line-height: 1.2;
+  }
+  .verdict .k {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    display: block;
+    margin-top: 3px;
+  }
+  .verdict.good .n { color: var(--pass); }
+
+  /* ---- sections ---- */
+  section { margin-top: 56px; }
+  h2 {
+    font-size: 13px;
+    font-family: var(--mono);
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+  h3 {
+    font-size: 23px;
+    font-weight: 600;
+    letter-spacing: -0.014em;
+    margin: 0 0 14px;
+    text-wrap: balance;
+  }
+  h4 {
+    font-size: 15.5px;
+    font-weight: 600;
+    margin: 30px 0 8px;
+  }
+  p { margin: 0 0 14px; }
+  code, .mono { font-family: var(--mono); font-size: 0.9em; }
+  code {
+    background: var(--surface-sunk);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--ink);
+  }
+
+  /* ---- data tables ---- */
+  .band { margin: 22px 0; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 560px; }
+  caption {
+    text-align: left;
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    padding-bottom: 8px;
+  }
+  th {
+    text-align: left;
+    font-size: 11.5px;
+    font-family: var(--mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 500;
+    padding: 0 14px 7px 0;
+    border-bottom: 1px solid var(--ink);
+    white-space: nowrap;
+  }
+  td {
+    padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  td.id { font-family: var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  /* state stripe: encodes conformance, not decoration */
+  tr[data-state] td:first-child { border-left: 3px solid transparent; padding-left: 11px; }
+  tr[data-state="full"] td:first-child { border-left-color: var(--pass); }
+  tr[data-state="partial"] td:first-child { border-left-color: var(--warn); }
+  tr[data-state="none"] td:first-child { border-left-color: var(--gap); }
+
+  .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .tag.full { background: var(--pass-soft); color: var(--pass); }
+  .tag.partial { background: var(--warn-soft); color: var(--warn); }
+  .tag.none { background: var(--gap-soft); color: var(--gap); }
+
+  /* ---- figure / callout ---- */
+  figure.calc {
+    margin: 24px 0;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    padding: 20px 22px;
+  }
+  figure.calc .row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    align-items: baseline;
+    font-family: var(--mono);
+    font-size: 14px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  figure.calc .row:last-of-type { border-bottom: none; }
+  figure.calc .row .lbl { color: var(--ink-soft); min-width: 22ch; flex: 1 1 22ch; }
+  figure.calc .row .val { color: var(--ink); font-weight: 500; }
+  figure.calc figcaption {
+    margin-top: 12px;
+    font-size: 14px;
+    color: var(--ink-soft);
+    line-height: 1.5;
+  }
+  figure.calc figcaption strong { color: var(--ink); font-weight: 600; }
+
+  pre.graph {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.75;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 18px 20px;
+    overflow-x: auto;
+    margin: 0;
+    color: var(--ink);
+  }
+  pre.graph .node { color: var(--accent); }
+  pre.graph .meta { color: var(--ink-faint); }
+
+  ul.notes { margin: 0; padding-left: 18px; }
+  ul.notes li { margin-bottom: 9px; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-size: 13px;
+    color: var(--ink-faint);
+    font-family: var(--mono);
+  }
+  a { color: var(--accent); }
+  a:focus-visible, td:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Conformance &amp; test report</p>
+      <h1>CAN stack: what is implemented,<br>and what it does</h1>
+    </div>
+    <dl>
+      <dt>engine</dt><dd>e3ead21</dd>
+      <dt>tests</dt><dd>377 across 55 suites</dd>
+      <dt>sweep</dt><dd>48 / 48 on P33C</dd>
+      <dt>date</dt><dd>23 Sep 2026</dd>
+    </dl>
+  </header>
+
+  <p class="lede measure">Audited against ISO 11898 (CAN), ISO 15765-2 (ISO-TP) and ISO 14229-1/-2 (UDS),
+    and exercised against the real 47-ECU <span class="mono">P33C</span> vehicle and a
+    127,638-line CANoe capture. <strong>Everything below was read out of the code or measured,
+    not recalled.</strong></p>
+
+  <div class="verdicts">
+    <div class="verdict good"><span class="n">377</span><span class="k">tests passing</span></div>
+    <div class="verdict good"><span class="n">48/48</span><span class="k">feature sweep on P33C</span></div>
+    <div class="verdict good"><span class="n">0.43s</span><span class="k">to parse 8&nbsp;MB of CANoe log</span></div>
+    <div class="verdict"><span class="n">4 &rarr; 0</span><span class="k">false ECUs from that log</span></div>
+  </div>
+
+  <!-- ============================ LAYERS ============================ -->
+  <section>
+    <h2>Layer by layer</h2>
+    <h3>Where the stack sits against the standards</h3>
+    <p class="measure">Three layers carry a UDS request from the wire to a virtual ECU. Each is a
+      separate crate, and each is complete in different degrees — stated here rather than implied.</p>
+
+    <div class="band">
+      <table>
+        <caption>Stripe encodes coverage: implemented · partial · not built</caption>
+        <thead>
+          <tr><th>Layer</th><th>Standard</th><th>Coverage</th><th>What is there, and what is not</th></tr>
+        </thead>
+        <tbody>
+          <tr data-state="partial">
+            <td>CAN frame</td>
+            <td class="id">ISO 11898</td>
+            <td><span class="tag partial">partial</span></td>
+            <td>Classic CAN, 11-bit and 29-bit identifiers, DLC 0–8. <strong>CAN-FD is modelled
+              in the frame type but never produced</strong> — the SLCAN path always sets it false.
+              Error and remote frames are not simulated.</td>
+          </tr>
+          <tr data-state="full">
+            <td>ISO-TP</td>
+            <td class="id">ISO 15765-2</td>
+            <td><span class="tag full">implemented</span></td>
+            <td>All four PCI types (SingleFrame, FirstFrame, ConsecutiveFrame, FlowControl), both
+              directions. BlockSize, STmin in both units, wait-frame limit, overflow refusal,
+              sequence validation with wrap, configurable padding.</td>
+          </tr>
+          <tr data-state="partial">
+            <td>Addressing</td>
+            <td class="id">ISO 15765-2 §10</td>
+            <td><span class="tag partial">partial</span></td>
+            <td>Normal 11-bit and normal-fixed 29-bit (<span class="mono">18DA&lt;target&gt;&lt;source&gt;</span>),
+              plus functional broadcast. <strong>Extended and mixed addressing are not built.</strong></td>
+          </tr>
+          <tr data-state="partial">
+            <td>UDS</td>
+            <td class="id">ISO 14229-1</td>
+            <td><span class="tag partial">partial</span></td>
+            <td>Eleven services answered natively; the rest reachable only through a response
+              override. Session and security state are real, not replayed.</td>
+          </tr>
+          <tr data-state="full">
+            <td>UDS timing</td>
+            <td class="id">ISO 14229-2 §7</td>
+            <td><span class="tag full">implemented</span></td>
+            <td>P2, P2*, P4 advertised and honoured, with the ResponsePending sequence the
+              standard requires when an answer runs past P2.</td>
+          </tr>
+          <tr data-state="full">
+            <td>Transport</td>
+            <td class="id">SLCAN / LAWICEL</td>
+            <td><span class="tag full">implemented</span></td>
+            <td>Streaming line codec, real serial ports, pseudo-terminals for a tester on the same
+              machine, and in-memory loopback for tests.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================ SERVICES ============================ -->
+  <section>
+    <h2>Application layer</h2>
+    <h3>UDS services</h3>
+    <p class="measure">A service marked <em>override only</em> is not unreachable — a response
+      override answers it, and an override outranks the supported-service list by design. What it
+      does not have is <em>behaviour</em>: no state changes, no computed reply.</p>
+
+    <div class="band">
+      <table>
+        <thead>
+          <tr><th>SID</th><th>Service</th><th>Status</th><th>Behaviour in the simulator</th></tr>
+        </thead>
+        <tbody>
+          <tr data-state="full"><td class="id">0x10</td><td>DiagnosticSessionControl</td><td><span class="tag full">native</span></td><td>Switches session; advertises P2/P2*; entering the default session locks security and drops any outstanding seed.</td></tr>
+          <tr data-state="full"><td class="id">0x11</td><td>ECUReset</td><td><span class="tag full">native</span></td><td>Returns to default session, locks security, abandons any transfer.</td></tr>
+          <tr data-state="full"><td class="id">0x19</td><td>ReadDTCInformation</td><td><span class="tag partial">native, 3 of 20 sub-functions</span></td><td>0x01 count, 0x02 by status mask, 0x0A supported DTCs. Each measured against <em>its own</em> length. Others refused 0x12 rather than invented.</td></tr>
+          <tr data-state="full"><td class="id">0x22</td><td>ReadDataByIdentifier</td><td><span class="tag full">native</span></td><td>Answers from the ECU's configured DIDs; unknown identifier gives 0x31.</td></tr>
+          <tr data-state="full"><td class="id">0x27</td><td>SecurityAccess</td><td><span class="tag full">native</span></td><td>Seed/key with a configurable key policy — compare, accept any, or refuse with a chosen NRC. Seed-first rule enforced under every policy.</td></tr>
+          <tr data-state="full"><td class="id">0x31</td><td>RoutineControl</td><td><span class="tag partial">native, acknowledges only</span></td><td>Start/stop/requestResults are acknowledged for any routine id. No routine actually executes.</td></tr>
+          <tr data-state="full"><td class="id">0x34</td><td>RequestDownload</td><td><span class="tag full">native</span></td><td>Accepts the transfer, announces a fixed 0x0400 max block length, arms the block counter at 0x01.</td></tr>
+          <tr data-state="full"><td class="id">0x35</td><td>RequestUpload</td><td><span class="tag full">native</span></td><td>As RequestDownload.</td></tr>
+          <tr data-state="full"><td class="id">0x36</td><td>TransferData</td><td><span class="tag full">native</span></td><td>Echoes and advances the block sequence counter; wraps 0xFF&rarr;0x00; a repeat of the previous counter is answered again as a retransmission; anything else is 0x73.</td></tr>
+          <tr data-state="full"><td class="id">0x37</td><td>RequestTransferExit</td><td><span class="tag full">native</span></td><td>Closes the transfer and disarms the counter.</td></tr>
+          <tr data-state="full"><td class="id">0x3E</td><td>TesterPresent</td><td><span class="tag full">native</span></td><td>Acknowledged; honours the suppress-positive-response bit.</td></tr>
+          <tr data-state="none"><td class="id">0x14 0x23 0x24 0x28 0x29 0x2A 0x2C 0x2E 0x2F 0x38 0x3D 0x83–0x87</td><td>everything else</td><td><span class="tag none">override only</span></td><td>Refused <span class="mono">7F &lt;sid&gt; 11</span> unless a response override matches. The editor offers templates for each.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h4>Negative response codes emitted</h4>
+    <div class="band">
+      <table>
+        <thead><tr><th>NRC</th><th>Meaning</th><th>When</th></tr></thead>
+        <tbody>
+          <tr><td class="id">0x11</td><td>serviceNotSupported</td><td>Service absent from the ECU's declared list (unless permissive mode is on).</td></tr>
+          <tr><td class="id">0x12</td><td>subFunctionNotSupported</td><td>Known service, sub-function this model has no data for.</td></tr>
+          <tr><td class="id">0x13</td><td>incorrectMessageLength</td><td>Length wrong <em>for that sub-function</em>. Still enforced in permissive mode — a length rule is the protocol, not a gate.</td></tr>
+          <tr><td class="id">0x22</td><td>conditionsNotCorrect</td><td>Request valid but the ECU's state forbids it.</td></tr>
+          <tr><td class="id">0x24</td><td>requestSequenceError</td><td>sendKey with no outstanding seed; TransferData with no open transfer.</td></tr>
+          <tr><td class="id">0x31</td><td>requestOutOfRange</td><td>Data identifier the ECU does not hold.</td></tr>
+          <tr><td class="id">0x35</td><td>invalidKey</td><td>Key policy is <em>compare</em> and the key did not match.</td></tr>
+          <tr><td class="id">0x73</td><td>wrongBlockSequenceCounter</td><td>TransferData counter neither expected nor a repeat of the previous.</td></tr>
+          <tr><td class="id">0x78</td><td>responsePending</td><td>Answer will run past P2; repeated as needed, then the real response.</td></tr>
+          <tr><td class="id">0x7F</td><td>serviceNotSupportedInActiveSession</td><td>Service exists but this session forbids it.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================ TIMING ============================ -->
+  <section>
+    <h2>Timing</h2>
+    <h3>Every parameter, and what changing it does</h3>
+    <p class="measure">Three kinds of value sit together and are kept apart by name: what the ECU
+      <em>advertises</em> (ISO 14229-2), what the operator <em>injects</em> to provoke a tester,
+      and the ISO-TP <em>flow control</em> — the only group that governs the request direction.</p>
+
+    <div class="band">
+      <table>
+        <thead><tr><th>Parameter</th><th>Standard</th><th>Default</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="id">P2Server_max</td><td class="id">14229-2 T3</td><td class="num">50 ms</td><td>Deadline to <em>start</em> answering after the request is fully received. Advertised in the 0x10 response at 1 ms resolution.</td></tr>
+          <tr><td class="id">P2*Server_max</td><td class="id">14229-2 T3</td><td class="num">5 000 ms</td><td>Deadline after a ResponsePending. Advertised at 10 ms resolution, so it must be a multiple of 10 — validated.</td></tr>
+          <tr><td class="id">P4Server_max</td><td class="id">14229-2 §7.1.1</td><td class="num">30 000 ms</td><td>Deadline for the <em>final</em> response. <span class="mono">P4 == P2</span> means this server may not use 0x78 at all.</td></tr>
+          <tr><td class="id">responseDelayMs</td><td class="id">operator</td><td class="num">0 ms</td><td>Injected think-time. A value past P2 automatically produces the ResponsePending sequence the standard requires.</td></tr>
+          <tr><td class="id">forceResponsePending</td><td class="id">operator</td><td class="num">off</td><td>Emit 0x78 even when the delay alone would not need it — demonstrates the pending path without waiting.</td></tr>
+          <tr><td class="id">forcedResponsePendingCount</td><td class="id">operator</td><td class="num">1</td><td>How many 0x78 messages to emit when forcing. Capped at 10.</td></tr>
+          <tr><td class="id">dropFinalResponse</td><td class="id">operator</td><td class="num">off</td><td>Fault injection: pendings go out, the answer never does. Exercises a tester's P2*Client timeout.</td></tr>
+          <tr data-state="full"><td class="id">isoTpBlockSize</td><td class="id">15765-2 §9.6.5.3</td><td class="num">1</td><td>ConsecutiveFrames accepted before another FlowControl is due. <strong>0 means "send them all"</strong> — fastest, and unusable over a slow link. See below.</td></tr>
+          <tr data-state="full"><td class="id">isoTpSeparationTimeMin</td><td class="id">15765-2 §9.6.5.4</td><td class="num">0</td><td>Minimum gap the tester must leave between ConsecutiveFrames. Raw wire byte: 0x00–0x7F ms, 0xF1–0xF9 hundreds of µs. Reserved values refused.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================ FLOW CONTROL ============================ -->
+  <section>
+    <h2>The finding that drove most of this</h2>
+    <h3>Why BlockSize 0 failed, and why it was never a sequencing bug</h3>
+    <p class="measure">A 386-byte SecurityAccess key kept arriving with holes in it. The sequence
+      numbers came out <span class="mono">1…15</span> in order, then
+      <span class="mono">3, 12, 4, 13, 5</span> — which reads as two interleaved streams, and had
+      the tester's VCI blamed for sending out of order.</p>
+
+    <figure class="calc">
+      <div class="row"><span class="lbl">observed sequence numbers</span><span class="val">3 · 12 · 4 · 13 · 5</span></div>
+      <div class="row"><span class="lbl">mapped through the 4-bit wrap</span><span class="val">frames 19 · 28 · 36 · 45 · 53</span></div>
+      <div class="row"><span class="lbl">gaps between survivors</span><span class="val">9 · 8 · 9 · 8&nbsp;&nbsp;→ stride ≈ 8.5</span></div>
+      <div class="row"><span class="lbl">SLCAN line @ 115 200 baud</span><span class="val">27 bytes → 2.34 ms/frame ≈ 426 frames/s</span></div>
+      <div class="row"><span class="lbl">29-bit frame @ 500 kbit/s</span><span class="val">≈ 135 bits → 0.28 ms/frame ≈ 3 700 frames/s</span></div>
+      <div class="row"><span class="lbl">ratio</span><span class="val">2.34 ÷ 0.28 = 8.4</span></div>
+      <figcaption>One stream, <strong>sampled</strong> — not two streams interleaved. Because the
+        stride is close to half of sixteen, consecutive survivors land on alternating halves of the
+        counter, which is what makes uniform loss look like shuffling. Reordering delivers every
+        frame eventually; loss never does. The VCI works against real ECUs because a real ECU
+        receives on CAN directly — the serial adapter is only in the path when the simulator is.</figcaption>
+    </figure>
+
+    <p class="measure">Proven, not argued: a test injects a 386-byte request — FirstFrame plus 55
+      ConsecutiveFrames — all at once on a bus that drops nothing, with BlockSize 0. It reassembles
+      whole and is answered. <strong>The engine was correct throughout.</strong></p>
+
+    <p class="measure">What was wrong is that the engine advertised <code>30 00 00</code> anyway —
+      the server telling a tester "send everything, I can take it" over a gap where it cannot. The
+      bridge now knows both speeds and, for an ECU asking for <em>no pacing at all</em>, advertises
+      the slowest STmin the link can honour. An operator who states a BlockSize or STmin is obeyed;
+      a link with room to spare is untouched.</p>
+  </section>
+
+  <!-- ============================ CANOE ============================ -->
+  <section>
+    <h2>Test: CANoe .asc</h2>
+    <h3>A 127,638-line capture, and the bug it exposed</h3>
+    <p class="measure">The sample is a two-channel powertrain bus recorded by CANoe 7.0.1 —
+      absolute hex timestamps, <span class="mono">Begin Triggerblock</span>, <span class="mono">d</span>-marked
+      data frames, <span class="mono">Statistic:</span> lines, and <strong>not one diagnostic
+      identifier anywhere in it</strong>: no 0x7xx, no 0x18DAxxxx.</p>
+
+    <div class="band">
+      <table>
+        <thead><tr><th>Check</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr data-state="full"><td>CANoe dialect parsed</td><td>8 MB / 127,638 lines in <span class="mono">0.43 s</span>. Two channels, header block, status and statistic lines all handled.</td></tr>
+          <tr data-state="full"><td>Extended identifiers</td><td>None present in this file; the <span class="mono">x</span> marker is handled and covered by tests.</td></tr>
+          <tr data-state="none"><td>ECUs reconstructed <em>(before)</em></td><td><strong>4 — all false.</strong> One had request and response on the <em>same</em> identifier. Two claimed services 0x13 and 0x3A, which ISO 14229-1 does not define.</td></tr>
+          <tr data-state="full"><td>ECUs reconstructed <em>(after)</em></td><td><strong>0</strong> — the truth about this capture.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h4>Why it invented them</h4>
+    <p class="measure">Correlation pairs a request with an answer on the strength of a single byte:
+      a positive response is the service identifier plus 0x40. On a bus carrying thousands of
+      periodic frames a second that coincidence is routine, and nothing downstream questioned it.
+      Three guards now close it:</p>
+    <ul class="notes measure">
+      <li><strong>A request and its response can never share an identifier.</strong> A tester
+        transmits on one, the ECU answers on another.</li>
+      <li><strong>The service list is the 27 SIDs ISO 14229-1 defines</strong>, not two contiguous
+        ranges that swept in every undefined value between them.</li>
+      <li><strong>An ECU must be supported by evidence</strong> — something it revealed (a DID, a
+        DTC, a security level, a session beyond the default), or an exchange sent to an address
+        <em>reserved</em> for diagnostics, where coincidence cannot occur. Repetition was
+        considered and rejected: periodic frames repeat by the thousand.</li>
+    </ul>
+    <p class="measure">All 34 existing reconstruction tests still pass, and the real 47-ECU
+      OEM vehicle still reconstructs — it earns its place on what it revealed.</p>
+  </section>
+
+  <!-- ============================ BRANCHES ============================ -->
+  <section>
+    <h2>Delivery</h2>
+    <h3>Branch graph</h3>
+    <p class="measure">Every change reached <span class="mono">main</span> through a feature branch
+      and a squash-merged PR, with CI green before each merge. Newest first.</p>
+    <div class="band">
+<pre class="graph">* <span class="node">e3ead21</span>  fix(reconstruct): stop inventing ECUs from ordinary periodic traffic     <span class="meta">(#31)</span>
+│          <span class="meta">└ fix/reconstruct-false-positive-ecus   — CANoe capture: 4 false ECUs → 0</span>
+│
+* <span class="node">aeecb24</span>  fix(isotp): say how many frames went missing, not a wrong number         <span class="meta">(#30)</span>
+│          <span class="meta">└ fix/name-frame-loss-not-reordering    — loss vs reordering, named</span>
+│
+* <span class="node">7671b82</span>  fix(bridge,traffic): never promise a pacing the link cannot keep         <span class="meta">(#29)</span>
+│          <span class="meta">└ fix/can-communication-and-monitor-scale — LinkCapacity clamp; SSE batching</span>
+│
+* <span class="node">a24adcc</span>  feat(uds): configurable SecurityAccess, transfer services, and fixes     <span class="meta">(#28)</span>
+│          <span class="meta">└ feat/security-access-key-policy       — 17 commits; key policy, 0x34–0x37</span>
+│
+* <span class="node">b5fab07</span>  fix(isotp,bridge): pace the tester, and measure the link                 <span class="meta">(#27)</span>
+│          <span class="meta">└ fix/isotp-flow-control-and-serial-baud — per-ECU BlockSize/STmin</span>
+│
+* <span class="node">7f3e06b</span>  feat(doip): entity identity, parameters and refusals editable            <span class="meta">(#26)</span>
+│
+* <span class="node">dc89535</span>  fix(reconstruct): per-message arrival time; captures as raw bytes        <span class="meta">(#25)</span>
+│
+⋮</pre>
+    </div>
+  </section>
+
+  <!-- ============================ GAPS ============================ -->
+  <section>
+    <h2>Known gaps</h2>
+    <h3>Deliberately not built</h3>
+    <ul class="notes measure">
+      <li><strong>CAN-FD on the wire.</strong> The frame type carries an FD flag; the SLCAN path
+        never sets it. A 64-byte FirstFrame escape is not implemented.</li>
+      <li><strong>Extended and mixed ISO-TP addressing.</strong> Normal 11-bit, normal-fixed 29-bit
+        and functional broadcast only.</li>
+      <li><strong>Seventeen of twenty 0x19 sub-functions</strong>, and routines that actually run
+        under 0x31. Both refuse honestly rather than inventing data the model does not hold.</li>
+      <li><strong>Raising a dongle's UART.</strong> Detection finds the rate an adapter is
+        <em>already</em> running at; it cannot make one faster. The MINI2024042 answers no identity
+        command, so its speed falls back to an assumed 115 200 — settable by hand in the Hardware tab.</li>
+      <li><strong>Error and remote frames</strong>, and bus-off simulation.</li>
+    </ul>
+  </section>
+
+  <footer>
+    Audited at e3ead21 · engine 377 tests / 55 suites · sweep <span class="mono">scripts/feature-sweep.py</span> 48/48 · CANoe sample 127,638 lines
+  </footer>
+
+</div>
+
+</body>
+</html>
