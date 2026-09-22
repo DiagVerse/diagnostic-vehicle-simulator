@@ -42,3 +42,23 @@ pub const c_initialInactivity: Duration = Duration::from_secs(2);
 /// `T_TCP_Alive_Check` — how long to wait for an alive check response before treating the
 /// socket as dead (REQ 3.DoIP-092 NL).
 pub const c_aliveCheckTimeout: Duration = Duration::from_millis(500);
+
+/// Draw one `A_DoIP_Announce_Wait` delay, in milliseconds.
+///
+/// REQ 8.DoIP-051 APP requires the vehicle identification *response* to be delayed by this
+/// parameter, and the standard's own note says why: without it, every entity on the network
+/// answers one broadcast in the same instant and the resulting UDP burst drops packets on the
+/// way back to the tester. The delay only works if entities pick different values.
+///
+/// Not a cryptographic draw, and it does not need to be — nothing here is a secret. What is
+/// required is spread, and the system clock's nanoseconds differ between two entities on two
+/// machines and between two requests to one entity, which is exactly that.
+pub fn DrawAnnounceWaitMs() -> u32 {
+    let u32MaxMs = c_announceWaitMax.as_millis() as u32;
+    let u32Nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+
+    u32Nanos % (u32MaxMs + 1)
+}

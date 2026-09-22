@@ -146,6 +146,47 @@ for _ in range(CYCLES):
 elapsed = time.time() - t0
 check(f"every DoIP-addressable ECU answers, {CYCLES}x", answered, CYCLES * len(targets))
 
+# ---------------------------------------------------------------- broadcast
+# A functional group address (ISO 13400-2 Table 13) reaches the whole vehicle in one request,
+# which on this vehicle is 46 ECUs answering a single message. Worth doing at this scale: a
+# broadcast that quietly reached only some of them would look identical on a two-ECU bench.
+sock.sendall(hdr(0x8001, struct.pack(">HH", TESTER, 0xE000) + bytes([0x3E, 0x00])))
+sources, nacked = set(), None
+sock.settimeout(2)
+deadline = time.time() + 15
+while time.time() < deadline:
+    try:
+        pt, body = recv(sock)
+    except (TimeoutError, socket.timeout):
+        break
+    if pt == 0x8003:
+        nacked = body[4]
+        break
+    if pt == 0x8001:
+        sources.add(struct.unpack(">H", body[0:2])[0])
+sock.settimeout(None)
+check("a functional group address is not refused", nacked, None)
+check("one broadcast reaches every DoIP-addressable ECU", sorted(sources), sorted(targets))
+check("and each answer names its own address, not the group",
+      0xE000 in sources, False)
+
+# REQ 7.DoIP-072 AL. This vehicle has one ECU (CAN(B)_HE13BMSEXT) with no DoIP logical address,
+# so a broadcast has to cross a CAN sub-network to reach it — and there a functional request may
+# be a SingleFrame only, because it has no single peer to flow-control it. Nine bytes of user
+# data is past that, so the whole message is discarded rather than delivered to the 46 ECUs that
+# could have taken it: half a broadcast is worse than none.
+long_request = [0x22, 0xF1, 0x90, 0xF1, 0x8C, 0xF1, 0x91, 0xF1]
+sock.sendall(hdr(0x8001, struct.pack(">HH", TESTER, 0xE000) + bytes(long_request)))
+pt, body = recv(sock)
+check("a functional request too long for a CAN sub-network is refused", pt, 0x8003)
+if pt == 0x8003:
+    check("NACK code 0x04 diagnostic message too large", body[4], 0x04)
+
+# The same request physically addressed is fine: it never leaves Ethernet.
+r = uds_over_doip(sock, GW_DOIP, long_request)
+check("...while the same length is accepted when it is addressed physically",
+      r[:4].hex().upper(), lambda got: not got.startswith("4E41"))
+
 sock.close()
 call("/doip/stop", {})
 print(json.dumps({"results": RESULTS, "targets": len(targets), "cycles": CYCLES, "elapsed": elapsed}))

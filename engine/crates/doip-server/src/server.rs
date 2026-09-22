@@ -100,10 +100,13 @@ impl DoIpServer {
 
 /// Answer discovery messages.
 async fn RunUdp(arcEntity: Arc<Mutex<DoIpEntity>>, socket: UdpSocket) {
+    // Shared with the tasks that send delayed answers. `send_to` takes `&self`, so several may
+    // hold it at once without any locking of our own.
+    let arcSocket = Arc::new(socket);
     let mut arrBuffer = vec![0u8; c_uMaxDatagram];
 
     loop {
-        let (uLength, fromAddress) = match socket.recv_from(&mut arrBuffer).await {
+        let (uLength, fromAddress) = match arcSocket.recv_from(&mut arrBuffer).await {
             Ok(received) => received,
             Err(error) => {
                 tracing::warn!(%error, "the DoIP discovery socket failed");
@@ -122,12 +125,26 @@ async fn RunUdp(arcEntity: Arc<Mutex<DoIpEntity>>, socket: UdpSocket) {
             entity.HandleUdp(&arrBuffer[..uLength])
         };
 
-        for vecReply in reaction.m_vecReplies {
-            // The answer goes back to the port the request came from, which is the tester's
-            // ephemeral one — not to 13400. Only the unsolicited announcement uses 13400.
-            if let Err(error) = socket.send_to(&vecReply, fromAddress).await {
-                tracing::warn!(%error, peer = %fromAddress, "could not answer a discovery request");
-            }
+        for reply in reaction.m_vecReplies {
+            // A vehicle identification response waits A_DoIP_Announce_Wait (REQ 8.DoIP-051
+            // APP). The wait happens in its own task rather than in this loop: this is one
+            // socket serving every tester on the network, and holding it for half a second
+            // would make one entity's de-bursting delay every *other* answer it owes.
+            let arcSocketForReply = Arc::clone(&arcSocket);
+            tokio::spawn(async move {
+                if reply.m_u32AtMs > 0 {
+                    tokio::time::sleep(Duration::from_millis(reply.m_u32AtMs as u64)).await;
+                }
+
+                // The answer goes back to the port the request came from, which is the tester's
+                // ephemeral one — not to 13400. Only the unsolicited announcement uses 13400.
+                if let Err(error) = arcSocketForReply
+                    .send_to(&reply.m_vecBytes, fromAddress)
+                    .await
+                {
+                    tracing::warn!(%error, peer = %fromAddress, "could not answer a discovery request");
+                }
+            });
         }
     }
 }
@@ -229,8 +246,19 @@ async fn ServeConnection(
                 entity.HandleTcp(u64Socket, &vecMessage, protocol.as_ref())
             };
 
-            for vecReply in &reaction.m_vecReplies {
-                if let Err(error) = stream.write_all(vecReply).await {
+            // The plan's timing is the ECU's, and it is kept: each reply waits until it is
+            // due before going out. Waiting here rather than inside the entity is deliberate —
+            // the entity holds the simulation mutex while it decides, and sleeping under a lock
+            // would stall every other connection for one tester's configured delay.
+            let mut u32SentAtMs = 0u32;
+            for reply in &reaction.m_vecReplies {
+                let u32WaitMs = reply.m_u32AtMs.saturating_sub(u32SentAtMs);
+                if u32WaitMs > 0 {
+                    tokio::time::sleep(Duration::from_millis(u32WaitMs as u64)).await;
+                    u32SentAtMs = reply.m_u32AtMs;
+                }
+
+                if let Err(error) = stream.write_all(&reply.m_vecBytes).await {
                     tracing::debug!(%error, socket = u64Socket, "DoIP write failed");
                     CloseConnection(&arcEntity, u64Socket);
                     return;

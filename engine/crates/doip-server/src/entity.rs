@@ -17,21 +17,39 @@ use simulation::{RoutingOutcome, SimulationService};
 
 use crate::settings::DoIpSettings;
 
-/// How many concurrent TCP data sockets this entity serves.
-///
-/// The standard names no value — it is manufacturer discretion — and requires `<n+1>` resources
-/// so one is always free for socket handling. This is the `<n>` reported to a tester, and the
-/// reserve is not included in it.
-pub const c_uMaxConnections: usize = 4;
-
 /// What the caller must do with one incoming message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reaction {
-    /// Messages to send back, in order. Empty means answer nothing at all — which for some
-    /// requests is the conformant behaviour, not an omission.
-    pub m_vecReplies: Vec<Vec<u8>>,
+    /// Messages to send back, in order, each with when it is due. Empty means answer nothing
+    /// at all — which for some requests is the conformant behaviour, not an omission.
+    pub m_vecReplies: Vec<TimedReply>,
     /// Whether to close the socket once they are sent.
     pub m_bCloseSocket: bool,
+}
+
+/// One message to send back, and how long after the request it is due.
+///
+/// The offset is what makes an operator's timing knobs real over DoIP. A response delay or a
+/// forced ResponsePending is only observable if the messages actually arrive apart: sending
+/// `7F 22 78` and the answer back to back in the same instant tells a tester nothing it can
+/// measure, and hides exactly the P2/P2* behaviour those knobs exist to provoke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedReply {
+    /// Milliseconds after the request arrived. Zero means send it immediately, which is every
+    /// reply that is not a step of an ECU's response plan.
+    pub m_u32AtMs: u32,
+    /// The encoded DoIP message.
+    pub m_vecBytes: Vec<u8>,
+}
+
+impl TimedReply {
+    /// A reply that goes out as soon as it is built.
+    pub fn Now(vecBytes: Vec<u8>) -> Self {
+        TimedReply {
+            m_u32AtMs: 0,
+            m_vecBytes: vecBytes,
+        }
+    }
 }
 
 impl Reaction {
@@ -46,7 +64,7 @@ impl Reaction {
     /// One reply, staying connected.
     pub fn Reply(vecMessage: Vec<u8>) -> Self {
         Reaction {
-            m_vecReplies: vec![vecMessage],
+            m_vecReplies: vec![TimedReply::Now(vecMessage)],
             m_bCloseSocket: false,
         }
     }
@@ -54,7 +72,7 @@ impl Reaction {
     /// One reply, then close.
     pub fn ReplyAndClose(vecMessage: Vec<u8>) -> Self {
         Reaction {
-            m_vecReplies: vec![vecMessage],
+            m_vecReplies: vec![TimedReply::Now(vecMessage)],
             m_bCloseSocket: true,
         }
     }
@@ -170,7 +188,7 @@ impl DoIpEntity {
                 if settings.m_bSuppressIdentificationResponse {
                     return Reaction::Silence();
                 }
-                Reaction::Reply(self.BuildAnnouncement(byReplyVersion))
+                self.AnnouncementReaction(byReplyVersion)
             }
 
             PayloadType::VehicleIdentificationRequestByEid => {
@@ -179,7 +197,7 @@ impl DoIpEntity {
                 let identity = self.Identity();
                 if vecPayload == identity.EidBytes() && !settings.m_bSuppressIdentificationResponse
                 {
-                    Reaction::Reply(self.BuildAnnouncement(byReplyVersion))
+                    self.AnnouncementReaction(byReplyVersion)
                 } else {
                     Reaction::Silence()
                 }
@@ -189,7 +207,7 @@ impl DoIpEntity {
                 let identity = self.Identity();
                 if vecPayload == identity.VinBytes() && !settings.m_bSuppressIdentificationResponse
                 {
-                    Reaction::Reply(self.BuildAnnouncement(byReplyVersion))
+                    self.AnnouncementReaction(byReplyVersion)
                 } else {
                     Reaction::Silence()
                 }
@@ -245,6 +263,18 @@ impl DoIpEntity {
         arrMessage: &[u8],
         protocol: &dyn ProtocolHandler,
     ) -> Reaction {
+        // REQ 3.DoIP-080 NL: the general inactivity timer resets "whenever data is received or
+        // sent over this socket" — not whenever a *valid* message is. Noted before the header
+        // is even read, because a malformed message is still data on the socket, and the
+        // negative acknowledgement sent back for it is data too. Noting it after the header
+        // check meant a tester sending a steady stream of rubbish was timed out as idle.
+        //
+        // This does not touch the initial inactivity timer, which by design no amount of
+        // traffic resets — see `Connection::NoteActivity`.
+        if let Some(connection) = self.m_mapConnections.get_mut(&u64Socket) {
+            connection.NoteActivity();
+        }
+
         if let Some(byForced) = self.Settings().m_optByForcedHeaderNack {
             return self.ForcedHeaderNackReaction(0x03, byForced);
         }
@@ -253,10 +283,6 @@ impl DoIpEntity {
             Ok(header) => header,
             Err(nack) => return self.NackReaction(0x03, nack),
         };
-
-        if let Some(connection) = self.m_mapConnections.get_mut(&u64Socket) {
-            connection.NoteActivity();
-        }
 
         let vecPayload = arrMessage[header::c_uHeaderLength.min(arrMessage.len())..].to_vec();
         let byReplyVersion = header::ReplyVersionFor(header.m_byProtocolVersion);
@@ -270,9 +296,12 @@ impl DoIpEntity {
                 self.HandleDiagnosticMessage(u64Socket, &vecPayload, byReplyVersion, protocol)
             }
 
-            // A tester may send this unsolicited purely to reset the inactivity timer — it is
-            // the smallest valid message that does nothing else. `NoteActivity` above has
-            // already done the work, so the correct answer is nothing at all.
+            // A tester may send this unsolicited purely to reset the general inactivity timer
+            // — REQ 3.DoIP-124 NL calls it the smallest valid message that does nothing else.
+            // `NoteActivity` above has already done the work, so the correct answer is nothing
+            // at all. On a socket that has not activated routing it buys the tester no time:
+            // the initial inactivity timer is a measure against exactly that, and only a valid
+            // routing activation request stops it.
             PayloadType::AliveCheckResponse => Reaction::Silence(),
 
             PayloadType::AliveCheckRequest => {
@@ -336,7 +365,24 @@ impl DoIpEntity {
         let bIsActiveElsewhere = self.m_mapConnections.iter().any(|(u64Other, connection)| {
             *u64Other != u64Socket && connection.SourceAddress() == Some(request.m_u16SourceAddress)
         });
-        let bHasFreeSocket = self.m_mapConnections.len() <= c_uMaxConnections;
+        // Routing activation code 0x04 is for "all concurrently supported TCP_DATA sockets are
+        // registered and active", so what fills the capacity is *registered* sockets, not open
+        // ones — the standard requires an <n+1>th resource precisely so a socket can always be
+        // accepted and then refused. This socket is not registered yet (an already-registered
+        // one is decided earlier, by address), so it fits whenever fewer than <n> others hold a
+        // registration.
+        //
+        // The capacity is the entity's advertised `m_byMaxSockets`, not a constant: an operator
+        // who lowers it to one in order to provoke 0x04 was previously told four, and then
+        // watched the fifth connection be accepted anyway.
+        let uRegisteredElsewhere = self
+            .m_mapConnections
+            .iter()
+            .filter(|(u64Other, connection)| {
+                **u64Other != u64Socket && connection.SourceAddress().is_some()
+            })
+            .count();
+        let bHasFreeSocket = uRegisteredElsewhere < self.Settings().m_byMaxSockets as usize;
 
         let optByForced = self
             .m_arcMtxSettings
@@ -503,7 +549,7 @@ impl DoIpEntity {
             }
 
             RoutingOutcome::Handled(vecResponses) => {
-                let mut vecReplies = vec![self.BuildAck(byReplyVersion, &request)];
+                let mut vecReplies = vec![TimedReply::Now(self.BuildAck(byReplyVersion, &request))];
 
                 for response in vecResponses {
                     if response.IsSuppressed() {
@@ -516,9 +562,24 @@ impl DoIpEntity {
                     // request is not the address the request was sent to. Echoing the target
                     // back would tell the tester the functional group answered, which no ECU
                     // did — and would make several ECUs' answers indistinguishable.
-                    let u16AnswerFrom = response
-                        .m_optU16LogicalAddress
-                        .unwrap_or(request.m_u16TargetAddress);
+                    //
+                    // An ECU with no logical address at all cannot be represented here: the
+                    // source address field has nothing truthful to put in it. Its answer is
+                    // dropped, which is what a real gateway does with a reply it has no route
+                    // back for — the request still reached it over CAN and its state still
+                    // changed, so this is a lost answer, not a skipped ECU.
+                    let u16AnswerFrom = match response.m_optU16LogicalAddress {
+                        Some(u16AnswerFrom) => u16AnswerFrom,
+                        None => {
+                            tracing::debug!(
+                                ecu = %response.m_strEcuName,
+                                targetAddress = format!("{:04X}", request.m_u16TargetAddress),
+                                "an ECU with no DoIP logical address answered a broadcast; \
+                                 there is no source address to send it under"
+                            );
+                            continue;
+                        }
+                    };
 
                     for step in &response.m_plan.m_vecSteps {
                         let answer = DiagnosticMessage {
@@ -526,11 +587,18 @@ impl DoIpEntity {
                             m_u16TargetAddress: request.m_u16SourceAddress,
                             m_vecUserData: step.m_vecBytes.clone(),
                         };
-                        vecReplies.push(header::WriteMessage(
-                            byReplyVersion,
-                            PayloadType::DiagnosticMessage,
-                            &answer.ToBytes(),
-                        ));
+                        // The step's own offset, carried through rather than dropped. The ECU
+                        // decided when this message is due — a delay the operator configured,
+                        // or the P2 gap before a forced ResponsePending — and flattening the
+                        // plan into one burst threw that decision away.
+                        vecReplies.push(TimedReply {
+                            m_u32AtMs: step.m_u32AtMs,
+                            m_vecBytes: header::WriteMessage(
+                                byReplyVersion,
+                                PayloadType::DiagnosticMessage,
+                                &answer.ToBytes(),
+                            ),
+                        });
                     }
                 }
 
@@ -549,6 +617,29 @@ impl DoIpEntity {
             PayloadType::DiagnosticMessageAck,
             &BuildDiagnosticAck(request, c_byAckRoutingConfirmation),
         )
+    }
+
+    /// A vehicle identification response, delayed as the standard requires.
+    ///
+    /// REQ 8.DoIP-051 APP: the answer waits `A_DoIP_Announce_Wait`, drawn fresh each time, so
+    /// that many entities answering one broadcast do not reply in the same instant and drop
+    /// each other's packets on the way back. Answering immediately is the obvious behaviour and
+    /// the wrong one — it looks faster on a bench with one vehicle and fails on a network with
+    /// several.
+    fn AnnouncementReaction(&self, byReplyVersion: u8) -> Reaction {
+        let u32AtMs = doip::timing::DrawAnnounceWaitMs();
+        tracing::debug!(
+            delayMs = u32AtMs,
+            "delaying a vehicle identification response by A_DoIP_Announce_Wait"
+        );
+
+        Reaction {
+            m_vecReplies: vec![TimedReply {
+                m_u32AtMs: u32AtMs,
+                m_vecBytes: self.BuildAnnouncement(byReplyVersion),
+            }],
+            m_bCloseSocket: false,
+        }
     }
 
     /// A diagnostic negative acknowledgement, closing the socket if that code requires it.

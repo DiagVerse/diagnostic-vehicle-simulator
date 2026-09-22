@@ -478,3 +478,317 @@ async fn default_settings_inject_nothing() {
     assert_eq!(settings.m_byPowerMode, 0x01);
     assert_eq!(settings.m_byNodeType, 0x00);
 }
+
+/// A vehicle whose airbag answers slowly: 400 ms of configured delay against a 50 ms P2.
+///
+/// Both halves of the timing story in one ECU — the delay is long enough to measure, and long
+/// enough past P2 that the ECU must announce a ResponsePending before it.
+const c_strSlowSimFile: &str = r#"{
+  "simfileVersion": 2,
+  "vehicle": "Slow DoIP test vehicle",
+  "networks": [
+    { "id": "eth", "name": "Diagnostic Ethernet", "kind": "Ethernet", "entryPoint": true }
+  ],
+  "ecus": [
+    { "name": "Gateway", "network": "eth",
+      "doip": { "logicalAddress": "0x0010" },
+      "sessions": ["default", "extended"],
+      "dids": { "F18C": { "text": "SIM-GW-0001" } } },
+    { "name": "Airbag", "network": "eth",
+      "doip": { "logicalAddress": "0x1030" },
+      "timing": { "p2Ms": 50, "responseDelayMs": 400 },
+      "sessions": ["default", "extended"],
+      "dids": { "F190": { "text": "SIMDOIPVIN0000001" } } }
+  ]
+}"#;
+
+/// Start a server over a simfile of the caller's choosing, with settings it can change.
+async fn ConnectToSimFile(
+    strSimFile: &str,
+) -> (
+    doip_server::ServerHandle,
+    TcpStream,
+    Arc<Mutex<DoIpSettings>>,
+) {
+    let mut simulation = SimulationService::New();
+    simulation
+        .LoadFromSimFileText(strSimFile)
+        .expect("the test simfile should load");
+    simulation.Start();
+
+    let arcSettings = Arc::new(Mutex::new(DoIpSettings::default()));
+    let arcEntity = Arc::new(Mutex::new(DoIpEntity::New(
+        Arc::new(Mutex::new(simulation)),
+        c_u16Gateway,
+        Arc::clone(&arcSettings),
+    )));
+
+    let handle = DoIpServer::Start(
+        arcEntity,
+        "127.0.0.1:0".parse().expect("a valid address"),
+        Arc::new(UdsHandler),
+    )
+    .await
+    .expect("the server should bind");
+
+    let stream = TcpStream::connect(handle.TcpAddress())
+        .await
+        .expect("the tester should connect");
+    (handle, stream, arcSettings)
+}
+
+#[tokio::test]
+async fn an_ecus_response_timing_is_kept_over_doip() {
+    // The defect: the entity flattened an ECU's response plan into one burst, throwing away
+    // every step's offset. A configured response delay and a forced ResponsePending are only
+    // observable if the messages actually arrive apart — sent together they tell a tester
+    // nothing it can measure, and hide exactly the P2/P2* behaviour those knobs exist to
+    // provoke.
+    let (handle, mut stream, _arcSettings) = ConnectToSimFile(c_strSlowSimFile).await;
+    assert_eq!(ActivateRouting(&mut stream, c_u16Tester, 0x00).await, 0x10);
+
+    let instantSent = std::time::Instant::now();
+    SendDiagnostic(&mut stream, c_u16Airbag, &[0x22, 0xF1, 0x90]).await;
+
+    // The acknowledgement means "routed", and is not part of the ECU's plan — it is immediate.
+    let ack = ReadMessage(&mut stream).await;
+    assert_eq!(ack.m_payloadType, PayloadType::DiagnosticMessageAck);
+    assert!(
+        instantSent.elapsed() < std::time::Duration::from_millis(200),
+        "the acknowledgement does not wait for the ECU, it took {:?}",
+        instantSent.elapsed()
+    );
+
+    // 400 ms is past the 50 ms P2, so the ECU says so before it goes quiet.
+    let pending = ReadMessage(&mut stream).await;
+    assert_eq!(pending.m_payloadType, PayloadType::DiagnosticMessage);
+    assert_eq!(
+        &pending.m_vecPayload[4..7],
+        &[0x7F, 0x22, 0x78],
+        "requestCorrectlyReceived-ResponsePending"
+    );
+
+    let answer = ReadMessage(&mut stream).await;
+    assert_eq!(&answer.m_vecPayload[4..7], &[0x62, 0xF1, 0x90]);
+
+    let durationToAnswer = instantSent.elapsed();
+    assert!(
+        durationToAnswer >= std::time::Duration::from_millis(350),
+        "the answer waited out the configured delay, it took {durationToAnswer:?}"
+    );
+
+    handle.Stop();
+}
+
+#[tokio::test]
+async fn the_advertised_socket_count_is_the_one_that_is_enforced() {
+    // The defect: capacity was a constant of four regardless of what the entity advertised, so
+    // an operator who lowered it to one in order to provoke routing activation code 0x04
+    // watched the second tester be accepted anyway.
+    const c_u16SecondTester: u16 = 0x0E81;
+
+    let (handle, mut first, arcSettings) = ConnectToSimFile(c_strSimFile).await;
+    arcSettings.lock().expect("settings mutex").m_byMaxSockets = 1;
+
+    assert_eq!(
+        ActivateRouting(&mut first, c_u16Tester, 0x00).await,
+        0x10,
+        "the one socket this entity advertises"
+    );
+
+    let mut second = TcpStream::connect(handle.TcpAddress())
+        .await
+        .expect("a second tester connects; the standard requires the spare resource for it");
+
+    assert_eq!(
+        ActivateRouting(&mut second, c_u16SecondTester, 0x00).await,
+        0x01,
+        "Table 48 code 0x01: all concurrently supported TCP_DATA sockets are registered \
+         and active"
+    );
+
+    handle.Stop();
+}
+
+#[tokio::test]
+async fn raising_the_socket_count_lets_a_second_tester_in() {
+    // The other half of the same property: the number is read when the decision is made, so a
+    // setting changed on a running entity takes effect without restarting it.
+    const c_u16SecondTester: u16 = 0x0E81;
+
+    let (handle, mut first, arcSettings) = ConnectToSimFile(c_strSimFile).await;
+    arcSettings.lock().expect("settings mutex").m_byMaxSockets = 2;
+
+    assert_eq!(ActivateRouting(&mut first, c_u16Tester, 0x00).await, 0x10);
+
+    let mut second = TcpStream::connect(handle.TcpAddress())
+        .await
+        .expect("the tester connects");
+    assert_eq!(
+        ActivateRouting(&mut second, c_u16SecondTester, 0x00).await,
+        0x10,
+        "there is room for both"
+    );
+
+    handle.Stop();
+}
+
+/// An entity over the test vehicle, with no sockets — the state machine driven directly, which
+/// is the only way to hold a clock still and step it.
+fn LoneEntity() -> DoIpEntity {
+    let mut simulation = SimulationService::New();
+    simulation
+        .LoadFromSimFileText(c_strSimFile)
+        .expect("the test simfile should load");
+    simulation.Start();
+
+    DoIpEntity::New(
+        Arc::new(Mutex::new(simulation)),
+        c_u16Gateway,
+        Arc::new(Mutex::new(DoIpSettings::default())),
+    )
+}
+
+/// The bytes of a routing activation request.
+fn RoutingActivationBytes(u16SourceAddress: u16) -> Vec<u8> {
+    let mut vecPayload = u16SourceAddress.to_be_bytes().to_vec();
+    vecPayload.push(0x00);
+    vecPayload.extend_from_slice(&0u32.to_be_bytes());
+    header::WriteMessage(0x03, PayloadType::RoutingActivationRequest, &vecPayload)
+}
+
+#[tokio::test]
+async fn data_the_entity_cannot_parse_still_keeps_an_activated_socket_alive() {
+    // REQ 3.DoIP-080 NL resets the general inactivity timer "whenever data is received or sent
+    // over this socket" — not whenever a *valid* message is. The defect: the timer was noted
+    // only after the header parsed, so a tester sending a steady stream of rubbish was closed
+    // as idle while the entity was busy negatively acknowledging every message of it.
+    const c_u64Socket: u64 = 1;
+    let mut entity = LoneEntity();
+    entity.OpenConnection(c_u64Socket);
+
+    let reaction = entity.HandleTcp(
+        c_u64Socket,
+        &RoutingActivationBytes(c_u16Tester),
+        &UdsHandler,
+    );
+    assert!(!reaction.m_bCloseSocket, "routing activated");
+
+    assert!(
+        entity.Tick(290_000).is_empty(),
+        "not yet at the five-minute general timer"
+    );
+
+    // A broken synchronisation pattern: data the entity answers but cannot interpret.
+    let reaction = entity.HandleTcp(c_u64Socket, &[0xAA; 8], &UdsHandler);
+    assert_eq!(
+        reaction.m_vecReplies.len(),
+        1,
+        "answered with a generic header NACK"
+    );
+
+    assert!(
+        entity.Tick(290_000).is_empty(),
+        "and that traffic reset the timer, so 580 seconds of it does not close the socket"
+    );
+}
+
+#[tokio::test]
+async fn a_vehicle_identification_response_waits_its_announce_delay() {
+    // REQ 8.DoIP-051 APP. The answer is correct but must not be instant: every entity on the
+    // network answers the same broadcast, and replying in the same instant is what makes the
+    // burst that drops the answers on the way back to the tester.
+    let entity = LoneEntity();
+    let vecRequest = header::WriteMessage(0x03, PayloadType::VehicleIdentificationRequest, &[]);
+
+    let reaction = entity.HandleUdp(&vecRequest);
+    assert_eq!(reaction.m_vecReplies.len(), 1);
+
+    let reply = &reaction.m_vecReplies[0];
+    let header = ReadHeader(&reply.m_vecBytes, HeaderLimits::default()).expect("a valid header");
+    assert_eq!(header.m_payloadType, PayloadType::VehicleAnnouncement);
+    assert!(
+        reply.m_u32AtMs <= 500,
+        "A_DoIP_Announce_Wait is 500 ms at most, got {}",
+        reply.m_u32AtMs
+    );
+}
+
+#[tokio::test]
+async fn the_announce_delay_is_drawn_fresh_rather_than_fixed() {
+    // The randomisation is the whole point: a fixed delay moves the burst instead of spreading
+    // it. Two entities that always wait the same 500 ms collide exactly as two that wait none.
+    let entity = LoneEntity();
+    let vecRequest = header::WriteMessage(0x03, PayloadType::VehicleIdentificationRequest, &[]);
+
+    let mut setDelays = std::collections::BTreeSet::new();
+    for _ in 0..50 {
+        let reaction = entity.HandleUdp(&vecRequest);
+        setDelays.insert(reaction.m_vecReplies[0].m_u32AtMs);
+    }
+
+    assert!(
+        setDelays.len() > 1,
+        "fifty draws produced only the single delay {setDelays:?}"
+    );
+}
+
+/// A vehicle with one ECU the entity can address and one it can only reach over CAN.
+const c_strMixedSimFile: &str = r#"{
+  "simfileVersion": 2,
+  "vehicle": "Mixed transport DoIP test vehicle",
+  "networks": [
+    { "id": "eth", "name": "Diagnostic Ethernet", "kind": "Ethernet", "entryPoint": true },
+    { "id": "pt", "name": "Powertrain CAN", "kind": "CAN" }
+  ],
+  "ecus": [
+    { "name": "Gateway", "network": "eth", "gatewayFor": ["pt"],
+      "doip": { "logicalAddress": "0x0010" },
+      "sessions": ["default", "extended"],
+      "dids": { "F18C": { "text": "SIM-GW-0001" } } },
+    { "name": "Engine", "network": "pt",
+      "can": { "request": "0x7E0", "response": "0x7E8", "functional": "0x7DF" },
+      "sessions": ["default", "extended"],
+      "dids": { "F18C": { "text": "SIM-ENG-0001" } } }
+  ]
+}"#;
+
+#[tokio::test]
+async fn a_broadcast_answer_from_an_ecu_with_no_logical_address_is_dropped() {
+    // An ECU behind the gateway on CAN has no DoIP logical address, so there is nothing
+    // truthful to put in a diagnostic message's source address field for it. Falling back to
+    // the group address would tell the tester 0xE000 answered — which no ECU did, and which
+    // makes the answer indistinguishable from every other ECU's.
+    //
+    // The request still reaches it and its state still changes; what is lost is the answer,
+    // exactly as on a gateway with no route back for it.
+    let (handle, mut stream, _arcSettings) = ConnectToSimFile(c_strMixedSimFile).await;
+    assert_eq!(ActivateRouting(&mut stream, c_u16Tester, 0x00).await, 0x10);
+
+    SendDiagnostic(&mut stream, 0xE000, &[0x3E, 0x00]).await;
+
+    let ack = ReadMessage(&mut stream).await;
+    assert_eq!(ack.m_payloadType, PayloadType::DiagnosticMessageAck);
+
+    let answer = ReadMessage(&mut stream).await;
+    assert_eq!(
+        &answer.m_vecPayload[0..2],
+        &c_u16Gateway.to_be_bytes(),
+        "the gateway answers under its own address"
+    );
+
+    // And nothing else arrives: the CAN-only ECU's answer has no address to travel under.
+    let mut arrSpare = [0u8; 64];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        stream.read(&mut arrSpare),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a second answer arrived: {:?}",
+        result.map(|inner| inner.map(|uRead| arrSpare[..uRead].to_vec()))
+    );
+
+    handle.Stop();
+}

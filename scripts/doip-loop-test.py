@@ -109,14 +109,26 @@ check("every diagnostic message acknowledged", acked, CYCLES * len(ECUS))
 check("activation code was always 0x10 (success)", activation_codes, {0x10})
 
 # ---------------------------------------------------------------- negatives
-sock = socket.create_connection(("127.0.0.1", 13400), timeout=3)
+# REQ 3.DoIP-131 NL: a diagnostic message before routing activation is not answered AND not
+# negatively acknowledged. Silence is the conformant behaviour here — what the tester learns
+# from is the socket closing underneath it when the 2 s initial inactivity timer elapses. The
+# timer is a measure against exactly this, so the traffic must not postpone it either.
+sock = socket.create_connection(("127.0.0.1", 13400), timeout=6)
 try:
     sock.sendall(hdr(0x8001, struct.pack(">HH", TESTER, ECUS[0]) + bytes([0x3E, 0x00])))
-    ver, ptype, body = recv_msg(sock)
-    check("diagnostic before activation is refused", ptype in (0x8003, 0x0000), True)
-except (TimeoutError, ConnectionError) as e:
-    RESULTS.append(("diagnostic before activation is refused", "FAIL",
-                    f"no answer at all ({type(e).__name__})"))
+    t_sent = time.time()
+    try:
+        ver, ptype, body = recv_msg(sock)
+        RESULTS.append(("diagnostic before activation gets no answer", "FAIL",
+                        f"payload type 0x{ptype:04X}"))
+    except ConnectionError:
+        waited = time.time() - t_sent
+        check("diagnostic before activation gets no answer, then the socket closes", True, True)
+        check("and it closes on the initial inactivity timer, not immediately",
+              round(waited, 2), lambda w: 1.0 < w < 5.0)
+    except TimeoutError:
+        RESULTS.append(("diagnostic before activation gets no answer, then the socket closes",
+                        "FAIL", "the socket was still open after 6 s"))
 finally:
     sock.close()
 
@@ -145,6 +157,55 @@ except (TimeoutError, ConnectionError) as e:
                     f"no answer at all ({type(e).__name__})"))
 finally:
     sock.close()
+
+# A functional group address (ISO 13400-2 Table 13, 0xE000-0xEFFF) reaches the whole vehicle
+# rather than being refused as an unknown target.
+sock = socket.create_connection(("127.0.0.1", 13400), timeout=5)
+try:
+    sock.sendall(hdr(0x0005, struct.pack(">HBI", TESTER, 0x00, 0)))
+    recv_msg(sock)
+    sock.sendall(hdr(0x8001, struct.pack(">HH", TESTER, 0xE000) + bytes([0x3E, 0x00])))
+
+    sources, nacked = set(), False
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        try:
+            ver, ptype, body = recv_msg(sock)
+        except TimeoutError:
+            break
+        if ptype == 0x8003:
+            nacked = True
+            break
+        if ptype == 0x8001:
+            sources.add(struct.unpack(">H", body[0:2])[0])
+            if len(sources) == len(ECUS):
+                break
+    check("a functional group address is not refused", nacked, False)
+    check("every ECU answers the broadcast", sorted(sources), sorted(ECUS))
+except (TimeoutError, ConnectionError) as e:
+    RESULTS.append(("a functional group address reaches the vehicle", "FAIL",
+                    f"{type(e).__name__}"))
+finally:
+    sock.close()
+
+# REQ 8.DoIP-051 APP: the vehicle identification response is delayed by A_DoIP_Announce_Wait so
+# that many entities answering one broadcast do not reply in the same instant.
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.settimeout(3)
+try:
+    t_sent = time.time()
+    udp.sendto(hdr(0x0001, b""), ("127.0.0.1", 13400))
+    data, _ = udp.recvfrom(1024)
+    waited_ms = (time.time() - t_sent) * 1000.0
+    ptype = struct.unpack(">H", data[2:4])[0]
+    check("a vehicle identification request is answered", ptype, 0x0004)
+    check("and the answer is inside A_DoIP_Announce_Wait",
+          round(waited_ms, 1), lambda w: w < 700.0)
+except (TimeoutError, OSError) as e:
+    RESULTS.append(("a vehicle identification request is answered", "FAIL",
+                    f"{type(e).__name__}"))
+finally:
+    udp.close()
 
 call("/doip/stop", {})
 print(json.dumps({"results": RESULTS, "elapsed": elapsed, "cycles": CYCLES}))
