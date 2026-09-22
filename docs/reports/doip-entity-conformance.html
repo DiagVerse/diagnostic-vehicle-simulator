@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; }
+  img { max-width: 100%; }
+  [hidden] { display: none !important; }
+</style>
+<title>DoIP Entity Conformance</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --ground: #f4f6f8;
+    --surface: #ffffff;
+    --surface-sunk: #eef1f5;
+    --ink: #121820;
+    --ink-soft: #5a6674;
+    --ink-faint: #8b96a3;
+    --rule: #dde2e8;
+    --rule-soft: #e9edf1;
+    --accent: #2f4b8f;
+    --accent-soft: #e6ebf6;
+    --pass: #1a7f5a;
+    --pass-soft: #e3f3ec;
+    --warn: #9a6400;
+    --warn-soft: #f9efd9;
+    --gap: #8a4a3c;
+    --gap-soft: #f6e8e4;
+    --measure: 74ch;
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0e1319;
+      --surface: #151c25;
+      --surface-sunk: #11171f;
+      --ink: #e4e9ef;
+      --ink-soft: #9aa6b4;
+      --ink-faint: #6b7787;
+      --rule: #263140;
+      --rule-soft: #1d2530;
+      --accent: #8aa6ee;
+      --accent-soft: #1b2438;
+      --pass: #4fc99a;
+      --pass-soft: #12241d;
+      --warn: #d9a441;
+      --warn-soft: #251e10;
+      --gap: #e08a76;
+      --gap-soft: #2a1a16;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0e1319;
+    --surface: #151c25;
+    --surface-sunk: #11171f;
+    --ink: #e4e9ef;
+    --ink-soft: #9aa6b4;
+    --ink-faint: #6b7787;
+    --rule: #263140;
+    --rule-soft: #1d2530;
+    --accent: #8aa6ee;
+    --accent-soft: #1b2438;
+    --pass: #4fc99a;
+    --pass-soft: #12241d;
+    --warn: #d9a441;
+    --warn-soft: #251e10;
+    --gap: #e08a76;
+    --gap-soft: #2a1a16;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1080px; margin: 0 auto; padding: 0 28px 96px; }
+  .measure { max-width: var(--measure); }
+
+  /* ---- masthead ---- */
+  header.masthead {
+    padding: 56px 0 28px;
+    border-bottom: 2px solid var(--ink);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px 40px;
+    align-items: flex-end;
+    justify-content: space-between;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(30px, 4.4vw, 42px);
+    line-height: 1.12;
+    font-weight: 600;
+    letter-spacing: -0.021em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .masthead dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 3px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  .masthead dt { color: var(--ink-faint); }
+  .masthead dd { margin: 0; color: var(--ink); }
+
+  .lede {
+    font-size: 18.5px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    margin: 28px 0 0;
+  }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  /* ---- verdict row ---- */
+  .verdicts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 40px 0 0;
+  }
+  .verdict { background: var(--surface); padding: 18px 20px; }
+  .verdict .n {
+    font-family: var(--mono);
+    font-size: 27px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    display: block;
+    line-height: 1.2;
+  }
+  .verdict .k {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    display: block;
+    margin-top: 3px;
+  }
+  .verdict.good .n { color: var(--pass); }
+
+  /* ---- sections ---- */
+  section { margin-top: 56px; }
+  h2 {
+    font-size: 13px;
+    font-family: var(--mono);
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+  h3 {
+    font-size: 23px;
+    font-weight: 600;
+    letter-spacing: -0.014em;
+    margin: 0 0 14px;
+    text-wrap: balance;
+  }
+  h4 {
+    font-size: 15.5px;
+    font-weight: 600;
+    margin: 30px 0 8px;
+  }
+  p { margin: 0 0 14px; }
+  code, .mono { font-family: var(--mono); font-size: 0.9em; }
+  code {
+    background: var(--surface-sunk);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--ink);
+  }
+
+  /* ---- data tables ---- */
+  .band { margin: 22px 0; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 560px; }
+  caption {
+    text-align: left;
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    padding-bottom: 8px;
+  }
+  th {
+    text-align: left;
+    font-size: 11.5px;
+    font-family: var(--mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 500;
+    padding: 0 14px 7px 0;
+    border-bottom: 1px solid var(--ink);
+    white-space: nowrap;
+  }
+  td {
+    padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  td.id { font-family: var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  /* state stripe: encodes conformance, not decoration */
+  tr[data-state] td:first-child { border-left: 3px solid transparent; padding-left: 11px; }
+  tr[data-state="full"] td:first-child { border-left-color: var(--pass); }
+  tr[data-state="partial"] td:first-child { border-left-color: var(--warn); }
+  tr[data-state="none"] td:first-child { border-left-color: var(--gap); }
+
+  .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .tag.full { background: var(--pass-soft); color: var(--pass); }
+  .tag.partial { background: var(--warn-soft); color: var(--warn); }
+  .tag.none { background: var(--gap-soft); color: var(--gap); }
+
+  /* ---- figure / callout ---- */
+  figure.calc {
+    margin: 24px 0;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    padding: 20px 22px;
+  }
+  figure.calc .row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    align-items: baseline;
+    font-family: var(--mono);
+    font-size: 14px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  figure.calc .row:last-of-type { border-bottom: none; }
+  figure.calc .row .lbl { color: var(--ink-soft); min-width: 22ch; flex: 1 1 22ch; }
+  figure.calc .row .val { color: var(--ink); font-weight: 500; }
+  figure.calc figcaption {
+    margin-top: 12px;
+    font-size: 14px;
+    color: var(--ink-soft);
+    line-height: 1.5;
+  }
+  figure.calc figcaption strong { color: var(--ink); font-weight: 600; }
+
+  pre.graph {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.75;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 18px 20px;
+    overflow-x: auto;
+    margin: 0;
+    color: var(--ink);
+  }
+  pre.graph .node { color: var(--accent); }
+  pre.graph .meta { color: var(--ink-faint); }
+
+  ul.notes { margin: 0; padding-left: 18px; }
+  ul.notes li { margin-bottom: 9px; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-size: 13px;
+    color: var(--ink-faint);
+    font-family: var(--mono);
+  }
+  a { color: var(--accent); }
+  a:focus-visible, td:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">Conformance &amp; test report</p>
+      <h1>DoIP entity: audited against<br>ISO 13400-2, and driven</h1>
+    </div>
+    <dl>
+      <dt>engine</dt><dd>99cd3a9</dd>
+      <dt>tests</dt><dd>409 across 55 suites</dd>
+      <dt>on the wire</dt><dd>43 / 43 checks</dd>
+      <dt>date</dt><dd>23 Sep 2026</dd>
+    </dl>
+  </header>
+
+  <p class="lede measure">Twelve defects found by a requirement-by-requirement audit of the DoIP
+    stack, all fixed; then the entity driven over real TCP and UDP sockets by two harnesses that
+    speak ISO 13400-2 rather than going through the HTTP API. <strong>None of the twelve was a
+    crash.</strong> Every one was a plausible-looking answer a tester would have believed.</p>
+
+  <div class="verdicts">
+    <div class="verdict good"><span class="n">12</span><span class="k">defects found and fixed</span></div>
+    <div class="verdict good"><span class="n">43/43</span><span class="k">socket-level checks</span></div>
+    <div class="verdict good"><span class="n">645</span><span class="k">messages, 6 ECUs from the capture</span></div>
+    <div class="verdict"><span class="n">46 + 1</span><span class="k">ECUs on P33C: DoIP, and CAN-only</span></div>
+  </div>
+
+  <!-- ============================ DEFECTS ============================ -->
+  <section>
+    <h2>The audit</h2>
+    <h3>What the entity used to tell a tester</h3>
+    <p class="measure">A simulator's worst failure is not silence — it is a confident wrong
+      answer, because the person debugging trusts its account of what happened. Each row is what
+      the code said, against what the standard says. Every one has a test that fails without the
+      fix.</p>
+
+    <div class="band">
+      <table>
+        <caption>Stripe encodes severity: a wrong answer · a lost answer · a missing delay</caption>
+        <thead>
+          <tr><th>Area</th><th>Requirement</th><th>It said</th><th>The standard says</th></tr>
+        </thead>
+        <tbody>
+          <tr data-state="none">
+            <td>Functional addressing</td>
+            <td class="id">Table 13 · Table 22</td>
+            <td><span class="tag none">NACK 0x03</span> unknown target address</td>
+            <td><span class="mono">0xE000</span>–<span class="mono">0xEFFF</span> are functional
+              group addresses. The standard's own worked example is a tester reading an InfoType
+              from the whole vehicle at <span class="mono">0xE000</span>.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Functional length</td>
+            <td class="id">REQ 7.DoIP-072 AL</td>
+            <td><span class="tag none">never reached</span></td>
+            <td>NACK <span class="mono">0x04</span> and discard when a sub-network the broadcast
+              must cross cannot carry it — a CAN leg allows a SingleFrame only.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Broadcast source address</td>
+            <td class="id">Table 23</td>
+            <td><span class="tag none">the group address</span></td>
+            <td>Each answer names the ECU that sent it. An ECU with no logical address has no
+              truthful value for the field, so its answer is dropped.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Inactivity timer → socket</td>
+            <td class="id">REQ 3.DoIP-082 NL</td>
+            <td><span class="tag none">socket stayed open</span></td>
+            <td>The elapsed timer closes the socket. The state was retired and the socket left
+              alive, answering nothing.</td>
+          </tr>
+          <tr data-state="none">
+            <td>General inactivity timer</td>
+            <td class="id">REQ 3.DoIP-080 NL</td>
+            <td><span class="tag none">reset on valid messages</span></td>
+            <td>Resets on <em>data</em> received or sent. A tester sending rubbish was closed as
+              idle while the entity was busy refusing every message of it.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Initial inactivity timer</td>
+            <td class="id">§12.6.3 · REQ 3.DoIP-085 NL</td>
+            <td><span class="tag none">reset by any traffic</span></td>
+            <td>A measure against exactly that traffic. Only a valid routing activation request
+              stops it — otherwise a socket is held open forever without activating.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Socket capacity</td>
+            <td class="id">Table 48 code 0x01</td>
+            <td><span class="tag none">a constant four</span></td>
+            <td>The advertised <span class="mono">MaxSockets</span>, counting registered sockets.
+              An operator lowering it to provoke <span class="mono">0x01</span> was ignored.</td>
+          </tr>
+          <tr data-state="partial">
+            <td>Response plan timing</td>
+            <td class="id">ISO 14229-2 §7</td>
+            <td><span class="tag partial">one burst</span></td>
+            <td>The ECU's offsets are its decision. A delay and its ResponsePending arriving
+              together is the one thing that makes them unmeasurable.</td>
+          </tr>
+          <tr data-state="partial">
+            <td>Vehicle identification</td>
+            <td class="id">REQ 8.DoIP-051 APP</td>
+            <td><span class="tag partial">answered instantly</span></td>
+            <td>Delayed by <span class="mono">A_DoIP_Announce_Wait</span>, drawn fresh — every
+              entity answers the same broadcast, and replying together makes the burst that drops
+              the answers.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Protocol version</td>
+            <td class="id">Table 16</td>
+            <td><span class="tag none">accepted by range</span></td>
+            <td>The table enumerates the versions. A range admitted versions that do not exist.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Entity-only messages</td>
+            <td class="id">Tables 5, 20</td>
+            <td><span class="tag none">answered as requests</span></td>
+            <td>Answering a message only an entity sends starts a NACK exchange between two
+              entities that ends when one of them stops.</td>
+          </tr>
+          <tr data-state="none">
+            <td>Framing an unknown type</td>
+            <td class="id">§8.1 header</td>
+            <td><span class="tag none">abandoned the stream</span></td>
+            <td>The length field frames a message whatever its type means. Manufacturer types
+              (<span class="mono">0xF000</span>+) are legal and common — this cost whole ECUs,
+              silently.</td>
+          </tr>
+          <tr data-state="none">
+            <td>ResponsePending in a capture</td>
+            <td class="id">ISO 14229-1 §7.5.5</td>
+            <td><span class="tag none">retired the request</span></td>
+            <td>It is an interim answer. Retiring on it lost the response carrying the data — and
+              most reads of any size go through one.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================ DECISIONS ============================ -->
+  <section>
+    <h2>Judgement, not transcription</h2>
+    <h3>Four decisions worth arguing with</h3>
+
+    <h4>A functional group address reaches every ECU</h4>
+    <p class="measure">Group <em>membership</em> is not modelled. Nothing in the vehicle model
+      says which ECUs belong to which group, and no source it is built from — CAN log, capture,
+      simulation file — carries it. Inventing a membership would be a claim the evidence does not
+      support, so every group address reaches everything.</p>
+
+    <h4>The limit belongs to the transport, not to the addressing mode</h4>
+    <p class="measure">A functional request over seven bytes of user data is refused only when
+      some ECU in the vehicle has no DoIP address of its own. That ECU is behind a gateway on CAN
+      and the message has to cross it; a vehicle reached entirely over Ethernet has no SingleFrame
+      to fit into and is not length-limited. On <span class="mono">P33C</span> this is observable
+      because exactly one of its 47 ECUs is CAN-only.</p>
+
+    <h4>The whole message is discarded, not partly delivered</h4>
+    <p class="measure">Half a broadcast is worse than none: the tester has no way to learn which
+      half arrived. The 46 ECUs that could have taken it get nothing.</p>
+
+    <h4>An answer with no address to travel under is dropped</h4>
+    <p class="measure">A CAN-only ECU's broadcast answer has nothing truthful for the source
+      address field, so it is dropped — as a real gateway drops a reply it has no route back for.
+      The request still reached it over CAN and its state still changed. What is lost is the
+      answer, not the ECU.</p>
+  </section>
+
+  <!-- ============================ TIMING ============================ -->
+  <section>
+    <h2>Table 12</h2>
+    <h3>Timing parameters, and which are enforced</h3>
+    <p class="measure">A named constant per parameter, so a reader can check each against the
+      table rather than against a number at a call site.</p>
+
+    <div class="band">
+      <table>
+        <caption>Enforced means a test drives the entity past it and observes the consequence</caption>
+        <thead>
+          <tr><th>Parameter</th><th>Value</th><th>State</th><th>What it does here</th></tr>
+        </thead>
+        <tbody>
+          <tr data-state="full">
+            <td class="id">T_TCP_Initial_Inactivity</td><td class="num">2 s</td>
+            <td><span class="tag full">enforced</span></td>
+            <td>Closes a socket that never activates routing. No traffic resets it.</td>
+          </tr>
+          <tr data-state="full">
+            <td class="id">T_TCP_General_Inactivity</td><td class="num">300 s</td>
+            <td><span class="tag full">enforced</span></td>
+            <td>Closes an idle activated socket. Any data in either direction resets it.</td>
+          </tr>
+          <tr data-state="full">
+            <td class="id">A_DoIP_Announce_Wait</td><td class="num">0–500 ms</td>
+            <td><span class="tag full">enforced</span></td>
+            <td>Delays every vehicle identification response, drawn fresh per request.</td>
+          </tr>
+          <tr data-state="partial">
+            <td class="id">A_DoIP_Announce_Interval</td><td class="num">500 ms</td>
+            <td><span class="tag partial">defined</span></td>
+            <td>The power-up announcement is not built, so nothing consumes it yet.</td>
+          </tr>
+          <tr data-state="partial">
+            <td class="id">A_DoIP_Announce_Num</td><td class="num">3</td>
+            <td><span class="tag partial">defined</span></td>
+            <td>Same.</td>
+          </tr>
+          <tr data-state="partial">
+            <td class="id">A_DoIP_Ctrl</td><td class="num">2 s</td>
+            <td><span class="tag partial">met, not policed</span></td>
+            <td>UDP answers are immediate apart from the announce wait, so the deadline is met —
+              but nothing measures it.</td>
+          </tr>
+          <tr data-state="partial">
+            <td class="id">A_DoIP_Diagnostic_Message</td><td class="num">50 ms</td>
+            <td><span class="tag partial">met, not policed</span></td>
+            <td>The acknowledgement is built before the ECU is asked, so it is never late.</td>
+          </tr>
+          <tr data-state="none">
+            <td class="id">T_TCP_Alive_Check</td><td class="num">500 ms</td>
+            <td><span class="tag none">not used</span></td>
+            <td>Alive-check arbitration is not built. The entity refuses a contested address
+              instead, which is stricter than the standard permits and never looser.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================ HARNESSES ============================ -->
+  <section>
+    <h2>On the wire</h2>
+    <h3>Two harnesses, both speaking ISO 13400-2 on a socket</h3>
+    <p class="measure">Neither goes through the HTTP API, so what they exercise is the entity a
+      real tester meets. The negative cases matter more than the positive ones: anything that
+      answers correctly is easy to get right by accident, and what separates a conformant entity
+      from a plausible one is whether it refuses properly.</p>
+
+    <figure class="calc">
+      <div class="row"><span class="lbl">doip-loop-test.py</span><span class="val">20 / 20 checks · 25 cycles × 6 ECUs · 19.9 ms</span></div>
+      <div class="row"><span class="lbl">source</span><span class="val">Reprolog3.pcapng → 645 messages → 6 ECUs</span></div>
+      <div class="row"><span class="lbl">doip-vehicle-test.py</span><span class="val">23 / 23 checks · 10 cycles × 46 ECUs · 38.9 ms</span></div>
+      <div class="row"><span class="lbl">source</span><span class="val">P33C simulation file → 47 ECUs, 46 DoIP-addressable</span></div>
+      <figcaption>Both run three times in a row with identical results. The capture's six ECUs
+        match an <strong>independent ground-truth parser sharing no code with the engine</strong>
+        — which is what makes 645 a measurement rather than a claim.</figcaption>
+    </figure>
+
+    <h4>What the capture-driven harness refuses to let pass</h4>
+    <ul class="notes measure">
+      <li>A diagnostic message before routing activation gets <strong>no answer and no
+        NACK</strong> — and then the socket closes, between one and five seconds later. Both
+        halves are asserted: the silence is REQ 3.DoIP-131 NL, and the close is what makes it
+        legible to a tester instead of a hang.</li>
+      <li>An unknown target address is NACKed <span class="mono">0x03</span>; a functional group
+        address is <strong>not</strong>, and all six ECUs answer it.</li>
+      <li>A protocol version outside Table 16 gets a generic header NACK.</li>
+      <li>A vehicle identification response arrives, and inside the announce wait.</li>
+    </ul>
+
+    <h4>What the vehicle harness adds</h4>
+    <ul class="notes measure">
+      <li>Real data: a DID read and its value, DTCs filtered by status mask (and a narrow mask
+        returning only what sets that bit), an unknown DID refused, security actually unlocked.</li>
+      <li><strong>One ECU, two transports.</strong> A session entered over DoIP is visible on CAN;
+        one entered over CAN is visible over DoIP; security unlocked either way is unlocked both
+        ways. Two instances keyed separately would pass every other check in the file and diverge
+        the moment a tester used both.</li>
+      <li>One broadcast reaching all 46 addressable ECUs, each answer under its own address — and
+        the 47th, CAN-only, staying silent because it has none.</li>
+      <li>The same nine-byte request refused functionally (<span class="mono">0x04</span>) and
+        accepted physically. That pair is the whole of REQ 7.DoIP-072 AL in two messages.</li>
+    </ul>
+  </section>
+
+  <!-- ============================ NOT BUILT ============================ -->
+  <section>
+    <h2>Stated, not implied</h2>
+    <h3>What is deliberately not built</h3>
+    <ul class="notes measure">
+      <li><strong>Power-up announcement.</strong> The entity answers identification requests but
+        does not announce itself unprompted. The three Table 12 parameters for it exist; nothing
+        consumes them.</li>
+      <li><strong>Alive-check arbitration.</strong> An entity may send an alive check to a socket
+        holding a contested source address and free it if it does not answer. This one refuses
+        with <span class="mono">0x03</span> instead — stricter than the standard permits, never
+        looser. A tester is told "in use" where the standard would allow "in use", and never the
+        reverse.</li>
+      <li><strong>TLS on port 3496.</strong> Encrypted packets in a capture are counted and
+        skipped, and the count is reported rather than hidden.</li>
+      <li><strong>Authentication and confirmation states.</strong> The connection state machine has
+        <span class="mono">PendingAuthentication</span> and honours its timer correctly, but
+        nothing drives it there except a forced routing activation code.</li>
+      <li><strong>Functional group membership.</strong> See above — a decision, not an omission.</li>
+    </ul>
+  </section>
+
+  <!-- ============================ GRAPH ============================ -->
+  <section>
+    <h2>Provenance</h2>
+    <h3>How this landed</h3>
+    <pre class="graph">* <span class="node">99cd3a9</span>  fix(doip): keep the entity's promises about timers, capacity, timing and discovery
+|          <span class="meta">D4 sockets · D5 plan timing · D8 announce wait · D9 + the initial-timer rule · D12 · ADR 0021</span>
+* <span class="node">4413330</span>  fix(doip): apply the audit's conformance defects to the entity and the capture reader
+|          <span class="meta">D1 close signal · D2 header limits · D3 functional addressing · D6 · D7 · D10 framing · D11 pending</span>
+* <span class="node">b73b654</span>  test(doip): drive a whole vehicle over DoIP, and prove the transports share one ECU
+* <span class="node">22857f3</span>  test(doip): drive the entity as a tester does, and check it against a capture
+|          <span class="meta">the harnesses came first; they made the audit's findings reproducible</span>
+* <span class="node">ef9fc80</span>  (main) docs: record the CAN data-link features in the conformance report  <span class="meta">#34</span>
+* <span class="node">b95a466</span>  feat(can): error states, remote frames and bus load  <span class="meta">#33</span>
+* <span class="node">9d75dbd</span>  docs: add the CAN stack conformance and test report  <span class="meta">#32</span>
+* <span class="node">e3ead21</span>  fix(reconstruct): stop inventing ECUs from ordinary periodic traffic  <span class="meta">#31</span>
+* <span class="node">7f3e06b</span>  feat(doip): make the entity's identity, parameters and refusals editable  <span class="meta">#26</span>
+* <span class="node">db2eb1f</span>  feat(reconstruct): build a vehicle from a DoIP capture  <span class="meta">#22</span></pre>
+  </section>
+
+  <footer>
+    engine 99cd3a9 · cargo test --all: 409 passing · clippy -D warnings clean ·
+    ADR 0021 · PR #35 · no real capture or customer simulation file is committed
+  </footer>
+
+</div>
+
+</body>
+</html>
