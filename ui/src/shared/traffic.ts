@@ -1,61 +1,61 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /** One CAN frame crossing the hardware bridge. */
 export interface TrafficFrame {
-  kind: 'frame'
-  atMs: number
+  kind: "frame";
+  atMs: number;
   /** 'rx' from the far end, 'tx' from the simulator. */
-  direction: string
-  canIdHex: string
-  dataHex: string
-  length: number
-  isFlowControl: boolean
+  direction: string;
+  canIdHex: string;
+  dataHex: string;
+  length: number;
+  isFlowControl: boolean;
 }
 
 /** One ECU's answer inside an exchange. */
 export interface TrafficExchangeResponse {
-  ecuName: string
-  responseCanIdHex: string
-  responseHex: string
-  suppressed: boolean
+  ecuName: string;
+  responseCanIdHex: string;
+  responseHex: string;
+  suppressed: boolean;
   /** True when one of your response overrides produced this answer, not the UDS plugin. */
-  overridden: boolean
+  overridden: boolean;
 }
 
 /** One request routed through the simulation, with whatever answered it. */
 export interface TrafficExchange {
-  kind: 'exchange'
-  atMs: number
-  canIdHex: string
-  requestHex: string
-  addressing: string
-  routed: boolean
-  responses: TrafficExchangeResponse[]
+  kind: "exchange";
+  atMs: number;
+  canIdHex: string;
+  requestHex: string;
+  addressing: string;
+  routed: boolean;
+  responses: TrafficExchangeResponse[];
   /** Why nothing answered, when that is the interesting part. */
-  reason: string | null
+  reason: string | null;
 }
 
 /** The simulation was loaded, started, stopped, or put on a wire. */
 export interface TrafficLifecycle {
-  kind: 'lifecycle'
-  atMs: number
-  what: string
+  kind: "lifecycle";
+  atMs: number;
+  what: string;
 }
 
 /** This monitor fell behind and missed events. Shown, never hidden. */
 export interface TrafficLagged {
-  kind: 'lagged'
-  atMs: number
-  missed: number
+  kind: "lagged";
+  atMs: number;
+  missed: number;
 }
 
 /** The history the engine replayed when this monitor attached. */
 export interface TrafficReplayed {
-  kind: 'replayed'
-  atMs: number
-  count: number
+  kind: "replayed";
+  atMs: number;
+  count: number;
   /** How many older events the engine had already dropped before we attached. */
-  droppedBefore: number
+  droppedBefore: number;
 }
 
 export type TrafficEvent =
@@ -63,12 +63,12 @@ export type TrafficEvent =
   | TrafficExchange
   | TrafficLifecycle
   | TrafficLagged
-  | TrafficReplayed
+  | TrafficReplayed;
 
 /** One event with an id, so React can key a list that only ever grows at the front. */
 export interface TrafficEntry {
-  id: number
-  event: TrafficEvent
+  id: number;
+  event: TrafficEvent;
   /**
    * Everything in the event, uppercased, for the filter to search — built the first time a
    * filter actually needs it and kept thereafter.
@@ -78,18 +78,18 @@ export interface TrafficEntry {
    * reconnect — which replays the engine's entire history in one burst — do twenty thousand
    * of them inside the event handler, on the main thread, before the tab could draw anything.
    */
-  search?: string
+  search?: string;
 }
 
 /** The searchable text of one event, built on demand. See `TrafficEntry.search`. */
 export function SearchTextOf(entry: TrafficEntry): string {
   if (entry.search === undefined) {
-    entry.search = JSON.stringify(entry.event).toUpperCase()
+    entry.search = JSON.stringify(entry.event).toUpperCase();
   }
-  return entry.search
+  return entry.search;
 }
 
-export type FeedStatus = 'connecting' | 'live' | 'offline'
+export type FeedStatus = "connecting" | "live" | "offline";
 
 /**
  * How often the buffered events are handed to React.
@@ -99,7 +99,7 @@ export type FeedStatus = 'connecting' | 'live' | 'offline'
  * up — which is the failure this batching exists to prevent. Events land in a ref and are
  * flushed on this interval instead, so the render rate is bounded no matter what the bus does.
  */
-const FLUSH_INTERVAL_MS = 250
+const FLUSH_INTERVAL_MS = 250;
 
 /**
  * Subscribe to the engine's live traffic feed.
@@ -115,25 +115,25 @@ const FLUSH_INTERVAL_MS = 250
  * than hidden.
  */
 export function useTrafficFeed(maxEntries: number, wantFrames = true) {
-  const [entries, setEntries] = useState<TrafficEntry[]>([])
-  const [status, setStatus] = useState<FeedStatus>('connecting')
-  const [isPaused, setPaused] = useState(false)
+  const [entries, setEntries] = useState<TrafficEntry[]>([]);
+  const [status, setStatus] = useState<FeedStatus>("connecting");
+  const [isPaused, setPaused] = useState(false);
   /** Total events seen since this monitor attached, including ones dropped from the buffer. */
-  const [totalSeen, setTotalSeen] = useState(0)
+  const [totalSeen, setTotalSeen] = useState(0);
   /** What the engine said it replayed, so the monitor can be honest about where history starts. */
-  const [replay, setReplay] = useState<TrafficReplayed | null>(null)
+  const [replay, setReplay] = useState<TrafficReplayed | null>(null);
   /** How many times the feed has attached. More than one means the connection dropped. */
-  const [reconnects, setReconnects] = useState(0)
+  const [reconnects, setReconnects] = useState(0);
 
-  const pendingRef = useRef<TrafficEntry[]>([])
-  const nextIdRef = useRef(1)
-  const isPausedRef = useRef(false)
+  const pendingRef = useRef<TrafficEntry[]>([]);
+  const nextIdRef = useRef(1);
+  const isPausedRef = useRef(false);
 
   // Pausing must take effect inside the EventSource handler, which closes over its first
   // render. A ref is the state the handler can actually read.
   useEffect(() => {
-    isPausedRef.current = isPaused
-  }, [isPaused])
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
 
   useEffect(() => {
     // The engine drops frames for us when they are not wanted, so a flash transfer never
@@ -142,114 +142,132 @@ export function useTrafficFeed(maxEntries: number, wantFrames = true) {
     // Ask for no more history than this monitor can hold. Replaying twenty thousand events
     // into a buffer that keeps two thousand is eighteen thousand parsed and discarded, on the
     // main thread, every time the connection comes back.
-    const params = new URLSearchParams({ history: String(maxEntries) })
+    const params = new URLSearchParams({ history: String(maxEntries) });
     if (!wantFrames) {
-      params.set('frames', 'false')
+      params.set("frames", "false");
     }
-    const source = new EventSource(`/events?${params.toString()}`)
+    const source = new EventSource(`/events?${params.toString()}`);
 
-    source.onopen = () => setStatus('live')
+    source.onopen = () => setStatus("live");
     source.onerror = () => {
       // EventSource reconnects by itself; say so rather than implying the feed is finished.
-      setStatus('offline')
-    }
+      setStatus("offline");
+    };
     source.onmessage = (message) => {
       if (isPausedRef.current) {
-        return
+        return;
       }
       try {
-        const event = JSON.parse(message.data) as TrafficEvent
-        if (event.kind === 'replayed') {
-          // An EventSource reconnects by itself, and the engine replays everything it holds to
-          // whoever attaches — so a dropped connection during a long session delivers the whole
-          // history again, on top of a buffer that already contains it. Appending that meant
-          // thousands of duplicated events and a main-thread stall for each reconnect, which is
-          // what made the window need closing and reopening.
-          //
-          // The replay is authoritative, so the buffer is rebuilt from it rather than grown.
-          setReplay(event)
-          pendingRef.current = []
-          setEntries([])
-          setTotalSeen(0)
-          setReconnects((count) => count + 1)
+        // One SSE message carries a batch. The engine groups events into short windows, which
+        // at a flash transfer's rates is the difference between two hundred thousand dispatches
+        // into this thread and a few thousand.
+        const vecBatch = JSON.parse(message.data) as TrafficEvent[];
+        for (const event of vecBatch) {
+          if (event.kind === "replayed") {
+            // An EventSource reconnects by itself, and the engine replays everything it holds to
+            // whoever attaches — so a dropped connection during a long session delivers the whole
+            // history again, on top of a buffer that already contains it. Appending that meant
+            // thousands of duplicated events and a main-thread stall for each reconnect, which is
+            // what made the window need closing and reopening.
+            //
+            // The replay is authoritative, so the buffer is rebuilt from it rather than grown.
+            setReplay(event);
+            pendingRef.current = [];
+            setEntries([]);
+            setTotalSeen(0);
+            setReconnects((count) => count + 1);
+          }
+          pendingRef.current.push({ id: nextIdRef.current++, event });
         }
-        pendingRef.current.push({ id: nextIdRef.current++, event })
       } catch {
         // A malformed line is not worth tearing the monitor down for; skip it and keep going.
       }
-    }
+    };
 
     const flush = window.setInterval(() => {
-      const pending = pendingRef.current
+      const pending = pendingRef.current;
       if (pending.length === 0) {
-        return
+        return;
       }
-      pendingRef.current = []
-      setTotalSeen((seen) => seen + pending.length)
+      pendingRef.current = [];
+      setTotalSeen((seen) => seen + pending.length);
 
       // A flood can deliver more in one flush than the buffer will ever hold. Trimming the
       // batch first means the merge below never builds an array larger than the ceiling —
       // during a flash transfer that is the difference between one allocation and fifty.
       const vecArriving =
-        pending.length > maxEntries ? pending.slice(pending.length - maxEntries) : pending
+        pending.length > maxEntries
+          ? pending.slice(pending.length - maxEntries)
+          : pending;
 
       // Appended at the end, and never longer than the ceiling: once full, the oldest go.
       setEntries((previous) => {
-        const vecNext = [...previous, ...vecArriving]
-        return vecNext.length > maxEntries ? vecNext.slice(vecNext.length - maxEntries) : vecNext
-      })
-    }, FLUSH_INTERVAL_MS)
+        const vecNext = [...previous, ...vecArriving];
+        return vecNext.length > maxEntries
+          ? vecNext.slice(vecNext.length - maxEntries)
+          : vecNext;
+      });
+    }, FLUSH_INTERVAL_MS);
 
     return () => {
-      window.clearInterval(flush)
-      source.close()
-    }
-  }, [maxEntries, wantFrames])
+      window.clearInterval(flush);
+      source.close();
+    };
+  }, [maxEntries, wantFrames]);
 
   const clear = useCallback(() => {
-    pendingRef.current = []
-    setEntries([])
-    setTotalSeen(0)
-  }, [])
+    pendingRef.current = [];
+    setEntries([]);
+    setTotalSeen(0);
+  }, []);
 
-  return { entries, status, isPaused, setPaused, totalSeen, replay, clear, reconnects }
+  return {
+    entries,
+    status,
+    isPaused,
+    setPaused,
+    totalSeen,
+    replay,
+    clear,
+    reconnects,
+  };
 }
 
 /** Wall-clock time of an event, as a monitor should show it. */
 export function FormatEventTime(atMs: number): string {
-  const at = new Date(atMs)
-  const strTime = at.toLocaleTimeString(undefined, { hour12: false })
-  return `${strTime}.${String(at.getMilliseconds()).padStart(3, '0')}`
+  const at = new Date(atMs);
+  const strTime = at.toLocaleTimeString(undefined, { hour12: false });
+  return `${strTime}.${String(at.getMilliseconds()).padStart(3, "0")}`;
 }
 
 /** One event as a single line of text, for the saved log file. */
 export function FormatEventLine(event: TrafficEvent): string {
-  const strAt = FormatEventTime(event.atMs)
+  const strAt = FormatEventTime(event.atMs);
   switch (event.kind) {
-    case 'frame':
+    case "frame":
       return `${strAt}  ${event.direction.toUpperCase()}  ${event.canIdHex.padEnd(8)} [${event.length}] ${event.dataHex}${
-        event.isFlowControl ? '   (flow control)' : ''
-      }`
-    case 'exchange': {
+        event.isFlowControl ? "   (flow control)" : ""
+      }`;
+    case "exchange": {
       const strAnswers =
         event.responses.length > 0
           ? event.responses
               .map(
                 (response) =>
-                  `${response.ecuName}: ${response.responseHex}${response.overridden ? ' (override)' : ''}`,
+                  `${response.ecuName}: ${response.responseHex}${response.overridden ? " (override)" : ""}`,
               )
-              .join(' | ')
-          : (event.reason ?? 'no answer')
-      return `${strAt}  --  ${event.canIdHex.padEnd(8)} ${event.requestHex}  [${event.addressing}]  ${strAnswers}`
+              .join(" | ")
+          : (event.reason ?? "no answer");
+      return `${strAt}  --  ${event.canIdHex.padEnd(8)} ${event.requestHex}  [${event.addressing}]  ${strAnswers}`;
     }
-    case 'lifecycle':
-      return `${strAt}  ==  ${event.what}`
-    case 'lagged':
-      return `${strAt}  !!  fell behind: ${event.missed} event(s) missed`
-    case 'replayed':
+    case "lifecycle":
+      return `${strAt}  ==  ${event.what}`;
+    case "lagged":
+      return `${strAt}  !!  fell behind: ${event.missed} event(s) missed`;
+    case "replayed":
       return event.droppedBefore > 0
         ? `${strAt}  ==  ${event.count} earlier event(s) replayed; ${event.droppedBefore} older one(s) had already been dropped by the engine`
-        : `${strAt}  ==  ${event.count} earlier event(s) replayed — the session from its start`
+        : `${strAt}  ==  ${event.count} earlier event(s) replayed — the session from its start`;
   }
 }
 
@@ -260,7 +278,10 @@ export function FormatEventLine(event: TrafficEvent): string {
  * actually saw versus how many it still holds. A log that quietly omits that would be read as
  * a full capture.
  */
-export function SaveTrafficLog(entries: TrafficEntry[], totalSeen: number): void {
+export function SaveTrafficLog(
+  entries: TrafficEntry[],
+  totalSeen: number,
+): void {
   const vecLines = [
     `# Diagnostic Vehicle Simulator — traffic log`,
     `# saved ${new Date().toISOString()}`,
@@ -268,15 +289,15 @@ export function SaveTrafficLog(entries: TrafficEntry[], totalSeen: number): void
     entries.length < totalSeen
       ? `# the buffer is a window: ${totalSeen - entries.length} older event(s) were dropped`
       : `# nothing was dropped`,
-    '',
+    "",
     ...entries.map((entry) => FormatEventLine(entry.event)),
-  ]
+  ];
 
-  const blob = new Blob([vecLines.join('\n')], { type: 'text/plain' })
-  const strUrl = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = strUrl
-  link.download = `dvsim-traffic-${new Date().toISOString().replace(/[:.]/g, '-')}.log`
-  link.click()
-  URL.revokeObjectURL(strUrl)
+  const blob = new Blob([vecLines.join("\n")], { type: "text/plain" });
+  const strUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = strUrl;
+  link.download = `dvsim-traffic-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+  link.click();
+  URL.revokeObjectURL(strUrl);
 }

@@ -6,6 +6,16 @@ import { api, type HardwareStatus, type SerialPort } from '../shared/api'
 const BITRATES = [10000, 20000, 50000, 100000, 125000, 250000, 500000, 800000, 1000000]
 
 /**
+ * Host-to-adapter line speeds, which are not the CAN bitrate.
+ *
+ * Offered explicitly because detection only works if the adapter answers something, and a
+ * firmware that implements none of the identity commands cannot be asked. The fallback is then
+ * 115200 — which is a guess, and on a dongle that runs faster it is a guess that throws away
+ * seven eighths of the link and loses the middle of every long request.
+ */
+const SERIAL_BAUDS = [115200, 230400, 250000, 460800, 500000, 921600, 1000000, 2000000]
+
+/**
  * Put the simulation on a wire.
  *
  * Two ways to use this. With a USB-CAN adapter, pick its port and the vehicle's bus speed, and
@@ -19,6 +29,8 @@ export function Hardware() {
   const [status, setStatus] = useState<HardwareStatus | null>(null)
   const [selected, setSelected] = useState('')
   const [bitrate, setBitrate] = useState(500000)
+  /** 0 means "ask the adapter", which is right until an adapter will not say. */
+  const [serialBaud, setSerialBaud] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -49,7 +61,7 @@ export function Hardware() {
       if (status?.running) {
         setStatus(await api.hardwareStop())
       } else {
-        setStatus(await api.hardwareStart(selected, bitrate))
+        setStatus(await api.hardwareStart(selected, bitrate, serialBaud || undefined))
       }
       setError(null)
     } catch (e) {
@@ -117,6 +129,23 @@ export function Hardware() {
               {BITRATES.map((rate) => (
                 <option key={rate} value={rate}>
                   {rate / 1000} kbit/s
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block">
+            <span className="text-xs text-slate-400">Host link</span>
+            <select
+              value={serialBaud}
+              onChange={(e) => setSerialBaud(Number(e.target.value))}
+              disabled={status?.running}
+              className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-200 outline-none focus:border-slate-500 disabled:opacity-50"
+            >
+              <option value={0}>Ask the adapter</option>
+              {SERIAL_BAUDS.map((rate) => (
+                <option key={rate} value={rate}>
+                  {rate} baud
                 </option>
               ))}
             </select>

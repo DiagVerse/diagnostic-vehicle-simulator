@@ -355,9 +355,15 @@ mod tests {
     }
 
     #[test]
-    fn only_a_well_formed_version_reply_counts_as_one() {
-        assert!(crate::IsVersionReply("V1013"));
-        assert!(crate::IsVersionReply("Vffff"));
+    fn only_a_well_formed_identity_reply_counts_as_one() {
+        // Three commands are asked, because a firmware that implements none of them cannot be
+        // detected at all. Each answer has its own shape: V and N carry four hex digits, F two.
+        for strReply in ["V1013", "Vffff", "N0042", "F00", "FA3"] {
+            assert!(
+                crate::IsIdentityReply(strReply),
+                "{strReply:?} is an adapter identifying itself"
+            );
+        }
 
         // Everything a wrong baud rate produces must be rejected, or the probe would settle on
         // a line speed that cannot actually carry a frame.
@@ -366,12 +372,14 @@ mod tests {
             "V",
             "V101",
             "V10133",
-            "N1013",
+            "N101",
+            "F1013",
             "Vzzzz",
+            "T1013",
             "\u{7F}\u{7F}\u{7F}\u{7F}\u{7F}",
         ] {
             assert!(
-                !crate::IsVersionReply(strNotAReply),
+                !crate::IsIdentityReply(strNotAReply),
                 "{strNotAReply:?} is not an adapter identifying itself"
             );
         }

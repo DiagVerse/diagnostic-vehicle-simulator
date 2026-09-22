@@ -374,10 +374,35 @@ pub async fn GetEvents(
     }];
     vecPrelude.extend(vecHistory);
 
-    let historyStream = tokio_stream::iter(vecPrelude.into_iter().map(ToSseEvent));
+    // History goes out in batches too, so the reader has one shape to deal with.
+    let vecHistoryBatches: Vec<Vec<TrafficEvent>> = vecPrelude
+        .chunks(c_uMaxEventsPerBatch)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let historyStream = tokio_stream::iter(vecHistoryBatches.into_iter().map(ToSseBatch));
     let stream = historyStream.chain(BuildEventStream(receiver, bWantsFrames));
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(c_keepAliveInterval))
+}
+
+/// How many events one SSE message may carry.
+const c_uMaxEventsPerBatch: usize = 64;
+/// How long to gather events before sending what there is.
+///
+/// Shorter than a person can perceive, so a batched feed still reads as live.
+const c_batchWindow: Duration = Duration::from_millis(40);
+
+/// Render a batch of events as one SSE frame.
+///
+/// Serialization of these types cannot fail; if it somehow did, an empty batch keeps the
+/// stream alive rather than tearing down every monitor over one bad event.
+///
+/// A single event is still sent as a batch of one rather than as a bare object: one shape on
+/// the wire is one path through the reader, and a format that is sometimes an array is where a
+/// subtle parsing bug eventually lives.
+fn ToSseBatch(vecEvents: Vec<TrafficEvent>) -> Result<Event, Infallible> {
+    let strJson = serde_json::to_string(&vecEvents).unwrap_or_else(|_| "[]".to_string());
+    Ok(Event::default().data(strJson))
 }
 
 /// Query string for `GET /events`.
@@ -402,15 +427,6 @@ pub struct EventsQuery {
 /// True for an event describing one CAN frame rather than a decoded exchange.
 fn IsFrameEvent(event: &TrafficEvent) -> bool {
     matches!(event, TrafficEvent::Frame { .. })
-}
-
-/// Render one event as an SSE frame.
-///
-/// Serialization of these types cannot fail; if it somehow did, an empty object keeps the
-/// stream alive rather than tearing down every monitor over one bad event.
-fn ToSseEvent(event: TrafficEvent) -> Result<Event, Infallible> {
-    let strJson = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    Ok(Event::default().data(strJson))
 }
 
 /// Turn the broadcast receiver into a stream of SSE events.
@@ -441,7 +457,16 @@ fn BuildEventStream(
             }
             Some(event)
         })
-        .map(ToSseEvent)
+        // Batched rather than one message per event, and this is the difference that shows at
+        // a flash transfer's rates. Two hundred thousand frames delivered singly is two hundred
+        // thousand EventSource dispatches into the browser's main thread — each one a separate
+        // task, a separate parse, a separate wake-up. The same data in batches costs a
+        // fiftieth of the dispatches and parses faster besides.
+        //
+        // The window is short enough to stay live to a person watching, so nothing appears to
+        // lag; the size cap keeps one batch from growing without bound on a busy bus.
+        .chunks_timeout(c_uMaxEventsPerBatch, c_batchWindow)
+        .map(ToSseBatch)
 }
 
 /// Format a CAN identifier the way the rest of the API does.
