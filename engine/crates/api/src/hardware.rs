@@ -176,7 +176,10 @@ pub async fn PostHardwareStart(
         Arc::clone(&state.simulation),
         IsoTpParameters::default(),
     )
-    .WithObserver(Arc::new(state.traffic.clone()));
+    .WithObserver(Arc::new(state.traffic.clone()))
+    // The bridge needs both speeds to know whether an ECU asking for no pacing is asking for
+    // something this link can actually deliver.
+    .WithLinkCapacity(linkSpeed.m_u32BaudRate, body.bitrate_bps);
     let arcStats = canBridge.Stats();
 
     let task = tokio::spawn(async move {

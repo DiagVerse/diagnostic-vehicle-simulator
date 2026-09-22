@@ -479,3 +479,168 @@ async fn a_second_ecus_frames_survive_the_first_ecus_transfer() {
          first ECU's transfer: {vecFromSecond:02X?}"
     );
 }
+
+/// Segment a PDU into the frames a tester would send for it.
+fn SegmentRequest(u32CanId: u32, vecPdu: &[u8]) -> Vec<CanFrame> {
+    let mut vecFrames = vec![Frame(
+        u32CanId,
+        [
+            &[
+                0x10 | ((vecPdu.len() >> 8) as u8),
+                (vecPdu.len() & 0xFF) as u8,
+            ],
+            &vecPdu[..6],
+        ]
+        .concat(),
+    )];
+
+    let mut uSent = 6;
+    let mut u8Sequence = 1u8;
+    while uSent < vecPdu.len() {
+        let uEnd = (uSent + 7).min(vecPdu.len());
+        let mut vecData = vec![0x20 | u8Sequence];
+        vecData.extend_from_slice(&vecPdu[uSent..uEnd]);
+        while vecData.len() < 8 {
+            vecData.push(0xAA);
+        }
+        vecFrames.push(Frame(u32CanId, vecData));
+        uSent = uEnd;
+        u8Sequence = (u8Sequence + 1) & 0x0F;
+    }
+    vecFrames
+}
+
+#[tokio::test]
+async fn block_size_zero_reassembles_a_long_request_on_a_link_that_keeps_up() {
+    // The question this settles: when a 386-byte request arrives with BlockSize 0 and the
+    // sequence numbers come out wrong, is the engine mis-ordering them or is the link losing
+    // them? The mock bus has no bandwidth limit and drops nothing, so a failure here would be
+    // ours and a success puts it on the wire.
+    let arcSimulation = BuildSimulation();
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let timing = EcuTiming {
+            m_u8IsoTpBlockSize: 0,
+            ..EcuTiming::default()
+        };
+        simulation
+            .SetEcuTiming(EcuKey::Can(0x7E0), timing)
+            .expect("the ECU");
+    }
+
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, arcSimulation);
+
+    // 386 bytes: a SecurityAccess sendKey the size of the one that failed in the field.
+    let mut vecPdu = vec![0x27, 0x02];
+    vecPdu.extend((0..384).map(|uIndex| (uIndex % 251) as u8));
+    assert_eq!(vecPdu.len(), 386);
+
+    let vecFrames = SegmentRequest(0x7E0, &vecPdu);
+    assert_eq!(
+        vecFrames.len(),
+        56,
+        "one FirstFrame and 55 ConsecutiveFrames"
+    );
+
+    // Every frame at once, which is exactly what BlockSize 0 asks a tester to do.
+    handle.InjectFrames(vecFrames);
+    bridge.PumpOnce(&UdsHandler).await;
+
+    let vecSent = Sent(&handle);
+    assert_eq!(
+        &vecSent[0].1[0..3],
+        &[0x30, 0x00, 0x00],
+        "BlockSize 0 must be what goes out"
+    );
+    assert!(
+        vecSent.len() >= 2,
+        "the request must be answered, not abandoned: {vecSent:02X?}"
+    );
+    // The ECU does not declare 0x27, so it refuses the service — and that refusal is the
+    // proof: it could only be produced by a request that reassembled whole and reached the
+    // ECU. A lost frame abandons the message and sends nothing at all.
+    assert_eq!(
+        &vecSent[1].1[0..4],
+        &[0x03, 0x7F, 0x27, 0x11],
+        "the whole 386-byte request must have reassembled"
+    );
+}
+
+#[tokio::test]
+async fn a_link_that_cannot_carry_the_bus_is_not_promised_unpaced_delivery() {
+    // BlockSize 0 is honest on a fast link and a broken promise on a slow one. 115200 baud
+    // carries about 426 SLCAN lines a second; a 500 kbit/s bus delivers about 3700 frames. An
+    // ECU asking for no pacing at all over that gap loses the middle of every long request, so
+    // the bridge advertises the slowest separation time the link *can* honour instead.
+    let arcSimulation = BuildSimulation();
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let timing = EcuTiming {
+            m_u8IsoTpBlockSize: 0,
+            m_byIsoTpSeparationTimeMin: 0,
+            ..EcuTiming::default()
+        };
+        simulation
+            .SetEcuTiming(EcuKey::Can(0x7E0), timing)
+            .expect("the ECU");
+    }
+
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, arcSimulation).WithLinkCapacity(115_200, 500_000);
+
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x10, 0x14, 0x2E, 0xF1, 0x90, b'1', b'H', b'G'],
+    ));
+    bridge.PumpOnce(&UdsHandler).await;
+
+    let vecSent = Sent(&handle);
+    assert_eq!(vecSent[0].1[0], 0x30, "a flow control is still owed");
+    assert_eq!(
+        vecSent[0].1[1], 0x00,
+        "the BlockSize the operator chose is kept"
+    );
+    assert!(
+        vecSent[0].1[2] >= 3,
+        "an STmin the link can honour must be advertised, got {:02X}",
+        vecSent[0].1[2]
+    );
+}
+
+#[tokio::test]
+async fn a_link_with_room_to_spare_is_left_alone() {
+    // The clamp must not fire where it is not needed, or a fast link is slowed for nothing.
+    let capacity = bridge::LinkCapacity::New(1_000_000, 500_000);
+    assert_eq!(
+        capacity.SafeSeparationTime(),
+        None,
+        "1 Mbaud carries {} frames/s against the bus's {}",
+        capacity.m_uLinkFramesPerSecond,
+        capacity.m_uBusFramesPerSecond
+    );
+
+    // And an operator who stated a rate is obeyed, not second-guessed.
+    let arcSimulation = BuildSimulation();
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let timing = EcuTiming {
+            m_u8IsoTpBlockSize: 4,
+            ..EcuTiming::default()
+        };
+        simulation
+            .SetEcuTiming(EcuKey::Can(0x7E0), timing)
+            .expect("the ECU");
+    }
+
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, arcSimulation).WithLinkCapacity(115_200, 500_000);
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x10, 0x14, 0x2E, 0xF1, 0x90, b'1', b'H', b'G'],
+    ));
+    bridge.PumpOnce(&UdsHandler).await;
+
+    let vecSent = Sent(&handle);
+    assert_eq!(&vecSent[0].1[0..3], &[0x30, 0x04, 0x00]);
+}

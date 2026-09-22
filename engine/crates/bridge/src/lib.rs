@@ -91,6 +91,11 @@ pub struct CanBridge {
     m_vecDeferred: Vec<CanFrame>,
     m_arcStats: Arc<BridgeStats>,
     m_startedAt: Instant,
+    /// What the link between host and adapter can carry, when that is known.
+    ///
+    /// Used to refuse to advertise a pacing the link cannot honour. `None` for a bus with no
+    /// such limit — an in-memory one, or a pseudo-terminal.
+    m_optLinkCapacity: Option<LinkCapacity>,
     /// The simulation's configuration generation these endpoints were built from. Compared
     /// once per poll so an ECU added, removed or re-timed while the link is up reaches the
     /// wire without the operator having to stop and restart it.
@@ -114,10 +119,23 @@ impl CanBridge {
             m_vecDeferred: Vec::new(),
             m_arcStats: Arc::new(BridgeStats::default()),
             m_startedAt: Instant::now(),
+            m_optLinkCapacity: None,
             m_u64EndpointGeneration: 0,
         };
         bridge.RebuildEndpoints();
         bridge
+    }
+
+    /// Tell the bridge what the link to the adapter can carry.
+    ///
+    /// Without this the bridge advertises exactly what each ECU asks for, which is right when
+    /// nothing is in the way. With it, an ECU asking for no pacing at all on a link that cannot
+    /// carry the bus unpaced is given the slowest pacing the link does support — see
+    /// [`LinkCapacity::SafeSeparationTime`].
+    pub fn WithLinkCapacity(mut self, u32SerialBaud: u32, u32CanBitrateBps: u32) -> Self {
+        self.m_optLinkCapacity = Some(LinkCapacity::New(u32SerialBaud, u32CanBitrateBps));
+        self.RebuildEndpoints();
+        self
     }
 
     /// Attach something that wants to see every frame crossing this bridge.
@@ -165,8 +183,8 @@ impl CanBridge {
 
             // Flow control is per ECU, not per link: each one declares how fast it is willing
             // to be sent a multi-frame request, exactly as a real ECU does.
-            let paramsForEcu = self.ParametersFor(runningEcu.Timing());
-            WarnIfPacingCannotWork(runningEcu.Config().m_strName.as_str(), paramsForEcu);
+            let paramsForEcu =
+                self.PacedForLink(runningEcu.Config().m_strName.as_str(), runningEcu.Timing());
 
             mapEndpoints.insert(
                 u32RequestCanId,
@@ -209,6 +227,51 @@ impl CanBridge {
             m_u8BlockSize: timing.m_u8IsoTpBlockSize,
             m_bySeparationTimeMin: timing.m_byIsoTpSeparationTimeMin,
             m_optByPaddingByte: self.m_params.m_optByPaddingByte,
+        }
+    }
+
+    /// One ECU's flow control, with the link's own limit applied when it has one.
+    ///
+    /// Only "no pacing at all" is overridden. An operator who set a BlockSize or an STmin has
+    /// stated a rate and is obeyed; `0/0` is not a rate, it is the absence of one, and over a
+    /// link that cannot carry the bus it means the middle of every long request is lost.
+    /// Advertising it is the server promising something it cannot keep.
+    fn PacedForLink(
+        &self,
+        strEcuName: &str,
+        timing: core_domain::model::EcuTiming,
+    ) -> IsoTpParameters {
+        let params = self.ParametersFor(timing);
+
+        let bAsksForNoPacing = params.m_u8BlockSize == 0 && params.m_bySeparationTimeMin == 0;
+        if !bAsksForNoPacing {
+            return params;
+        }
+
+        let capacity = match self.m_optLinkCapacity {
+            Some(capacity) => capacity,
+            // No known limit: nothing is in the way, so ask for nothing.
+            None => return params,
+        };
+
+        let byNeeded = match capacity.SafeSeparationTime() {
+            Some(byNeeded) => byNeeded,
+            None => return params,
+        };
+
+        tracing::warn!(
+            ecu = %strEcuName,
+            linkFramesPerSecond = capacity.m_uLinkFramesPerSecond,
+            busFramesPerSecond = capacity.m_uBusFramesPerSecond,
+            stMinMs = byNeeded,
+            "this ECU asks a tester for no pacing, which this link cannot carry; advertising \
+             the slowest separation time it can honour instead. Set a BlockSize or an STmin to \
+             choose your own, or raise the host link speed"
+        );
+
+        IsoTpParameters {
+            m_bySeparationTimeMin: byNeeded,
+            ..params
         }
     }
 
@@ -521,24 +584,54 @@ impl CanBridge {
     }
 }
 
-/// Say so when an ECU asks a tester for more than a serial link is likely to carry.
+/// How fast frames can cross each side of the bridge.
 ///
-/// BlockSize 0 means "send every ConsecutiveFrame back to back". That is the fastest setting
-/// and the right one over a link with bandwidth to spare — but an SLCAN dongle on a 115200 baud
-/// line carries roughly an eighth of what a 500 kbit/s bus delivers, so the middle of every
-/// long request is lost and the message is abandoned with a sequence error. The engine honours
-/// the setting either way; this is the only warning that says the setting is the reason.
-fn WarnIfPacingCannotWork(strEcuName: &str, params: IsoTpParameters) {
-    if params.m_u8BlockSize != 0 || params.m_bySeparationTimeMin != 0 {
-        return;
+/// The two numbers that matter are frames per second, not bits: a CAN frame and the SLCAN line
+/// that carries it are wildly different sizes, and it is the mismatch between the rates that
+/// loses frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkCapacity {
+    /// Frames per second the host-to-adapter link can carry.
+    pub m_uLinkFramesPerSecond: usize,
+    /// Frames per second the CAN bus can deliver, back to back.
+    pub m_uBusFramesPerSecond: usize,
+}
+
+/// Bytes in the SLCAN line for a 29-bit frame with eight data bytes: `T`, eight identifier
+/// characters, one length digit, sixteen data characters and the terminator.
+const c_uSlcanLineBytes: usize = 27;
+/// Bits per serial byte at 8N1 — the start and stop bits are why a byte costs ten, not eight.
+const c_uSerialBitsPerByte: usize = 10;
+/// Bits on the wire for a 29-bit CAN frame carrying eight data bytes, stuffing included.
+const c_uCanBitsPerFrame: usize = 135;
+
+impl LinkCapacity {
+    /// Work out both rates from the two speeds.
+    pub fn New(u32SerialBaud: u32, u32CanBitrateBps: u32) -> Self {
+        LinkCapacity {
+            m_uLinkFramesPerSecond: (u32SerialBaud as usize)
+                / (c_uSerialBitsPerByte * c_uSlcanLineBytes),
+            m_uBusFramesPerSecond: (u32CanBitrateBps as usize) / c_uCanBitsPerFrame,
+        }
     }
 
-    tracing::warn!(
-        ecu = %strEcuName,
-        "BlockSize 0 asks the tester to send every frame without pausing; over a slow serial \
-         adapter that loses the middle of a long request. Raise BlockSize, or set STmin, if \
-         inbound messages are abandoned with a sequence error"
-    );
+    /// The separation time a sender must leave for this link to keep up, or `None` when the
+    /// link is fast enough that no pacing is needed.
+    ///
+    /// Rounded up to whole milliseconds, which is all an STmin below `0xF1` can express, and
+    /// then given one millisecond of headroom — landing exactly on the limit leaves nothing for
+    /// a busy host, and the cost of being one millisecond slow is far smaller than the cost of
+    /// losing a frame.
+    pub fn SafeSeparationTime(self) -> Option<u8> {
+        if self.m_uLinkFramesPerSecond == 0
+            || self.m_uLinkFramesPerSecond >= self.m_uBusFramesPerSecond
+        {
+            return None;
+        }
+
+        let uMillisecondsPerFrame = 1000usize.div_ceil(self.m_uLinkFramesPerSecond);
+        Some((uMillisecondsPerFrame + 1).min(0x7F) as u8)
+    }
 }
 
 /// True for a flow-control frame: the PCI type is 3.
