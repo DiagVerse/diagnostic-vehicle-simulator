@@ -310,8 +310,8 @@
       <h1>CAN stack: what is implemented,<br>and what it does</h1>
     </div>
     <dl>
-      <dt>engine</dt><dd>e3ead21</dd>
-      <dt>tests</dt><dd>377 across 55 suites</dd>
+      <dt>engine</dt><dd>b95a466</dd>
+      <dt>tests</dt><dd>394 across 57 suites</dd>
       <dt>sweep</dt><dd>48 / 48 on P33C</dd>
       <dt>date</dt><dd>23 Sep 2026</dd>
     </dl>
@@ -323,7 +323,7 @@
     not recalled.</strong></p>
 
   <div class="verdicts">
-    <div class="verdict good"><span class="n">377</span><span class="k">tests passing</span></div>
+    <div class="verdict good"><span class="n">394</span><span class="k">tests passing</span></div>
     <div class="verdict good"><span class="n">48/48</span><span class="k">feature sweep on P33C</span></div>
     <div class="verdict good"><span class="n">0.43s</span><span class="k">to parse 8&nbsp;MB of CANoe log</span></div>
     <div class="verdict"><span class="n">4 &rarr; 0</span><span class="k">false ECUs from that log</span></div>
@@ -347,9 +347,25 @@
             <td>CAN frame</td>
             <td class="id">ISO 11898</td>
             <td><span class="tag partial">partial</span></td>
-            <td>Classic CAN, 11-bit and 29-bit identifiers, DLC 0–8. <strong>CAN-FD is modelled
-              in the frame type but never produced</strong> — the SLCAN path always sets it false.
-              Error and remote frames are not simulated.</td>
+            <td>Classic CAN, 11-bit and 29-bit identifiers, DLC 0–8, data and remote frames.
+              <strong>CAN-FD is modelled in the frame type but never produced</strong> — the
+              SLCAN path always sets it false. Error frames are not transmitted.</td>
+          </tr>
+          <tr data-state="full">
+            <td>Fault confinement</td>
+            <td class="id">ISO 11898-1 §12.1</td>
+            <td><span class="tag full">implemented</span></td>
+            <td>Transmit and receive error counters with the standard's penalties and
+              thresholds, and the three states they produce. A bus-off ECU puts nothing on the
+              wire, so a request to it times out rather than being refused.</td>
+          </tr>
+          <tr data-state="full">
+            <td>Bus load</td>
+            <td class="id">ISO 11898-1 §10.4</td>
+            <td><span class="tag full">implemented</span></td>
+            <td>Computed from frame bit lengths counted field by field, per second, over two
+              minutes. Reported as a range: bit stuffing cannot be recovered from a decoded
+              frame, so the nominal figure is a floor and the worst case bounds it.</td>
           </tr>
           <tr data-state="full">
             <td>ISO-TP</td>
@@ -586,12 +602,14 @@
       <li><strong>Raising a dongle's UART.</strong> Detection finds the rate an adapter is
         <em>already</em> running at; it cannot make one faster. The MINI2024042 answers no identity
         command, so its speed falls back to an assumed 115 200 — settable by hand in the Hardware tab.</li>
-      <li><strong>Error and remote frames</strong>, and bus-off simulation.</li>
+      <li><strong>Error frames on the wire.</strong> The fault-confinement state machine is
+        implemented and a bus-off ECU really does fall silent, but no error frame is transmitted
+        — a standard SLCAN adapter offers no way to send one.</li>
     </ul>
   </section>
 
   <footer>
-    Audited at e3ead21 · engine 377 tests / 55 suites · sweep <span class="mono">scripts/feature-sweep.py</span> 48/48 · CANoe sample 127,638 lines
+    Audited at b95a466 · engine 394 tests / 57 suites · sweep <span class="mono">scripts/feature-sweep.py</span> 48/48 · CANoe sample 127,638 lines
   </footer>
 
 </div>
