@@ -473,6 +473,10 @@ impl CanBridge {
             RoutingOutcome::NoTarget
             | RoutingOutcome::Stopped
             | RoutingOutcome::Silenced { .. } => return,
+            // Cannot arise on CAN: a tester has no way to put a functional request longer
+            // than a SingleFrame on the wire, so there is nothing here to refuse. The refusal
+            // belongs to DoIP, where the length is not limited by the link that carried it.
+            RoutingOutcome::TooLargeForSubnetwork { .. } => return,
         };
 
         // Collect what to send as each step comes due, then segment it. The plan's timing is

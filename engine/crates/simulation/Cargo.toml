@@ -9,6 +9,9 @@ description = "Simulation use case: hold a loaded vehicle and route UDS requests
 [dependencies]
 can.workspace = true
 core-domain.workspace = true
+# For the one thing routing needs from ISO 13400-2: which target addresses are a functional
+# group rather than an ECU. The codec itself stays in the DoIP layer.
+doip.workspace = true
 application.workspace = true
 ecu.workspace = true
 reconstruct.workspace = true

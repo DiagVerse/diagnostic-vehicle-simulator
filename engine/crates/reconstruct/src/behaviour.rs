@@ -171,6 +171,22 @@ pub(crate) fn ApplySecurityAccess(ecu: &mut Ecu, vecRequest: &[u8], vecResponse:
 /// single-frame header would otherwise be taken for a diagnostic request and pollute
 /// correlation. The high range 0x83..=0x88 (AccessTimingParameter, ControlDTCSetting,
 /// LinkControl, …) is included; it appears in real flashing sequences.
+/// NRC 0x78 requestCorrectlyReceived-ResponsePending (ISO 14229-1 Annex A.1).
+pub(crate) const c_byNrcResponsePending: u8 = 0x78;
+
+/// True for an interim "still working" answer rather than a final one.
+///
+/// It matters to correlation because `7F <sid> 78` looks exactly like a refusal and is not one:
+/// the real answer is still coming. Treating it as final retires the pending request, and the
+/// response that follows then matches nothing and is dropped — so every read that went through
+/// a ResponsePending, which on a real ECU is most of them, contributed a "service supported"
+/// mark and no value at all.
+pub(crate) fn IsResponsePending(vecResponse: &[u8]) -> bool {
+    vecResponse.len() >= 3
+        && vecResponse[0] == c_byNegativeResponseSid
+        && vecResponse[2] == c_byNrcResponsePending
+}
+
 pub(crate) fn IsRequestSid(byFirst: u8) -> bool {
     c_arrRequestSids.contains(&byFirst)
 }

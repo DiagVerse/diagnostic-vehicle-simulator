@@ -3,6 +3,7 @@
 //! This half owns the network and the clock and makes no protocol decisions — everything it
 //! sends comes from `DoIpEntity`, which it drives.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,7 @@ use application::ProtocolHandler;
 use doip::header::{c_uHeaderLength, HeaderLimits, ReadHeader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Notify;
 
 use crate::entity::DoIpEntity;
 
@@ -74,13 +76,18 @@ impl DoIpServer {
 
         tracing::info!(tcp = %tcpAddress, "DoIP entity listening");
 
+        // Shared with every connection task so an elapsed timer can reach the socket it
+        // belongs to. Created before the spawns, which both need it.
+        let closeSignals: CloseSignals = Arc::new(Mutex::new(BTreeMap::new()));
+
         let taskUdp = tokio::spawn(RunUdp(Arc::clone(&arcEntity), udpSocket));
         let taskTcp = tokio::spawn(RunTcp(
             Arc::clone(&arcEntity),
             tcpListener,
             Arc::clone(&protocol),
+            Arc::clone(&closeSignals),
         ));
-        let taskTick = tokio::spawn(RunTick(Arc::clone(&arcEntity)));
+        let taskTick = tokio::spawn(RunTick(Arc::clone(&arcEntity), Arc::clone(&closeSignals)));
 
         Ok(ServerHandle {
             m_taskUdp: taskUdp,
@@ -130,6 +137,7 @@ async fn RunTcp(
     arcEntity: Arc<Mutex<DoIpEntity>>,
     listener: TcpListener,
     protocol: Arc<dyn ProtocolHandler>,
+    closeSignals: CloseSignals,
 ) {
     // Sockets are numbered rather than keyed by peer address: a tester may open several
     // connections from one machine, and the standard keys a connection on the socket, not the
@@ -158,6 +166,7 @@ async fn RunTcp(
             stream,
             u64Socket,
             Arc::clone(&protocol),
+            Arc::clone(&closeSignals),
         ));
     }
 }
@@ -168,25 +177,48 @@ async fn ServeConnection(
     mut stream: TcpStream,
     u64Socket: u64,
     protocol: Arc<dyn ProtocolHandler>,
+    closeSignals: CloseSignals,
 ) {
     let mut vecPending: Vec<u8> = Vec::new();
     let mut arrChunk = vec![0u8; 4096];
 
+    let notifyClose = Arc::new(Notify::new());
+    closeSignals
+        .lock()
+        .expect("DoIP close signals mutex poisoned")
+        .insert(u64Socket, Arc::clone(&notifyClose));
+
     loop {
-        let uRead = match stream.read(&mut arrChunk).await {
-            Ok(0) => break,
-            Ok(uRead) => uRead,
-            Err(error) => {
-                tracing::debug!(%error, socket = u64Socket, "DoIP connection read failed");
+        let uRead = tokio::select! {
+            // Biased so a socket whose timer has already elapsed closes even when the peer is
+            // simultaneously sending: the timer decided this connection is over.
+            biased;
+
+            _ = notifyClose.notified() => {
+                tracing::debug!(socket = u64Socket, "DoIP connection closed by its inactivity timer");
                 break;
             }
+            result = stream.read(&mut arrChunk) => match result {
+                Ok(0) => break,
+                Ok(uRead) => uRead,
+                Err(error) => {
+                    tracing::debug!(%error, socket = u64Socket, "DoIP connection read failed");
+                    break;
+                }
+            },
         };
         vecPending.extend_from_slice(&arrChunk[..uRead]);
 
         // TCP is a stream: the generic header's length field is the only framing there is, so
         // messages can arrive split across segments or several at once. Both happen with real
         // testers, and assuming one message per segment is a listed trap.
-        while let Some(uMessageLength) = NextMessageLength(&vecPending) {
+        // Re-read each pass: the limits are settable while the entity is running.
+        let limits = arcEntity
+            .lock()
+            .expect("DoIP entity mutex poisoned")
+            .Limits();
+
+        while let Some(uMessageLength) = NextMessageLength(&vecPending, limits) {
             if vecPending.len() < uMessageLength {
                 break;
             }
@@ -218,11 +250,22 @@ async fn ServeConnection(
     }
 
     tracing::info!(socket = u64Socket, "DoIP connection closed");
+    closeSignals
+        .lock()
+        .expect("DoIP close signals mutex poisoned")
+        .remove(&u64Socket);
     CloseConnection(&arcEntity, u64Socket);
 }
 
 /// How many bytes the next complete message occupies, if its header has arrived.
-fn NextMessageLength(vecPending: &[u8]) -> Option<usize> {
+///
+/// Takes the entity's *configured* limits rather than the defaults. Framing against a different
+/// maximum from the one the entity enforces desynchronises the stream: a message inside the
+/// advertised size is framed as though it were oversized, only its header is consumed, and the
+/// body is then read as the next header — whose first two bytes are a source address rather
+/// than a version pair, so the connection dies with a generic header NACK about a message
+/// nobody sent.
+fn NextMessageLength(vecPending: &[u8], limits: HeaderLimits) -> Option<usize> {
     if vecPending.len() < c_uHeaderLength {
         return None;
     }
@@ -234,7 +277,6 @@ fn NextMessageLength(vecPending: &[u8]) -> Option<usize> {
 
     // Refuse to wait for a body larger than anything this entity accepts; the header handler
     // will reject it, and the connection is not going to recover.
-    let limits = HeaderLimits::default();
     if u32PayloadLength > limits.m_u32MaxDataSize && ReadHeader(vecPending, limits).is_err() {
         return Some(c_uHeaderLength.min(vecPending.len()));
     }
@@ -242,8 +284,16 @@ fn NextMessageLength(vecPending: &[u8]) -> Option<usize> {
     Some(c_uHeaderLength + u32PayloadLength as usize)
 }
 
-/// Advance every connection's inactivity clock.
-async fn RunTick(arcEntity: Arc<Mutex<DoIpEntity>>) {
+/// How a socket is told to close from outside the task reading it.
+///
+/// An inactivity timer elapsing has to close the TCP connection, and the task that could close
+/// it is parked in `read()` — which a peer that has gone quiet will never return from. Waiting
+/// for the read is exactly the mistake: a silent peer is the case the timer exists for. So the
+/// reading task selects on this alongside its read.
+pub type CloseSignals = Arc<Mutex<BTreeMap<u64, Arc<Notify>>>>;
+
+/// Advance every connection's inactivity clock, closing the sockets that have run out.
+async fn RunTick(arcEntity: Arc<Mutex<DoIpEntity>>, closeSignals: CloseSignals) {
     let mut interval = tokio::time::interval(c_tickInterval);
 
     loop {
@@ -254,9 +304,20 @@ async fn RunTick(arcEntity: Arc<Mutex<DoIpEntity>>) {
             .Tick(c_tickInterval.as_millis() as u64);
 
         for u64Socket in vecExpired {
-            // The connection is dropped from the table here; the socket itself closes when its
-            // read returns, which the peer will cause by sending nothing.
-            tracing::info!(socket = u64Socket, "closing an inactive DoIP connection");
+            // ISO 13400-2 REQ 3.DoIP-086 and 3.DoIP-082: an elapsed inactivity timer closes the
+            // socket and returns it to the listen state. Dropping the entry alone used to leave
+            // the TCP connection ESTABLISHED and permanently deaf — every later message found no
+            // connection and was answered with silence, so a tester that activated routing a
+            // second too late waited out its own timeout with no FIN to tell it to reconnect.
+            let optNotify = closeSignals
+                .lock()
+                .expect("DoIP close signals mutex poisoned")
+                .remove(&u64Socket);
+
+            if let Some(notify) = optNotify {
+                tracing::info!(socket = u64Socket, "closing an inactive DoIP connection");
+                notify.notify_one();
+            }
         }
     }
 }

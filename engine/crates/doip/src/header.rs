@@ -123,6 +123,21 @@ impl Default for HeaderLimits {
 /// `bIsHeaderOnly` says whether the caller has the payload yet. On UDP the whole datagram
 /// arrives at once; on TCP the header is read first and the body follows, which is why the
 /// length check cannot wait for it.
+/// The protocol versions ISO 13400-2 Table 16 defines.
+///
+/// `0x00` and `0x04`–`0xFE` are reserved, so a header carrying one is not a header this entity
+/// can act on however well-formed its complement is. `0xFF` is the placeholder a tester uses in
+/// a vehicle identification request before it knows what the vehicle speaks.
+pub fn IsKnownProtocolVersion(byVersion: u8) -> bool {
+    matches!(
+        byVersion,
+        c_byProtocolVersion2010
+            | c_byProtocolVersion2012
+            | c_byProtocolVersion2019
+            | c_byProtocolVersionDefault
+    )
+}
+
 pub fn ReadHeader(arrBytes: &[u8], limits: HeaderLimits) -> Result<GenericHeader, HeaderNack> {
     if arrBytes.len() < c_uHeaderLength {
         // Too short to even carry a version pair; nothing else can be said about it.
@@ -134,7 +149,13 @@ pub fn ReadHeader(arrBytes: &[u8], limits: HeaderLimits) -> Result<GenericHeader
 
     let byVersion = arrBytes[0];
     let byInverse = arrBytes[1];
-    if byInverse != !byVersion {
+
+    // Both halves of the synchronisation pattern, and Table 16 enumerates the legal versions
+    // rather than allowing any complementary pair. Checking only the complement accepted
+    // version 0x55 / inverse 0xAA — a self-consistent pattern of a version that does not exist
+    // — and the entity then answered a version it had never negotiated. A conformance suite
+    // sends exactly that.
+    if byInverse != !byVersion || !IsKnownProtocolVersion(byVersion) {
         return Err(HeaderNack::IncorrectPatternFormat {
             byVersion,
             byInverse,

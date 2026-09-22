@@ -688,6 +688,36 @@ pub async fn PostSimulationRequest(
                 silenced_reason: Some(strReason),
             }));
         }
+        RoutingOutcome::TooLargeForSubnetwork {
+            uRequestBytes,
+            uMaxBytes,
+            strEcuName,
+        } => {
+            // Refused rather than silent: the DoIP entity answers this with NACK 0x04, and the
+            // operator driving it from the UI needs the same answer for the same reason.
+            let strReason = format!(
+                "a functional request of {uRequestBytes} bytes is longer than the {uMaxBytes} a \
+                 CAN sub-network can carry, and '{strEcuName}' is on one"
+            );
+            PublishExchange(
+                &state,
+                u32RequestCanId,
+                &vecRequest,
+                "refused",
+                false,
+                &[],
+                Some(strReason.clone()),
+            );
+            return Ok(Json(SimulationRequestResultDto {
+                can_id_hex: FormatCanId(u32RequestCanId),
+                request_hex: FormatHex(&vecRequest),
+                addressing: "refused".to_string(),
+                routed: false,
+                responses: Vec::new(),
+                silenced_ecu_name: Some(strEcuName),
+                silenced_reason: Some(strReason),
+            }));
+        }
         RoutingOutcome::Handled(vecResponses) => vecResponses,
     };
 
@@ -2190,6 +2220,7 @@ mod emitter_tests {
             m_strEcuName: "Engine_ECU".to_string(),
             m_u32RequestCanId: 0x7E0,
             m_u32ResponseCanId: 0x7E8,
+            m_optU16LogicalAddress: None,
             m_vecResponse: vec![0x62, 0xF1, 0x90],
             m_bySession: 0x01,
             m_bIsSecurityUnlocked: false,

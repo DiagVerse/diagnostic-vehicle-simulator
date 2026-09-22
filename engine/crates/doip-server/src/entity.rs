@@ -103,7 +103,7 @@ impl DoIpEntity {
     ///
     /// Derived from the settings rather than fixed, so the maximum data size a tester is *told*
     /// and the one actually enforced cannot disagree — a conformance test cross-checks them.
-    fn Limits(&self) -> HeaderLimits {
+    pub(crate) fn Limits(&self) -> HeaderLimits {
         let u32MaxDataSize = self.Settings().m_u32MaxDataSize;
         HeaderLimits {
             m_u32MaxDataSize: u32MaxDataSize,
@@ -218,6 +218,17 @@ impl DoIpEntity {
 
             // Everything else belongs on the TCP data socket, so it is not a message this port
             // knows how to answer.
+            // A message this entity would itself send is not a request. Answering one starts
+            // an exchange of negative acknowledgements between two entities that ends only when
+            // one of them stops.
+            _ if header.m_payloadType.IsSentByAnEntity() => {
+                tracing::debug!(
+                    payloadType = format!("{:04X}", header.m_payloadType.Code()),
+                    "ignoring a message only a DoIP entity sends"
+                );
+                Reaction::Silence()
+            }
+
             _ => self.NackReaction(
                 byReplyVersion,
                 HeaderNack::UnknownPayloadType {
@@ -278,6 +289,17 @@ impl DoIpEntity {
                     // Nothing is registered here yet, so there is no address to answer with.
                     None => Reaction::Silence(),
                 }
+            }
+
+            // A message this entity would itself send is not a request. Answering one starts
+            // an exchange of negative acknowledgements between two entities that ends only when
+            // one of them stops.
+            _ if header.m_payloadType.IsSentByAnEntity() => {
+                tracing::debug!(
+                    payloadType = format!("{:04X}", header.m_payloadType.Code()),
+                    "ignoring a message only a DoIP entity sends"
+                );
+                Reaction::Silence()
             }
 
             _ => self.NackReaction(
@@ -447,6 +469,28 @@ impl DoIpEntity {
                 DiagnosticNack::TargetUnreachable,
             ),
 
+            // A functional request longer than a sub-network it must cross can carry
+            // (REQ 7.DoIP-072 AL). The message is discarded, not truncated and not partly
+            // delivered — half a broadcast is worse than none.
+            RoutingOutcome::TooLargeForSubnetwork {
+                uRequestBytes,
+                uMaxBytes,
+                strEcuName,
+            } => {
+                tracing::info!(
+                    targetAddress = format!("{:04X}", request.m_u16TargetAddress),
+                    requestBytes = uRequestBytes,
+                    maxBytes = uMaxBytes,
+                    ecu = %strEcuName,
+                    "refusing a functional request that a sub-network cannot carry"
+                );
+                self.DiagnosticNackReaction(
+                    byReplyVersion,
+                    &request,
+                    DiagnosticNack::MessageTooLarge,
+                )
+            }
+
             // The ECU exists and the request was routed to it; it simply is not answering.
             // That is an acknowledgement followed by silence — exactly what a real gateway
             // produces, and what leaves the tester to time out on P2 as it should.
@@ -468,9 +512,17 @@ impl DoIpEntity {
                     // Every step of the plan is its own DoIP diagnostic message, including each
                     // ResponsePending. Concatenating them into one payload would hand the
                     // tester something it cannot parse as UDS.
+                    // The answer comes *from the ECU*, which for a functionally addressed
+                    // request is not the address the request was sent to. Echoing the target
+                    // back would tell the tester the functional group answered, which no ECU
+                    // did — and would make several ECUs' answers indistinguishable.
+                    let u16AnswerFrom = response
+                        .m_optU16LogicalAddress
+                        .unwrap_or(request.m_u16TargetAddress);
+
                     for step in &response.m_plan.m_vecSteps {
                         let answer = DiagnosticMessage {
-                            m_u16SourceAddress: request.m_u16TargetAddress,
+                            m_u16SourceAddress: u16AnswerFrom,
                             m_u16TargetAddress: request.m_u16SourceAddress,
                             m_vecUserData: step.m_vecBytes.clone(),
                         };

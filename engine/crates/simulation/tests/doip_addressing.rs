@@ -204,3 +204,152 @@ fn two_ecus_claiming_one_logical_address_are_refused() {
         "the error should name the contested address, got: {error}"
     );
 }
+
+#[test]
+fn a_functional_group_address_reaches_the_whole_vehicle_over_doip() {
+    // ISO 13400-2 Table 13 gives 0xE000-0xEFFF to functional group addresses, and Table 22's
+    // worked example is a tester reading an InfoType from the whole vehicle at 0xE000. Before
+    // this the address matched no ECU and the entity answered NACK 0x03, telling the tester
+    // no such target existed — when every ECU in the vehicle was one.
+    let mut simulation = LoadMixed();
+
+    let outcome = simulation.ProcessByLogicalAddress(0xE000, &[0x22, 0xF1, 0x8C], &UdsHandler);
+    let vecResponses = match outcome {
+        RoutingOutcome::Handled(vecResponses) => vecResponses,
+        other => panic!("expected the broadcast to be handled, got {other:?}"),
+    };
+
+    // All three: the gateway and the airbag directly, the engine through the gateway onto the
+    // powertrain CAN — which is exactly the routing REQ 7.DoIP-072 AL's example describes.
+    let mut vecNames: Vec<&str> = vecResponses
+        .iter()
+        .map(|response| response.m_strEcuName.as_str())
+        .collect();
+    vecNames.sort();
+    assert_eq!(vecNames, vec!["Airbag", "Engine", "Gateway"]);
+
+    for response in &vecResponses {
+        assert_eq!(
+            &response.m_vecResponse[..3],
+            &[0x62, 0xF1, 0x8C],
+            "'{}' answered the broadcast",
+            response.m_strEcuName
+        );
+    }
+}
+
+#[test]
+fn each_answer_to_a_broadcast_names_its_own_logical_address() {
+    // The answers must be distinguishable. An ECU that echoed the group address back as its
+    // source would tell the tester "the group replied", which no ECU did — and would make
+    // several ECUs' answers identical in the one field that separates them.
+    let mut simulation = LoadMixed();
+
+    let outcome = simulation.ProcessByLogicalAddress(0xE000, &[0x22, 0xF1, 0x8C], &UdsHandler);
+    let vecResponses = match outcome {
+        RoutingOutcome::Handled(vecResponses) => vecResponses,
+        other => panic!("expected the broadcast to be handled, got {other:?}"),
+    };
+
+    let FindAddress = |strName: &str| {
+        vecResponses
+            .iter()
+            .find(|response| response.m_strEcuName == strName)
+            .expect("the ECU answered")
+            .m_optU16LogicalAddress
+    };
+    assert_eq!(FindAddress("Gateway"), Some(0x0010));
+    assert_eq!(FindAddress("Airbag"), Some(0x1030));
+    assert_eq!(
+        FindAddress("Engine"),
+        None,
+        "a CAN-only ECU has no logical address to answer from; the entity fills in the \
+         request's target rather than inventing one"
+    );
+}
+
+#[test]
+fn a_functional_request_too_long_for_can_is_refused_rather_than_half_delivered() {
+    // REQ 7.DoIP-072 AL, with the standard's own example: a functional request crossing a CAN
+    // sub-network may be a SingleFrame only, because there is no single peer to flow-control
+    // it. Delivering it to the ECUs that *could* have taken it would leave the tester with
+    // part of a broadcast and no way to know which part.
+    let mut simulation = LoadMixed();
+
+    let vecLongRequest = vec![0x22, 0xF1, 0x8C, 0xF1, 0x90, 0xF1, 0x91, 0xF1];
+    assert!(vecLongRequest.len() > 7);
+
+    match simulation.ProcessByLogicalAddress(0xE000, &vecLongRequest, &UdsHandler) {
+        RoutingOutcome::TooLargeForSubnetwork {
+            uRequestBytes,
+            uMaxBytes,
+            strEcuName,
+        } => {
+            assert_eq!(uRequestBytes, 8);
+            assert_eq!(uMaxBytes, 7);
+            assert_eq!(strEcuName, "Engine", "the ECU that is only on CAN");
+        }
+        other => panic!("expected the request to be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_functional_request_is_not_length_limited_when_nothing_has_to_cross_can() {
+    // The limit belongs to the sub-network, not to functional addressing. A vehicle the entity
+    // reaches entirely over Ethernet has no SingleFrame to fit into, and refusing a long
+    // request there would be inventing a constraint the transport does not have.
+    const c_strEthernetOnly: &str = r#"{
+      "simfileVersion": 2,
+      "vehicle": "Ethernet-only vehicle",
+      "networks": [
+        { "id": "eth", "name": "Diagnostic Ethernet", "kind": "Ethernet", "entryPoint": true }
+      ],
+      "ecus": [
+        { "name": "Airbag", "network": "eth",
+          "doip": { "logicalAddress": "0x1030" },
+          "sessions": ["default", "extended"],
+          "dids": { "F18C": { "text": "SIM-SRS-0001" } } }
+      ]
+    }"#;
+
+    let mut simulation = SimulationService::New();
+    simulation
+        .LoadFromSimFileText(c_strEthernetOnly)
+        .expect("the Ethernet-only simfile should load");
+    simulation.Start();
+
+    let vecLongRequest = vec![0x22, 0xF1, 0x8C, 0xF1, 0x90, 0xF1, 0x91, 0xF1];
+    match simulation.ProcessByLogicalAddress(0xE000, &vecLongRequest, &UdsHandler) {
+        RoutingOutcome::Handled(vecResponses) => {
+            assert_eq!(vecResponses.len(), 1, "the one ECU processed it");
+        }
+        other => panic!("expected the broadcast to be handled, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_broadcast_skips_an_ecu_behind_a_gateway_that_is_switched_off() {
+    // Same rule as the physical path, and for the same reason: an unpowered gateway takes
+    // everything behind it off the air. A broadcast that reached through one would be claiming
+    // a route the vehicle does not have.
+    let mut simulation = LoadMixed();
+    simulation
+        .SetEcuEnabled(EcuKey::Can(0x7E7), false)
+        .expect("the gateway can be switched off");
+
+    let outcome = simulation.ProcessByLogicalAddress(0xE000, &[0x22, 0xF1, 0x8C], &UdsHandler);
+    let vecResponses = match outcome {
+        RoutingOutcome::Handled(vecResponses) => vecResponses,
+        other => panic!("expected the broadcast to be handled, got {other:?}"),
+    };
+
+    let vecNames: Vec<&str> = vecResponses
+        .iter()
+        .map(|response| response.m_strEcuName.as_str())
+        .collect();
+    assert_eq!(
+        vecNames,
+        vec!["Airbag"],
+        "the gateway is off and the engine sits behind it"
+    );
+}

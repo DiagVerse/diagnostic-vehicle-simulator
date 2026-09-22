@@ -288,6 +288,19 @@ fn DescribeOutcome(
             Vec::new(),
             Some("no ECU listens on that identifier".to_string()),
         ),
+        RoutingOutcome::TooLargeForSubnetwork {
+            uRequestBytes,
+            uMaxBytes,
+            strEcuName,
+        } => (
+            "refused".to_string(),
+            false,
+            Vec::new(),
+            Some(format!(
+                "a functional request of {uRequestBytes} bytes is longer than the {uMaxBytes} \
+                 a CAN sub-network can carry, and '{strEcuName}' is on one"
+            )),
+        ),
         RoutingOutcome::Silenced {
             strEcuName,
             strReason,
