@@ -111,6 +111,7 @@ fn a_hardware_exchange_carries_the_decoded_request_not_only_the_frames() {
         m_strEcuName: "Engine".to_string(),
         m_u32RequestCanId: 0x7E0,
         m_u32ResponseCanId: 0x7E8,
+        m_optU16LogicalAddress: None,
         m_vecResponse: vec![0x50, 0x03],
         m_bySession: 0x03,
         m_bIsSecurityUnlocked: false,

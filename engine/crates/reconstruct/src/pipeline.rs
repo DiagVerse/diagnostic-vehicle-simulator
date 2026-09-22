@@ -140,6 +140,16 @@ fn TryApplyAsResponse(
     // A functional request is answered by every ECU that listens on the broadcast identifier,
     // so it stays outstanding for the ECUs still to answer; a physical request has exactly one
     // answer and is retired once it arrives.
+    // A ResponsePending says the answer is still coming, so the request stays outstanding and
+    // nothing is folded in yet. Retiring it here loses the real answer that follows.
+    if crate::behaviour::IsResponsePending(&pdu.m_vecBytes) {
+        tracing::trace!(
+            canId = format!("{:03X}", pdu.m_u32CanId),
+            "a ResponsePending; the request stays outstanding"
+        );
+        return true;
+    }
+
     let bIsFunctional = IsFunctionalRequestCanId(vecPending[uIndex].m_u32RequestCanId);
     let pending = if bIsFunctional {
         ClonePendingRequest(&vecPending[uIndex])

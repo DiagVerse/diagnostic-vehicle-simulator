@@ -185,3 +185,51 @@ fn traffic_in_either_direction_keeps_a_socket_alive() {
     }
     assert!(connection.IsRoutingActive());
 }
+
+#[test]
+fn traffic_does_not_keep_an_unactivated_socket_alive() {
+    // The distinction the two timers turn on, and the one this got wrong. REQ 3.DoIP-080 NL
+    // resets the *general* timer on any data; the initial timer has no such rule — clause
+    // 12.6.3 calls it "a measure against connection attempts on TCP_DATA sockets with invalid
+    // DoIP messages or without sending any data", and REQ 3.DoIP-085 NL stops it only on
+    // receipt of a valid routing activation request.
+    //
+    // Resetting it on traffic let a tester hold a socket open forever without ever activating
+    // routing — by sending alive check responses, or by sending rubbish — which is precisely
+    // what the timer exists to prevent.
+    let mut connection = Connection::New();
+
+    for _ in 0..10 {
+        connection.NoteActivity();
+        if connection.Tick(300) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        connection.State(),
+        ConnectionState::Finalize,
+        "the two seconds ran out despite the traffic"
+    );
+}
+
+#[test]
+fn activating_a_socket_starts_its_general_timer_from_zero() {
+    // A socket that spent most of its two seconds waiting must not carry that idle time over
+    // into the five-minute timer — it has just been written to, so its general timer starts
+    // fresh.
+    let mut connection = Connection::New();
+    assert!(!connection.Tick(1_900), "nearly out of initial time");
+
+    connection.ApplyRoutingActivation(
+        &Request(c_u16Tester, 0x00),
+        RoutingActivationOutcome::Activated,
+    );
+    assert!(connection.IsRoutingActive());
+
+    assert!(
+        !connection.Tick(299_000),
+        "the five minutes are counted from activation, not from connect"
+    );
+    assert!(connection.Tick(2_000), "and then they run out");
+}

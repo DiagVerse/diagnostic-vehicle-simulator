@@ -197,3 +197,121 @@ fn a_large_local_capture_reconstructs_deterministically() {
         vecBytes.len() / (1024 * 1024)
     );
 }
+
+/// A DoIP message: header plus payload, ready to concatenate into a stream.
+fn DoIpMessageBytes(u16PayloadType: u16, vecPayload: &[u8]) -> Vec<u8> {
+    let mut vecBytes = vec![0x02, 0xFD];
+    vecBytes.extend_from_slice(&u16PayloadType.to_be_bytes());
+    vecBytes.extend_from_slice(&(vecPayload.len() as u32).to_be_bytes());
+    vecBytes.extend_from_slice(vecPayload);
+    vecBytes
+}
+
+/// A diagnostic message payload: source, target, then the UDS bytes.
+fn DiagnosticPayload(u16Source: u16, u16Target: u16, vecUserData: &[u8]) -> Vec<u8> {
+    let mut vecPayload = Vec::new();
+    vecPayload.extend_from_slice(&u16Source.to_be_bytes());
+    vecPayload.extend_from_slice(&u16Target.to_be_bytes());
+    vecPayload.extend_from_slice(vecUserData);
+    vecPayload
+}
+
+/// A classic pcap holding one Ethernet/IPv4/TCP packet carrying this byte stream on port 13400.
+fn SingleTcpPacketCapture(vecStream: &[u8]) -> Vec<u8> {
+    const c_u16PortDoIp: u16 = 13400;
+    const c_uIpHeaderLength: usize = 20;
+    const c_byProtocolTcp: u8 = 6;
+
+    let mut vecTcp = Vec::new();
+    vecTcp.extend_from_slice(&c_u16PortDoIp.to_be_bytes()); // source: the entity answering
+    vecTcp.extend_from_slice(&40000u16.to_be_bytes()); // destination: the tester
+    vecTcp.extend_from_slice(&1u32.to_be_bytes()); // sequence number
+    vecTcp.extend_from_slice(&0u32.to_be_bytes()); // acknowledgement number
+    vecTcp.push(0x50); // data offset: five 32-bit words, no options
+    vecTcp.push(0x18); // PSH | ACK
+    vecTcp.extend_from_slice(&8192u16.to_be_bytes()); // window
+    vecTcp.extend_from_slice(&0u16.to_be_bytes()); // checksum, not verified by the reader
+    vecTcp.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
+    vecTcp.extend_from_slice(vecStream);
+
+    let mut vecIp = vec![0x45, 0x00];
+    let u16TotalLength = (c_uIpHeaderLength + vecTcp.len()) as u16;
+    vecIp.extend_from_slice(&u16TotalLength.to_be_bytes());
+    vecIp.extend_from_slice(&[0x00, 0x01, 0x40, 0x00, 0x40, c_byProtocolTcp, 0x00, 0x00]);
+    vecIp.extend_from_slice(&[192, 168, 0, 2]); // source: the entity
+    vecIp.extend_from_slice(&[192, 168, 0, 1]); // destination: the tester
+    vecIp.extend_from_slice(&vecTcp);
+
+    let mut vecEthernet = vec![0x00; 12];
+    vecEthernet.extend_from_slice(&0x0800u16.to_be_bytes());
+    vecEthernet.extend_from_slice(&vecIp);
+
+    let mut vecFile = Vec::new();
+    vecFile.extend_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+    vecFile.extend_from_slice(&[2, 0, 4, 0]);
+    vecFile.extend_from_slice(&0u32.to_le_bytes());
+    vecFile.extend_from_slice(&0u32.to_le_bytes());
+    vecFile.extend_from_slice(&65535u32.to_le_bytes());
+    vecFile.extend_from_slice(&1u32.to_le_bytes()); // link type: Ethernet
+
+    vecFile.extend_from_slice(&1u32.to_le_bytes()); // seconds
+    vecFile.extend_from_slice(&0u32.to_le_bytes()); // microseconds
+    vecFile.extend_from_slice(&(vecEthernet.len() as u32).to_le_bytes());
+    vecFile.extend_from_slice(&(vecEthernet.len() as u32).to_le_bytes());
+    vecFile.extend_from_slice(&vecEthernet);
+    vecFile
+}
+
+#[test]
+fn a_payload_type_this_reader_does_not_interpret_is_skipped_not_fatal() {
+    // The bug this pins: framing stopped at the first payload type the reader has no decoder
+    // for, silently dropping every later message in that stream — and with them, whole ECUs.
+    // A header's length field says how long a message is whatever its type means, so an
+    // uninterpretable type is a message to step over, not a reason to abandon the stream.
+    // Manufacturer-specific types (0xF000-0xFFFF) are legal by design and common in OEM
+    // captures, which is exactly where this cost the most.
+    const c_u16ManufacturerSpecificType: u16 = 0xF00D;
+
+    let mut vecStream = Vec::new();
+    vecStream.extend_from_slice(&DoIpMessageBytes(
+        0x8001,
+        &DiagnosticPayload(0x0E00, 0x1234, &[0x22, 0xF1, 0x90]),
+    ));
+    vecStream.extend_from_slice(&DoIpMessageBytes(
+        c_u16ManufacturerSpecificType,
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+    ));
+    let mut vecResponse = vec![0x62, 0xF1, 0x90];
+    vecResponse.extend_from_slice(b"1HGBH41JXMN109186");
+    vecStream.extend_from_slice(&DoIpMessageBytes(
+        0x8001,
+        &DiagnosticPayload(0x1234, 0x0E00, &vecResponse),
+    ));
+
+    let vecFile = SingleTcpPacketCapture(&vecStream);
+    let (vehicle, summary) =
+        ReconstructFromCaptureWithSummary(&vecFile).expect("the capture should reconstruct");
+
+    assert_eq!(
+        summary.m_uUninterpreted, 1,
+        "the unknown type is counted, not hidden"
+    );
+    assert_eq!(
+        summary.m_uAbandonedStreams, 0,
+        "and the stream carries on rather than being abandoned"
+    );
+    assert_eq!(
+        summary.m_uMessages, 2,
+        "the two interpretable messages survive; the skipped one is counted separately \
+         rather than being handed on as a message with no meaning attached"
+    );
+    assert_eq!(summary.m_uExchanges, 1);
+
+    let ecu = vehicle
+        .m_vecEcus
+        .first()
+        .expect("the ECU that answered after the uninterpretable message");
+    assert_eq!(ecu.m_u16LogicalAddress, 0x1234);
+    let did = ecu.m_mapDids.get(&0xF190).expect("DID 0xF190 was read");
+    assert_eq!(did.m_vecValue, b"1HGBH41JXMN109186");
+}

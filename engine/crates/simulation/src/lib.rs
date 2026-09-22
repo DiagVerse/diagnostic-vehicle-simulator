@@ -23,6 +23,7 @@ use can::confinement::FaultConfinement;
 use core_domain::model::{
     CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, Vehicle, VehicleIdentity,
 };
+use doip::messages::IsFunctionalAddress;
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
 
@@ -202,6 +203,12 @@ pub struct RoutedResponse {
     pub m_u32RequestCanId: u32,
     /// The CAN identifier the answer is sent on.
     pub m_u32ResponseCanId: u32,
+    /// The DoIP logical address this ECU answers on, when it has one.
+    ///
+    /// Needed because a functionally addressed request is answered by several ECUs at once,
+    /// and each answer must name *its own* address as the source — echoing the functional
+    /// group address back would tell the tester the group replied, which no ECU did.
+    pub m_optU16LogicalAddress: Option<u16>,
     /// The UDS response bytes. Empty when the ECU deliberately suppressed its response
     /// (suppressPosRspMsgIndicationBit) — the caller must then transmit nothing.
     pub m_vecResponse: Vec<u8>,
@@ -253,6 +260,22 @@ pub enum RoutingOutcome {
     },
     /// One or more ECUs handled the request, in ECU order.
     Handled(Vec<RoutedResponse>),
+    /// A functionally addressed request is longer than a sub-network it has to cross can
+    /// carry, so nothing was routed anywhere (ISO 13400-2 REQ 7.DoIP-072 AL).
+    ///
+    /// The example the requirement gives is exactly this case: a functional request crossing a
+    /// CAN sub-network, where ISO 15765-2 allows a SingleFrame only because there is no single
+    /// peer to send flow control. The DoIP entity turns this into NACK `0x04` and discards the
+    /// message; over CAN it cannot arise, because a tester cannot put such a request on the
+    /// wire in the first place.
+    TooLargeForSubnetwork {
+        /// How long the request actually was.
+        uRequestBytes: usize,
+        /// The longest a functional request may be on the network that cannot carry it.
+        uMaxBytes: usize,
+        /// An ECU on that network, so the operator knows which one the limit came from.
+        strEcuName: String,
+    },
 }
 
 /// A running simulation: the loaded vehicle plus one live ECU per CAN request identifier.
@@ -1071,6 +1094,12 @@ impl SimulationService {
             return RoutingOutcome::Stopped;
         }
 
+        // A functional group address is not an ECU's address and never will be, so it is
+        // checked before the physical index rather than after it fails to find one.
+        if IsFunctionalAddress(u16TargetAddress) {
+            return self.ProcessFunctionalByLogicalAddress(u16TargetAddress, vecRequest, protocol);
+        }
+
         let key = match self.m_mapKeyByLogicalAddress.get(&u16TargetAddress) {
             Some(key) => *key,
             None => {
@@ -1156,25 +1185,125 @@ impl SimulationService {
             None => return RoutingOutcome::NoTarget,
         };
 
+        let vecKeys: Vec<EcuKey> = vecTargetRequestIds.into_iter().map(EcuKey::Can).collect();
+        let vecResponses = self.BroadcastTo(&vecKeys, u32FunctionalCanId, vecRequest, protocol);
+
+        // An empty vector is not "no target": the identifier was known and the ECUs did
+        // process the request — they were simply all required to stay quiet.
+        RoutingOutcome::Handled(vecResponses)
+    }
+
+    /// Case 2 over DoIP: a functional group target address every ECU behind the entity
+    /// processes on its own state.
+    ///
+    /// ISO 13400-2 Table 13 reserves `0xE000`-`0xEFFF` for functional group addresses, and the
+    /// standard's own example (Table 22) is a tester reading an InfoType from the whole vehicle
+    /// at `0xE000`. Answering one of these with NACK `0x03` — as this did before — tells the
+    /// tester no such target exists, when in fact every ECU in the vehicle is one.
+    ///
+    /// The reach is the whole vehicle, not only the ECUs the entity addresses directly: a real
+    /// DoIP gateway forwards a functional request onto the sub-networks behind it, which is
+    /// what REQ 7.DoIP-072 AL's example describes. An ECU behind a gateway that is switched off
+    /// is skipped, because on a real vehicle it would not be reached either.
+    ///
+    /// Not modelled: functional *groups*. Every group address reaches every ECU, because
+    /// nothing in the vehicle model says which ECUs belong to which group — inventing a
+    /// membership would be a claim the source data never made.
+    fn ProcessFunctionalByLogicalAddress(
+        &mut self,
+        u16TargetAddress: u16,
+        vecRequest: &[u8],
+        protocol: &dyn ProtocolHandler,
+    ) -> RoutingOutcome {
+        let vecKeys: Vec<EcuKey> = self.m_mapEcus.keys().copied().collect();
+        if vecKeys.is_empty() {
+            tracing::debug!(
+                targetAddress = format!("{u16TargetAddress:04X}"),
+                "a functional group address with no ECUs behind it"
+            );
+            return RoutingOutcome::NoTarget;
+        }
+
+        // REQ 7.DoIP-072 AL: the limit of the *narrowest* sub-network the broadcast has to
+        // cross applies to all of it, and the message is discarded rather than delivered to the
+        // part of the vehicle that could have taken it. Only CAN imposes a limit here — the
+        // ISO 15765-2 SingleFrame, because a functional request has no peer to flow-control it
+        // — and only for an ECU the entity cannot reach directly.
+        if vecRequest.len() > c_uMaxFunctionalRequestBytes {
+            if let Some(strEcuName) = self.FirstEcuReachedOnlyOverCan(&vecKeys) {
+                tracing::warn!(
+                    targetAddress = format!("{u16TargetAddress:04X}"),
+                    requestBytes = vecRequest.len(),
+                    maxBytes = c_uMaxFunctionalRequestBytes,
+                    ecu = %strEcuName,
+                    "functional request is too long for a CAN sub-network it must cross; discarding it"
+                );
+                return RoutingOutcome::TooLargeForSubnetwork {
+                    uRequestBytes: vecRequest.len(),
+                    uMaxBytes: c_uMaxFunctionalRequestBytes,
+                    strEcuName,
+                };
+            }
+        }
+
+        // No CAN identifier is being addressed here, so zero stands for "not addressed on CAN"
+        // exactly as it does on the physical DoIP path. Each answer still reports the ECU's own
+        // identifiers, which `ProcessOnEcu` reads from its configuration.
+        let vecResponses = self.BroadcastTo(&vecKeys, 0, vecRequest, protocol);
+        RoutingOutcome::Handled(vecResponses)
+    }
+
+    /// The name of the first of these ECUs that a DoIP entity can only reach by routing onto
+    /// CAN, or `None` when it can reach all of them directly.
+    ///
+    /// "Directly" means the ECU carries a DoIP logical address of its own. One that does not is
+    /// behind a gateway on a CAN sub-network, and that sub-network's transport limits then
+    /// apply to anything sent to it.
+    fn FirstEcuReachedOnlyOverCan(&self, vecKeys: &[EcuKey]) -> Option<String> {
+        for key in vecKeys {
+            let config = match self.m_mapEcus.get(key) {
+                Some(runningEcu) => runningEcu.Config(),
+                None => continue,
+            };
+            if !config.m_bHasDoIpAddress && config.m_optCanAddress.is_some() {
+                return Some(config.m_strName.clone());
+            }
+        }
+        None
+    }
+
+    /// Drive every ECU in a broadcast and collect the answers that may actually be sent.
+    ///
+    /// Shared by both transports deliberately: which ECUs a broadcast reaches differs between
+    /// CAN and DoIP, but what each ECU does with the request — and which of its negative
+    /// responses it must swallow — is a UDS rule, not a transport one.
+    fn BroadcastTo(
+        &mut self,
+        vecKeys: &[EcuKey],
+        u32AddressedOn: u32,
+        vecRequest: &[u8],
+        protocol: &dyn ProtocolHandler,
+    ) -> Vec<RoutedResponse> {
         let mut vecResponses = Vec::new();
-        for u32TargetRequestId in vecTargetRequestIds {
+
+        for key in vecKeys {
             // A broadcast reaches whoever is listening. An ECU that is off, or behind a
             // gateway that is off, simply is not.
-            if let Some(strReason) = self.DescribeWhySilent(EcuKey::Can(u32TargetRequestId)) {
+            if let Some(strReason) = self.DescribeWhySilent(*key) {
                 tracing::debug!(
-                    requestCanId = format!("{u32FunctionalCanId:03X}"),
+                    addressedOn = %DescribeKey(*key),
                     reason = %strReason,
                     "an ECU was skipped for this broadcast"
                 );
                 continue;
             }
 
-            let runningEcu = match self.m_mapEcus.get_mut(&EcuKey::Can(u32TargetRequestId)) {
+            let runningEcu = match self.m_mapEcus.get_mut(key) {
                 Some(runningEcu) => runningEcu,
                 None => continue,
             };
 
-            let response = ProcessOnEcu(runningEcu, u32FunctionalCanId, vecRequest, protocol);
+            let response = ProcessOnEcu(runningEcu, u32AddressedOn, vecRequest, protocol);
 
             // A functionally addressed server must stay silent for some negative responses
             // rather than flood the tester with "I do not support that" (ISO 14229-1
@@ -1203,10 +1332,7 @@ impl SimulationService {
         // Ascending response identifier: CAN arbitration is won by the lower identifier, so
         // this is the order the answers would appear on a real bus.
         vecResponses.sort_by_key(|response| response.m_u32ResponseCanId);
-
-        // An empty vector is not "no target": the identifier was known and the ECUs did
-        // process the request — they were simply all required to stay quiet.
-        RoutingOutcome::Handled(vecResponses)
+        vecResponses
     }
 }
 
@@ -1228,6 +1354,11 @@ fn ProcessOnEcu(
         .map(|address| address.m_u32RequestCanId)
         .unwrap_or(0);
     let strEcuName = runningEcu.Config().m_strName.clone();
+    let optU16LogicalAddress = if runningEcu.Config().m_bHasDoIpAddress {
+        Some(runningEcu.Config().m_u16LogicalAddress)
+    } else {
+        None
+    };
 
     let plan = runningEcu.ProcessRequestWithTiming(protocol, vecRequest);
     let vecResponse = plan.FinalResponse().to_vec();
@@ -1265,6 +1396,7 @@ fn ProcessOnEcu(
         m_strEcuName: strEcuName,
         m_u32RequestCanId: u32EcuRequestCanId,
         m_u32ResponseCanId: u32ResponseCanId,
+        m_optU16LogicalAddress: optU16LogicalAddress,
         m_vecResponse: vecResponse,
         m_bySession: runningEcu.CurrentSession(),
         m_bIsSecurityUnlocked: runningEcu.IsSecurityUnlocked(),

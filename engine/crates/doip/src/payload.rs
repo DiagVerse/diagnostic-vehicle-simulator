@@ -122,6 +122,26 @@ impl PayloadType {
     }
 
     /// True for a message that arrives on the UDP discovery port.
+    /// True for a payload type a DoIP entity *sends* rather than receives.
+    ///
+    /// These must be ignored in silence, not refused. REQ 7.DoIP-039 AL says so outright for
+    /// the generic header negative acknowledge — and the reason generalises: two entities on a
+    /// segment that answer each other's messages with "unknown payload type" NACK each other
+    /// until one gives up. Vehicle announcements are the common case, since every entity on
+    /// UDP 13400 hears every other entity's.
+    pub fn IsSentByAnEntity(self) -> bool {
+        matches!(
+            self,
+            PayloadType::GenericHeaderNack
+                | PayloadType::VehicleAnnouncement
+                | PayloadType::RoutingActivationResponse
+                | PayloadType::EntityStatusResponse
+                | PayloadType::PowerModeResponse
+                | PayloadType::DiagnosticMessageAck
+                | PayloadType::DiagnosticMessageNack
+        )
+    }
+
     pub fn IsUdpDiscovery(self) -> bool {
         matches!(
             self,

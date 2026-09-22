@@ -953,6 +953,7 @@ dependencies = [
  "application",
  "can",
  "core-domain",
+ "doip",
  "ecu",
  "plugin-contract",
  "reconstruct",

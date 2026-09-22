@@ -44,6 +44,10 @@ pub struct CaptureSummary {
     pub m_uEncryptedPackets: usize,
     /// TCP streams abandoned because their sequence numbers had a gap.
     pub m_uAbandonedStreams: usize,
+    /// Messages framed correctly but carrying a payload type this reader does not interpret —
+    /// manufacturer-specific types, mostly. Counted rather than silently skipped, so a capture
+    /// full of them does not look like a capture full of nothing.
+    pub m_uUninterpreted: usize,
 }
 
 /// Build a vehicle from a pcap or pcapng capture of DoIP traffic.
@@ -74,6 +78,7 @@ pub fn ReconstructFromCaptureWithSummary(
         ecus = vehicle.m_vecEcus.len(),
         encrypted = summary.m_uEncryptedPackets,
         abandonedStreams = summary.m_uAbandonedStreams,
+        uninterpreted = summary.m_uUninterpreted,
         "reconstructed a vehicle from a DoIP capture"
     );
     Ok((vehicle, summary))
@@ -121,7 +126,7 @@ fn ExtractDoIpMessages(
                     m_vecBytes: packet.m_vecPayload.clone(),
                     m_vecSegmentStarts: vec![(0, packet.m_f64TimestampSec, packet.m_uCaptureIndex)],
                 };
-                ReadMessages(&stream, &packet.m_strSourceIp, &mut vecMessages);
+                ReadMessages(&stream, &packet.m_strSourceIp, &mut vecMessages, summary);
             }
             TransportKind::Tcp => {
                 mapStreams.entry(packet.FlowKey()).or_default().push(packet);
@@ -134,7 +139,7 @@ fn ExtractDoIpMessages(
         match JoinTcpStream(&vecSegments) {
             Some(stream) => {
                 let strSourceIp = vecSegments[0].m_strSourceIp.clone();
-                ReadMessages(&stream, &strSourceIp, &mut vecMessages);
+                ReadMessages(&stream, &strSourceIp, &mut vecMessages, summary);
             }
             None => {
                 summary.m_uAbandonedStreams += 1;
@@ -230,7 +235,12 @@ impl TcpStream {
 }
 
 /// Frame a byte stream into DoIP messages using each header's length field.
-fn ReadMessages(stream: &TcpStream, strSourceIp: &str, vecMessages: &mut Vec<DoIpMessage>) {
+fn ReadMessages(
+    stream: &TcpStream,
+    strSourceIp: &str,
+    vecMessages: &mut Vec<DoIpMessage>,
+    summary: &mut CaptureSummary,
+) {
     let arrStream = &stream.m_vecBytes;
     let limits = HeaderLimits {
         m_u32MaxDataSize: c_u32MaxMessageLength,
@@ -241,11 +251,35 @@ fn ReadMessages(stream: &TcpStream, strSourceIp: &str, vecMessages: &mut Vec<DoI
     while uOffset + header::c_uHeaderLength <= arrStream.len() {
         let header = match header::ReadHeader(&arrStream[uOffset..], limits) {
             Ok(header) => header,
+            // A payload type this reader does not interpret is still perfectly framed: the
+            // length field says how long it is whatever the type means. Manufacturer-specific
+            // types (0xF000-0xFFFF) are legal by design and common in OEM captures, and
+            // abandoning the stream at the first one silently dropped every later message in
+            // it — and with them, whole ECUs — at debug level and uncounted.
+            Err(header::HeaderNack::UnknownPayloadType { u16PayloadType }) => {
+                let u32Skip = u32::from_be_bytes([
+                    arrStream[uOffset + 4],
+                    arrStream[uOffset + 5],
+                    arrStream[uOffset + 6],
+                    arrStream[uOffset + 7],
+                ]);
+                let uNext = uOffset + header::c_uHeaderLength + u32Skip as usize;
+                if uNext > arrStream.len() || u32Skip > c_u32MaxMessageLength {
+                    return;
+                }
+                tracing::debug!(
+                    payloadType = format!("{u16PayloadType:04X}"),
+                    "skipping a DoIP payload type this reader does not interpret"
+                );
+                summary.m_uUninterpreted += 1;
+                uOffset = uNext;
+                continue;
+            }
             Err(nack) => {
-                // A capture legitimately contains messages an entity rejected — the reference
-                // capture has a deliberately malformed one. Stop framing this stream rather
-                // than guessing where the next message starts.
+                // Only a broken synchronisation pattern justifies abandoning the stream: from
+                // there the next message's boundary is genuinely unknown.
                 tracing::debug!(%nack, "stopping at a DoIP message this reader cannot frame");
+                summary.m_uAbandonedStreams += 1;
                 return;
             }
         };
@@ -321,6 +355,16 @@ fn BuildVehicle(vecMessages: &[DoIpMessage], summary: &mut CaptureSummary) -> Ve
                     pending.m_u16TargetAddress == diagnostic.m_u16SourceAddress
                         && AnswersService(pending.m_byServiceId, &diagnostic.m_vecUserData)
                 });
+
+                // A ResponsePending is an interim answer, not a final one. Retiring the
+                // request on it loses the response that actually carries the data — and on a
+                // real ECU most reads of any size go through one, so this was quietly emptying
+                // the reconstructed model of DID values while still counting the exchange.
+                if optIndex.is_some()
+                    && crate::behaviour::IsResponsePending(&diagnostic.m_vecUserData)
+                {
+                    continue;
+                }
 
                 if let Some(uIndex) = optIndex {
                     let pending = vecPending.remove(uIndex);

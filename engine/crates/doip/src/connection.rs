@@ -70,10 +70,21 @@ impl Connection {
 
     /// Note that something was sent or received.
     ///
-    /// Resets the inactivity clock. Both directions count (REQ 3.DoIP-080 NL) — a response this
-    /// entity sends keeps the socket alive just as a request does, and forgetting the outbound
-    /// half is a listed trap.
+    /// Resets the **general** inactivity timer. Both directions count (REQ 3.DoIP-080 NL) — a
+    /// response this entity sends keeps the socket alive just as a request does, and forgetting
+    /// the outbound half is a listed trap.
+    ///
+    /// It deliberately does *not* reset the initial inactivity timer. That timer is a measure
+    /// against "connection attempts on TCP_DATA sockets with invalid DoIP messages or without
+    /// sending any data" (clause 12.6.3), and the only thing that stops it is receipt of a
+    /// valid routing activation request (REQ 3.DoIP-085 NL). Resetting it on traffic would let
+    /// a tester hold a socket open indefinitely — by sending alive check responses, or by
+    /// sending rubbish — without ever activating routing, which is the one thing it exists to
+    /// prevent.
     pub fn NoteActivity(&mut self) {
+        if self.m_state == ConnectionState::Initialized {
+            return;
+        }
         self.m_u64IdleMs = 0;
     }
 
@@ -138,7 +149,11 @@ impl Connection {
             return RoutingActivationOutcome::DeniedSourceAddressMismatch;
         }
 
-        // The address is live on another socket that answered an alive check.
+        // The address is already registered on another socket. The standard lets an entity
+        // send an alive check to that socket first and free it if it does not answer; this
+        // entity does not, so it refuses. That is stricter than the standard permits, never
+        // looser — a tester is told "in use" when the standard would allow "in use", and never
+        // the reverse.
         if bIsAddressActiveElsewhere {
             return RoutingActivationOutcome::DeniedSourceAddressInUse;
         }
@@ -161,8 +176,6 @@ impl Connection {
         request: &RoutingActivationRequest,
         outcome: RoutingActivationOutcome,
     ) {
-        self.NoteActivity();
-
         match outcome {
             RoutingActivationOutcome::Activated => {
                 self.m_optU16SourceAddress = Some(request.m_u16SourceAddress);
@@ -176,6 +189,12 @@ impl Connection {
             }
             _ => self.m_state = ConnectionState::Finalize,
         }
+
+        // Cleared *after* the state moves, so a socket leaving `Initialized` starts its general
+        // timer from zero rather than inheriting however long it spent waiting to activate.
+        // This is the transition REQ 3.DoIP-085 NL describes: the initial timer stops on
+        // receipt of a valid routing activation request, not on the response going out.
+        self.m_u64IdleMs = 0;
     }
 
     /// Mark this connection finished, so the caller closes the socket.
