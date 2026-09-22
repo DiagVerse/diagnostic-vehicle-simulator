@@ -244,6 +244,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "can"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cfg-if"
@@ -345,6 +348,7 @@ version = "0.1.0"
 dependencies = [
  "abi_stable",
  "application",
+ "can",
  "core-domain",
  "plugin-contract",
  "tracing",
@@ -947,6 +951,7 @@ version = "0.1.0"
 dependencies = [
  "abi_stable",
  "application",
+ "can",
  "core-domain",
  "ecu",
  "plugin-contract",

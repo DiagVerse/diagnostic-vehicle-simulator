@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostics::{FormatHex, ParseHex, SessionName};
 use crate::traffic::{ExchangeResponse, NowMs, TrafficEvent};
 use crate::AppState;
+use can::confinement::{c_u16BusOffThreshold, BusState, FaultConfinement};
 
 /// Longest CAN log accepted in one upload (characters). A log is pasted or uploaded by a
 /// human; anything larger is a mistake or an attempt to exhaust the engine's memory.
@@ -347,6 +348,37 @@ pub struct SecurityLevelDto {
 #[serde(rename_all = "camelCase")]
 pub struct SetSecurityLevelsBody {
     pub levels: Vec<SecurityLevelDto>,
+}
+
+/// An ECU's CAN error counters and the bus state they put it in.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusStateDto {
+    /// `errorActive`, `errorPassive` or `busOff`.
+    pub state: String,
+    /// Transmit error counter. Only this one can reach bus-off.
+    pub transmit_error_count: u16,
+    /// Receive error counter. Can reach error-passive and no further.
+    pub receive_error_count: u16,
+    /// False once the node has taken itself off the wire — then it neither answers nor
+    /// acknowledges, so a request to it times out rather than being refused.
+    pub can_transmit: bool,
+}
+
+/// Request body for `PUT /simulation/ecus/{handle}/bus-state`.
+///
+/// Name a state to jump straight to it, or set the counters and let them decide. Naming a state
+/// also sets counters consistent with it, so an ECU forced error-passive then given one more
+/// transmit error behaves exactly as one that counted its way there.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBusStateBody {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub transmit_error_count: Option<u16>,
+    #[serde(default)]
+    pub receive_error_count: Option<u16>,
 }
 
 /// A vehicle written out as a simulation file, ready for the browser to save.
@@ -1496,6 +1528,79 @@ pub async fn PostSimulationPermissive(
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation.SetPermissiveMode(body.enabled);
     Json(BuildStateDto(&simulation, state.protocol.is_some()))
+}
+
+/// GET /simulation/ecus/{requestCanIdHex}/bus-state — an ECU's CAN error state.
+pub async fn GetEcuBusState(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+) -> Result<Json<BusStateDto>, ApiError> {
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    let confinement = simulation
+        .EcuFaultConfinementOf(key)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(BuildBusStateDto(&confinement)))
+}
+
+/// PUT /simulation/ecus/{requestCanIdHex}/bus-state — drive it into a bus condition.
+pub async fn PutEcuBusState(
+    State(state): State<Arc<AppState>>,
+    Path(strRequestCanIdHex): Path<String>,
+    Json(body): Json<SetBusStateBody>,
+) -> Result<Json<BusStateDto>, ApiError> {
+    let key = ParseEcuHandle(&strRequestCanIdHex).map_err(ApiError::BadRequest)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    let mut confinement = simulation
+        .EcuFaultConfinementOf(key)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    // The named state is applied first so explicit counters can still refine it; the other
+    // order would let a state silently discard the numbers sent with it.
+    if let Some(strState) = body.state.as_deref() {
+        confinement.ForceState(ParseBusState(strState)?);
+    }
+    if let Some(u16Transmit) = body.transmit_error_count {
+        confinement.m_u16TransmitErrorCount = u16Transmit;
+        confinement.m_bIsBusOff = u16Transmit > c_u16BusOffThreshold;
+    }
+    if let Some(u16Receive) = body.receive_error_count {
+        confinement.m_u16ReceiveErrorCount = u16Receive;
+    }
+
+    simulation
+        .SetEcuFaultConfinement(key, confinement)
+        .map_err(|error| ApiError::NotFound(error.to_string()))?;
+
+    Ok(Json(BuildBusStateDto(&confinement)))
+}
+
+fn BuildBusStateDto(confinement: &FaultConfinement) -> BusStateDto {
+    let state = confinement.State();
+    BusStateDto {
+        state: match state {
+            BusState::ErrorActive => "errorActive".to_string(),
+            BusState::ErrorPassive => "errorPassive".to_string(),
+            BusState::BusOff => "busOff".to_string(),
+        },
+        transmit_error_count: confinement.m_u16TransmitErrorCount,
+        receive_error_count: confinement.m_u16ReceiveErrorCount,
+        can_transmit: state.CanTransmit(),
+    }
+}
+
+fn ParseBusState(strState: &str) -> Result<BusState, ApiError> {
+    match strState.trim().to_ascii_lowercase().as_str() {
+        "erroractive" | "active" => Ok(BusState::ErrorActive),
+        "errorpassive" | "passive" => Ok(BusState::ErrorPassive),
+        "busoff" | "off" => Ok(BusState::BusOff),
+        strOther => Err(ApiError::BadRequest(format!(
+            "'{strOther}' is not a bus state; use errorActive, errorPassive or busOff"
+        ))),
+    }
 }
 
 /// GET /simulation/export — the loaded vehicle as a simulation file.

@@ -269,6 +269,48 @@ export interface EchoSpan {
  * Declaring a service supported does not implement it — the engine's UDS plugin answers seven
  * services, and an override is the only way to get a positive response out of the rest.
  */
+/** One second of bus activity. */
+export interface BusLoadSample {
+  atSec: number
+  frames: number
+  /** Share of the bus occupied, 0–1, with bit stuffing excluded. */
+  loadNominal: number
+  /** The same with every frame stuffed as heavily as the standard allows. */
+  loadWorstCase: number
+}
+
+/**
+ * How busy the bus has been.
+ *
+ * `loadNominal` is a floor, not a measurement: bit stuffing depends on the payload's bit
+ * pattern and on a CRC a decoded frame does not carry, so the real figure lies between the
+ * nominal and the worst case. Showing one number would be showing a number that is subtly
+ * wrong; showing the range is honestly right.
+ */
+export interface BusLoad {
+  bitrateBps: number
+  samples: BusLoadSample[]
+  /** Incomplete by definition — the second still being filled. */
+  current: BusLoadSample | null
+  peak: BusLoadSample | null
+  isNominalAFloor: boolean
+}
+
+/** An ECU's CAN error counters and the bus state they put it in (ISO 11898-1 §12.1). */
+export interface BusState {
+  state: 'errorActive' | 'errorPassive' | 'busOff'
+  transmitErrorCount: number
+  receiveErrorCount: number
+  /** False once the node is off the wire: requests to it time out rather than being refused. */
+  canTransmit: boolean
+}
+
+export interface SetBusState {
+  state?: 'errorActive' | 'errorPassive' | 'busOff'
+  transmitErrorCount?: number
+  receiveErrorCount?: number
+}
+
 /** A vehicle written out as a simulation file. */
 export interface SimFileExport {
   fileName: string
@@ -532,6 +574,10 @@ export const api = {
   hardwareStart: (port: string, bitrateBps: number, serialBaudBps?: number) =>
     postJson<HardwareStatus>('/hw/start', { port, bitrateBps, serialBaudBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
+  busLoad: () => getJson<BusLoad>('/hw/busload'),
+  ecuBusState: (handle: string) => getJson<BusState>(`/simulation/ecus/${handle}/bus-state`),
+  setEcuBusState: (handle: string, body: SetBusState) =>
+    putJson<BusState>(`/simulation/ecus/${handle}/bus-state`, body),
   /** The loaded vehicle as simulation-file text, ready to save. Clears the unsaved marker. */
   simulationExport: () => getJson<SimFileExport>('/simulation/export'),
   setPermissiveMode: (enabled: boolean) =>

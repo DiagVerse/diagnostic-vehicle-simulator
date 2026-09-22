@@ -644,3 +644,96 @@ async fn a_link_with_room_to_spare_is_left_alone() {
     let vecSent = Sent(&handle);
     assert_eq!(&vecSent[0].1[0..3], &[0x30, 0x04, 0x00]);
 }
+
+#[tokio::test]
+async fn a_bus_off_ecu_is_silent_rather_than_refusing() {
+    // The distinction a tester depends on. A negative response is an answer — it proves
+    // something was there to send it. A node that has taken itself off the bus sends nothing
+    // and acknowledges nothing, so the request has to time out instead.
+    let arcSimulation = BuildSimulation();
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, Arc::clone(&arcSimulation));
+
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x03, 0x22, 0xF1, 0x90, 0xAA, 0xAA, 0xAA, 0xAA],
+    ));
+    bridge.PumpOnce(&UdsHandler).await;
+    assert!(
+        !Sent(&handle).is_empty(),
+        "error-active, so it answers normally first"
+    );
+
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let mut confinement = simulation
+            .EcuFaultConfinementOf(EcuKey::Can(0x7E0))
+            .expect("the ECU");
+        confinement.ForceState(can::confinement::BusState::BusOff);
+        simulation
+            .SetEcuFaultConfinement(EcuKey::Can(0x7E0), confinement)
+            .expect("the ECU");
+    }
+
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x03, 0x22, 0xF1, 0x90, 0xAA, 0xAA, 0xAA, 0xAA],
+    ));
+    bridge.PumpOnce(&UdsHandler).await;
+    assert!(
+        Sent(&handle).is_empty(),
+        "bus off must put nothing on the wire at all — not even a refusal: {:02X?}",
+        Sent(&handle)
+    );
+}
+
+#[tokio::test]
+async fn error_passive_still_answers_which_is_what_makes_it_different_from_bus_off() {
+    // Error-passive is a degraded node, not an absent one. Conflating the two would lose the
+    // only fault worth injecting separately.
+    let arcSimulation = BuildSimulation();
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, Arc::clone(&arcSimulation));
+
+    {
+        let mut simulation = arcSimulation.lock().expect("simulation");
+        let mut confinement = can::confinement::FaultConfinement::default();
+        confinement.ForceState(can::confinement::BusState::ErrorPassive);
+        simulation
+            .SetEcuFaultConfinement(EcuKey::Can(0x7E0), confinement)
+            .expect("the ECU");
+    }
+
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x03, 0x22, 0xF1, 0x90, 0xAA, 0xAA, 0xAA, 0xAA],
+    ));
+    bridge.PumpOnce(&UdsHandler).await;
+    assert!(
+        !Sent(&handle).is_empty(),
+        "error-passive is still on the bus"
+    );
+}
+
+#[tokio::test]
+async fn the_bus_load_meter_counts_what_crosses_the_bridge() {
+    let handle = MockBusHandle::default();
+    let mut bridge = BuildBridge(&handle, BuildSimulation()).WithLinkCapacity(1_000_000, 500_000);
+    let arcMeter = bridge.BusLoad();
+
+    // A request in and an answer out: both directions are traffic on the same wire.
+    handle.InjectFrame(Frame(
+        0x7E0,
+        vec![0x03, 0x22, 0xF1, 0x90, 0xAA, 0xAA, 0xAA, 0xAA],
+    ));
+    bridge.PumpOnce(&UdsHandler).await;
+
+    let meter = arcMeter.lock().expect("meter");
+    let sample = meter.Current().expect("a bucket once anything has crossed");
+    assert!(sample.m_uFrames >= 2, "received and sent are both counted");
+    assert!(sample.m_f64LoadNominal > 0.0);
+    assert!(
+        sample.m_f64LoadWorstCase >= sample.m_f64LoadNominal,
+        "the range must contain the truth, never sit below it"
+    );
+}
