@@ -28,8 +28,19 @@ const c_byFlowStatusOverflow: u8 = 0x32;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IsoTpReceiveError {
     /// A consecutive frame arrived out of order, so bytes are missing.
-    #[error("consecutive frame sequence number {u8Received} arrived where {u8Expected} was expected; the message is incomplete and was abandoned")]
-    WrongSequenceNumber { u8Expected: u8, u8Received: u8 },
+    ///
+    /// Carries how many frames that implies were never seen, because the distinction matters
+    /// and is invisible from the sequence numbers alone: ISO-TP numbers wrap at 15, so a
+    /// sender whose frames are being *dropped* on the way here produces jumps that read exactly
+    /// like *reordering* to anyone reading the log. Frames arriving out of order would all
+    /// still arrive; frames being lost do not.
+    #[error("consecutive frame sequence number {u8Received} arrived where {u8Expected} was expected — {u8MissingFrames} frame(s) never arrived, so the message is incomplete and was abandoned")]
+    WrongSequenceNumber {
+        u8Expected: u8,
+        u8Received: u8,
+        /// How many frames are missing between the two, counting through the wrap.
+        u8MissingFrames: u8,
+    },
 
     /// A frame arrived that makes no sense where it did.
     #[error("a consecutive frame arrived with no message in progress")]
@@ -213,9 +224,14 @@ impl IsoTpReceiver {
         if u8Received != pending.m_u8NextSequenceNumber {
             // Bytes are missing, so whatever is assembled is wrong. Abandon it rather than
             // hand a plausible-looking but incorrect PDU upward.
+            // Counting through the wrap: sequence numbers are four bits, so the gap from the
+            // expected number to the received one is how many were skipped.
+            let u8MissingFrames = u8Received.wrapping_sub(pending.m_u8NextSequenceNumber) & 0x0F;
+
             return ReceiveOutcome::Aborted(IsoTpReceiveError::WrongSequenceNumber {
                 u8Expected: pending.m_u8NextSequenceNumber,
                 u8Received,
+                u8MissingFrames,
             });
         }
         pending.m_u8NextSequenceNumber = pending.m_u8NextSequenceNumber.wrapping_add(1) & 0x0F;
@@ -380,7 +396,8 @@ mod tests {
             outcome,
             ReceiveOutcome::Aborted(IsoTpReceiveError::WrongSequenceNumber {
                 u8Expected: 1,
-                u8Received: 2
+                u8Received: 2,
+                u8MissingFrames: 1,
             })
         );
     }
@@ -446,5 +463,67 @@ mod tests {
             receiver.OnFrame(&[0x21, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]),
             ReceiveOutcome::Nothing
         );
+    }
+
+    #[test]
+    fn a_link_dropping_one_frame_in_eight_looks_like_reordering_and_is_not() {
+        // Reproduces a field log exactly. A tester sent a 386-byte SecurityAccess key as 55
+        // ConsecutiveFrames; the adapter relaying them to this engine carried about one in
+        // eight and a half. What arrived was 1..15 in perfect order and then 3, 12, 4, 13, 5 —
+        // which reads as two interleaved streams and had the VCI blamed for reordering.
+        //
+        // It is one stream, sampled. The stride is close to half of sixteen, so consecutive
+        // survivors land on alternating halves of a four-bit counter. The giveaway is that the
+        // missing frames never turn up at all: reordering delivers everything eventually.
+        let mut receiver = Physical();
+        receiver.OnFrame(&[0x11, 0x82, 0x27, 0x02, 0x26, 0x2D, 0xB7, 0x99]);
+
+        // The fifteen that got through in order.
+        for u8Sequence in 1..=15u8 {
+            let outcome = receiver.OnFrame(&[0x20 | u8Sequence, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                outcome,
+                ReceiveOutcome::Nothing,
+                "frame {u8Sequence} is in order and adds bytes"
+            );
+        }
+
+        // Frames 16, 17 and 18 were lost, so the next to arrive carries sequence number 3.
+        let outcome = receiver.OnFrame(&[0x23, 0, 0, 0, 0, 0, 0, 0]);
+        match outcome {
+            ReceiveOutcome::Aborted(IsoTpReceiveError::WrongSequenceNumber {
+                u8Expected,
+                u8Received,
+                u8MissingFrames,
+            }) => {
+                assert_eq!(u8Expected, 0, "after 15 the next is 0, not 1");
+                assert_eq!(u8Received, 3);
+                assert_eq!(
+                    u8MissingFrames, 3,
+                    "three frames never arrived; saying so is what separates loss from reordering"
+                );
+            }
+            other => panic!("expected an abandoned message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_missing_count_is_measured_through_the_wrap() {
+        // The gap that matters is often across the wrap, where the raw numbers go backwards:
+        // expecting 4 and receiving 12 is eight frames lost, not a frame that went back in
+        // time. This is the arithmetic that makes a dropped-frame log readable.
+        let mut receiver = Physical();
+        receiver.OnFrame(&[0x11, 0x82, 0x27, 0x02, 0x26, 0x2D, 0xB7, 0x99]);
+        for u8Sequence in 1..=3u8 {
+            receiver.OnFrame(&[0x20 | u8Sequence, 0, 0, 0, 0, 0, 0, 0]);
+        }
+
+        match receiver.OnFrame(&[0x2C, 0, 0, 0, 0, 0, 0, 0]) {
+            ReceiveOutcome::Aborted(IsoTpReceiveError::WrongSequenceNumber {
+                u8MissingFrames,
+                ..
+            }) => assert_eq!(u8MissingFrames, 8),
+            other => panic!("expected an abandoned message, got {other:?}"),
+        }
     }
 }
