@@ -912,6 +912,10 @@ function LogLoader({ onLoad, busy }: { onLoad: (logText: string) => void; busy: 
             onChange={(e) => {
               const file = e.target.files?.[0]
               if (file) readFile(file)
+              // Clear it, or picking the *same* file again fires no change event at all and
+              // the click looks ignored. Reloading one file after trying another is exactly
+              // what someone comparing two logs does.
+              e.target.value = ''
             }}
           />
         </label>
@@ -979,6 +983,10 @@ function CaptureLoader({
             onChange={(e) => {
               const file = e.target.files?.[0]
               if (file) readFile(file)
+              // Clear it, or picking the *same* file again fires no change event at all and
+              // the click looks ignored. Reloading one file after trying another is exactly
+              // what someone comparing two logs does.
+              e.target.value = ''
             }}
           />
         </label>
@@ -1061,6 +1069,10 @@ function SimFileLoader({
             onChange={(e) => {
               const file = e.target.files?.[0]
               if (file) readFile(file)
+              // Clear it, or picking the *same* file again fires no change event at all and
+              // the click looks ignored. Reloading one file after trying another is exactly
+              // what someone comparing two logs does.
+              e.target.value = ''
             }}
           />
         </label>
