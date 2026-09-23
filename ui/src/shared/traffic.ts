@@ -240,7 +240,16 @@ export function FormatEventTime(atMs: number): string {
   return `${strTime}.${String(at.getMilliseconds()).padStart(3, "0")}`;
 }
 
-/** One event as a single line of text, for the saved log file. */
+/**
+ * One event as a single line of text, for the saved log file.
+ *
+ * **This format is read back by the engine.** `engine/crates/reconstruct/src/parser.rs`
+ * (`ParseTrafficMonitorLine`) rebuilds a vehicle from a saved log, recognising a frame by a
+ * wall clock in the first column, an RX/TX marker in the second and a bracketed length in the
+ * fourth. Changing any of those three breaks loading a saved session, and it breaks it
+ * silently — the engine would simply report no CAN frames found. Change the parser in the same
+ * commit, and its tests will tell you if the shapes have drifted apart.
+ */
 export function FormatEventLine(event: TrafficEvent): string {
   const strAt = FormatEventTime(event.atMs);
   switch (event.kind) {
