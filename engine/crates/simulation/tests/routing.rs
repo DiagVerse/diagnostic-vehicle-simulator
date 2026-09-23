@@ -518,3 +518,57 @@ fn switching_an_absent_ecu_is_an_error_rather_than_a_silent_no_op() {
         "an operator toggling an ECU that is not there must be told"
     );
 }
+
+// ---------------------------------------------------------------- loading replaces the vehicle
+
+#[test]
+fn loading_a_vehicle_puts_it_on_the_bus_even_after_a_stop() {
+    // The bug: Start/Stop was a flag on the service, and loading never touched it. Pressing
+    // Stop once therefore poisoned every later load — the file went in, the ECUs appeared in
+    // the list, and not one of them answered. From the outside that is indistinguishable from
+    // the load having failed, which is how it was reported.
+    //
+    // Running is a statement about specific ECUs being reachable, and loading replaces those
+    // ECUs, so there is nothing for it to carry over from.
+    let mut simulation = LoadThreeEcuSimulation();
+    assert!(simulation.IsRunning(), "a fresh load is on the bus");
+
+    simulation.Stop();
+    assert!(!simulation.IsRunning());
+
+    simulation
+        .LoadFromLogText(c_strThreeEcuLog)
+        .expect("the log loads again");
+
+    assert!(
+        simulation.IsRunning(),
+        "the newly loaded vehicle is on the bus, not inheriting the old one's stopped flag"
+    );
+
+    // And it really answers, which is the thing the operator was missing.
+    let outcome = simulation.ProcessByCanId(0x7E0, &[0x10, 0x03], &UdsHandler);
+    match outcome {
+        RoutingOutcome::Handled(vecResponses) => {
+            assert_eq!(vecResponses[0].m_vecResponse[0], 0x50, "a real answer");
+        }
+        other => panic!("expected an answer from the reloaded vehicle, got {other:?}"),
+    }
+}
+
+#[test]
+fn permissive_mode_still_survives_a_load_even_though_the_stopped_flag_does_not() {
+    // The contrast worth keeping straight, and the reason the fix above is narrow. Permissive
+    // is a policy the operator chose about how ECUs should behave; a vehicle arriving
+    // mid-session rightly inherits it. Stopped is not a policy — it is the state of ECUs that
+    // no longer exist.
+    let mut simulation = LoadThreeEcuSimulation();
+    simulation.SetPermissiveMode(true);
+    simulation.Stop();
+
+    simulation
+        .LoadFromLogText(c_strThreeEcuLog)
+        .expect("the log loads again");
+
+    assert!(simulation.IsPermissive(), "the policy carried over");
+    assert!(simulation.IsRunning(), "the stopped flag did not");
+}

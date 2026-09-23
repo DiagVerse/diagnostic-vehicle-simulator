@@ -458,6 +458,18 @@ impl SimulationService {
             runningEcu.SetPermissive(bIsPermissive);
         }
         self.m_optVehicle = Some(vehicle);
+
+        // A vehicle that has just been loaded is on the bus, whether or not the previous one
+        // was. Running/stopped is a statement about specific ECUs being reachable, and those
+        // ECUs have just been replaced — so there is nothing for it to carry over from.
+        //
+        // This is the difference from permissive mode above, which is a *policy* the operator
+        // chose and which a new vehicle rightly inherits. Inheriting the stopped flag instead
+        // meant that pressing Stop once quietly poisoned every later load: the file went in,
+        // the ECUs appeared, and none of them answered. From the outside that is
+        // indistinguishable from the load having failed, which is exactly how it was reported.
+        self.Start();
+
         self.BumpConfigGeneration();
         // A vehicle that has just arrived is not unsaved work: it came from a file, or from a
         // capture the operator still has. Only edits made from here count as unsaved.
