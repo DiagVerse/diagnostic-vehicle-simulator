@@ -37,6 +37,20 @@ jobs:
       - name: Build (all crates + plugins)
         run: cargo build --all
 
+  converters:
+    name: Converters (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Deliberately no odxtools: these cover the readers that decide what an address, a name,
+      # a placeholder or a variant choice should be, which is where the mistakes live. Reading
+      # ODX itself belongs to the library that owns it.
+      - name: PDX converter tests
+        run: python3 scripts/test_pdx_to_simfile.py
+
   ui:
     name: UI (React/TS)
     runs-on: ubuntu-latest
