@@ -32,13 +32,23 @@ pub fn ParseCanLog(strContent: &str) -> Result<Vec<CanFrame>, ParseError> {
             continue;
         }
 
+        // A comment. Our own traffic log opens with a header block of these, and a candump
+        // line is recognised by a '#' *inside* it rather than at the start, so skipping these
+        // first costs nothing and stops a header being offered to every parser in turn.
+        if strTrimmed.starts_with('#') {
+            continue;
+        }
+
         // Each format is recognised by a marker no other format uses: candump parenthesises
-        // its timestamp and joins id and data with '#', and the diagnostic trace separates
-        // its identifier from its data with "->" after a direction marker.
+        // its timestamp and joins id and data with '#', the diagnostic trace separates its
+        // identifier from its data with "->" after a direction marker, and this engine's own
+        // traffic log puts an RX/TX marker between a wall clock and a bracketed length.
         let optFrame = if strTrimmed.starts_with('(') && strTrimmed.contains('#') {
             ParseCandumpLine(strTrimmed)
         } else if strTrimmed.contains(">>") || strTrimmed.contains("<<") {
             ParseDiagnosticTraceLine(strTrimmed)
+        } else if IsTrafficMonitorLine(strTrimmed) {
+            ParseTrafficMonitorLine(strTrimmed)
         } else {
             ParseAscLine(strTrimmed)
         };
@@ -94,6 +104,73 @@ fn ParseDiagnosticTraceLine(strLine: &str) -> Option<CanFrame> {
         .trim_start_matches("0X");
     let u32CanId = u32::from_str_radix(strIdDigits, 16).ok()?;
 
+    let vecData = ParseSpacedHexBytes(strData)?;
+
+    Some(CanFrame::NewDirected(
+        f64TimestampSec,
+        u32CanId,
+        vecData,
+        bIsRequest,
+    ))
+}
+
+/// Whether this line is a frame from this engine's own traffic monitor log.
+///
+/// `19:51:09.855  RX  18DA15F1 [8] 02 10 01 55 55 55 55 55`
+///
+/// Recognised by the shape rather than by a single character, because the pieces individually
+/// are not distinctive: a wall clock in the first token, an `RX`/`TX` marker in the second, and
+/// a bracketed length in the fourth. A Vector `.asc` line also carries an `Rx`, but at the
+/// *fourth* token and behind a floating-point timestamp, so the two cannot be confused.
+///
+/// The monitor's other lines — decoded exchanges (`--`), lifecycle notes (`==`) and lag
+/// warnings (`!!`) — fail this and are skipped. They are summaries *of* the frames, and reading
+/// them as well would count every exchange twice.
+fn IsTrafficMonitorLine(strLine: &str) -> bool {
+    let vecTokens: Vec<&str> = strLine.split_whitespace().collect();
+    if vecTokens.len() < 4 {
+        return false;
+    }
+
+    let bHasWallClock = vecTokens[0].contains(':');
+    let bHasDirection =
+        vecTokens[1].eq_ignore_ascii_case("RX") || vecTokens[1].eq_ignore_ascii_case("TX");
+    let bHasBracketedLength = vecTokens[3].starts_with('[');
+
+    bHasWallClock && bHasDirection && bHasBracketedLength
+}
+
+/// Parse one frame line from this engine's own traffic monitor log.
+///
+/// This closes a round trip that was open: the monitor could save a session, and nothing could
+/// read it back — including this engine, which is the one thing that certainly should. A log
+/// worth saving is a log worth loading, and a tool that cannot read its own output tells its
+/// user the file is worthless.
+///
+/// The direction marker is the reason this format reconstructs *better* than an `.asc`: `RX` is
+/// a frame the simulator received, which is the tester talking, and `TX` is one it sent. That is
+/// observed fact rather than the guess the other formats force — correlation believes it instead
+/// of inferring a direction from the service identifier.
+fn ParseTrafficMonitorLine(strLine: &str) -> Option<CanFrame> {
+    let vecTokens: Vec<&str> = strLine.split_whitespace().collect();
+    if vecTokens.len() < 4 {
+        return None;
+    }
+
+    let f64TimestampSec = ParseWallClockSeconds(vecTokens[0])?;
+
+    // RX is a frame this engine received, so it came from the tester and is a request.
+    let bIsRequest = vecTokens[1].eq_ignore_ascii_case("RX");
+
+    let u32CanId = u32::from_str_radix(vecTokens[2], 16).ok()?;
+
+    // Everything after the bracketed length is data, up to an annotation. The monitor appends
+    // "(flow control)" to the frames that carry it, and those parentheses are not bytes.
+    let strAfterLength = strLine.split_once(']')?.1;
+    let strData = match strAfterLength.split_once('(') {
+        Some((strBytes, _)) => strBytes,
+        None => strAfterLength,
+    };
     let vecData = ParseSpacedHexBytes(strData)?;
 
     Some(CanFrame::NewDirected(
@@ -258,5 +335,107 @@ mod tests {
     #[test]
     fn empty_log_errors() {
         assert!(ParseCanLog("\n\n# just comments\n").is_err());
+    }
+
+    /// A saved monitor log, header and all, exactly as the browser writes it.
+    const c_strTrafficLog: &str = "\
+# Diagnostic Vehicle Simulator — traffic log
+# saved 2026-09-12T10:56:55.426Z
+# 538 event(s) held, 538 seen since this monitor attached
+# nothing was dropped
+
+19:56:53.778  ==  537 earlier event(s) replayed — the session from its start
+19:50:55.193  ==  on the wire: /dev/cu.usbserial-MINI2024042 at 1000000 bit/s, host link 115200 baud
+19:51:09.855  RX  18DA15F1 [8] 02 10 01 55 55 55 55 55
+19:51:09.856  --  18DA15F1 10 01  [physical]  CAN(B)_PCM: 50 01 15 7C 03 E8
+19:51:09.857  TX  18DAF115 [8] 06 50 01 15 7C 03 E8 AA
+19:51:09.903  RX  18DA15F1 [8] 30 00 00 55 55 55 55 55   (flow control)
+19:51:10.001  !!  fell behind: 12 event(s) missed
+";
+
+    #[test]
+    fn reads_its_own_traffic_log() {
+        // The round trip that was broken: the monitor could save a session and nothing could
+        // read it back — including this engine, which is the one thing that certainly should.
+        let vecFrames = ParseCanLog(c_strTrafficLog).expect("a saved monitor log should parse");
+
+        assert_eq!(
+            vecFrames.len(),
+            3,
+            "three frame lines; the header, the decoded exchange, the lifecycle notes and the \
+             lag warning are not frames"
+        );
+        assert_eq!(vecFrames[0].m_u32CanId, 0x18DA15F1);
+        assert_eq!(
+            vecFrames[0].m_vecData,
+            vec![0x02, 0x10, 0x01, 0x55, 0x55, 0x55, 0x55, 0x55]
+        );
+        assert!(vecFrames[0].m_bIsExtended);
+    }
+
+    #[test]
+    fn rx_is_the_tester_talking_and_tx_is_the_simulator_answering() {
+        // The reason this format reconstructs better than an .asc: the direction is recorded
+        // rather than inferred from the service identifier. RX is a frame this engine received,
+        // so it came from the tester.
+        let vecFrames = ParseCanLog(c_strTrafficLog).expect("parses");
+
+        assert_eq!(vecFrames[0].m_optBIsRequest, Some(true), "RX 18DA15F1");
+        assert_eq!(vecFrames[1].m_optBIsRequest, Some(false), "TX 18DAF115");
+    }
+
+    #[test]
+    fn a_flow_control_annotation_is_not_read_as_data() {
+        // "(flow control)" is a note the monitor appends for a reader. Parsed as bytes it would
+        // fail the whole line, dropping a frame that really was on the wire.
+        let vecFrames = ParseCanLog(c_strTrafficLog).expect("parses");
+        let flowControl = vecFrames.last().expect("the flow control frame survived");
+
+        assert_eq!(flowControl.m_vecData[0], 0x30, "a FlowControl PCI");
+        assert_eq!(
+            flowControl.m_vecData.len(),
+            8,
+            "eight bytes, and not a ninth invented from the annotation"
+        );
+    }
+
+    #[test]
+    fn a_decoded_exchange_line_is_not_counted_as_a_frame() {
+        // The "--" lines summarise frames that are already in the log. Reading them too would
+        // put every exchange in twice, and the second copy would carry the wrong identifier —
+        // the request's, on what is really a response.
+        let strJustTheSummary =
+            "19:51:09.856  --  18DA15F1 10 01  [physical]  CAN(B)_PCM: 50 01 15 7C 03 E8";
+        assert!(!IsTrafficMonitorLine(strJustTheSummary));
+        assert!(ParseCanLog(strJustTheSummary).is_err(), "nothing to read");
+    }
+
+    #[test]
+    fn an_eleven_bit_identifier_survives_the_column_padding() {
+        // The monitor pads the identifier to eight columns, so a short one is followed by more
+        // spaces than a long one. Splitting on whitespace has to be indifferent to that.
+        let strLog = "12:00:00.100  RX  7E0      [3] 02 10 03\n                      12:00:00.102  TX  7E8      [4] 03 50 03 00";
+        let vecFrames = ParseCanLog(strLog).expect("parses");
+
+        assert_eq!(vecFrames.len(), 2);
+        assert_eq!(vecFrames[0].m_u32CanId, 0x7E0);
+        assert!(!vecFrames[0].m_bIsExtended);
+        assert_eq!(vecFrames[1].m_u32CanId, 0x7E8);
+        assert_eq!(vecFrames[1].m_vecData, vec![0x03, 0x50, 0x03, 0x00]);
+    }
+
+    #[test]
+    fn an_asc_receive_marker_is_not_mistaken_for_a_monitor_line() {
+        // Both formats carry an "Rx". The discriminator is where it sits: a monitor line has it
+        // in the second column behind a wall clock, an .asc line in the fourth behind a float.
+        let strAsc = "0.001000 1 7E0 Rx d 3 02 10 03";
+        assert!(!IsTrafficMonitorLine(strAsc));
+
+        let vecFrames = ParseCanLog(strAsc).expect("parses as .asc");
+        assert_eq!(vecFrames[0].m_u32CanId, 0x7E0);
+        assert_eq!(
+            vecFrames[0].m_optBIsRequest, None,
+            "an .asc Rx is the recorder's point of view, not the tester's, so direction stays unknown"
+        );
     }
 }
