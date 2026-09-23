@@ -162,6 +162,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/ecus/:requestCanIdHex/timing",
             get(simulation::GetEcuTiming).put(simulation::PutEcuTiming),
         )
+        // Vehicle-wide rather than per ECU, because the link this compensates for is shared.
+        .route(
+            "/simulation/flow-control",
+            put(simulation::PutFlowControlForEveryEcu),
+        )
         // axum caps a request body at 2 MB unless told otherwise, and it rejects an oversized
         // one *before* any handler runs. That made the per-endpoint size guards unreachable:
         // a caller sending a 3 MB CAN log got a bare 413 and, through a dev proxy, an EPIPE

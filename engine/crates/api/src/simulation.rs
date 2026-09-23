@@ -426,6 +426,34 @@ pub struct EcuTimingUpdateDto {
     pub advertised_at_next_session_control: bool,
 }
 
+/// A flow-control setting to apply to every ECU at once.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowControlForEveryEcuDto {
+    /// ConsecutiveFrames a tester may send before waiting for another FlowControl.
+    /// 0 means "send them all", which is right only on a link that can carry the bus unpaced.
+    pub iso_tp_block_size: u8,
+    /// The raw STmin byte: 0x00-0x7F milliseconds, 0xF1-0xF9 hundreds of microseconds.
+    #[serde(default)]
+    pub iso_tp_separation_time_min: u8,
+}
+
+/// What a bulk flow-control apply actually did.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowControlAppliedDto {
+    /// The values now advertised by every ECU.
+    pub iso_tp_block_size: u8,
+    pub iso_tp_separation_time_min: u8,
+    /// How many ECUs this changed — excluding those that already held these values, so
+    /// applying the same setting twice reports zero rather than looking like work happened.
+    pub ecus_changed: usize,
+    /// How many ECUs the vehicle holds in total, so "3 of 47" reads differently from "3 of 3".
+    pub ecus_total: usize,
+    /// The handles that changed, in the order the vehicle lists them.
+    pub changed_handles: Vec<String>,
+}
+
 /// The outcome of one routed request.
 ///
 /// `responses` holds one entry per ECU that answered. A physically addressed request produces
@@ -1842,6 +1870,35 @@ pub async fn PutEcuTiming(
     Ok(Json(EcuTimingUpdateDto {
         timing: BuildTimingDto(&timing),
         advertised_at_next_session_control: true,
+    }))
+}
+
+/// PUT /simulation/flow-control — the same ISO-TP flow control on every ECU.
+///
+/// Flow control is per-ECU because the model is, but the link it compensates for is shared: one
+/// slow adapter sits between the tester and all of them, so the value an operator arrives at is
+/// almost always the same for the whole vehicle. On a 47-ECU file, setting it one at a time is a
+/// chore the design creates and this relieves.
+///
+/// Only BlockSize and STmin are written — see `SetFlowControlForEveryEcu` for why the rest of an
+/// ECU's timing is deliberately left alone.
+pub async fn PutFlowControlForEveryEcu(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FlowControlForEveryEcuDto>,
+) -> Result<Json<FlowControlAppliedDto>, ApiError> {
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+
+    let uEcusTotal = simulation.RunningEcus().count();
+    let vecChanged = simulation
+        .SetFlowControlForEveryEcu(body.iso_tp_block_size, body.iso_tp_separation_time_min)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    Ok(Json(FlowControlAppliedDto {
+        iso_tp_block_size: body.iso_tp_block_size,
+        iso_tp_separation_time_min: body.iso_tp_separation_time_min,
+        ecus_changed: vecChanged.len(),
+        ecus_total: uEcusTotal,
+        changed_handles: vecChanged,
     }))
 }
 

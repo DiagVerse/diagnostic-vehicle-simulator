@@ -21,7 +21,8 @@ use std::collections::BTreeMap;
 use application::ProtocolHandler;
 use can::confinement::FaultConfinement;
 use core_domain::model::{
-    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, Vehicle, VehicleIdentity,
+    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, TimingValidationError,
+    Vehicle, VehicleIdentity,
 };
 use doip::messages::IsFunctionalAddress;
 use ecu::schedule::ResponsePlan;
@@ -755,6 +756,78 @@ impl SimulationService {
         // the link was restarted.
         self.BumpConfigGeneration();
         Ok(())
+    }
+
+    /// Set the ISO-TP flow control every ECU advertises, leaving the rest of their timing alone.
+    ///
+    /// Flow control is per-ECU because the model is per-ECU, but the *link* it is compensating
+    /// for is shared: one slow adapter sits between the tester and all of them. So the setting
+    /// an operator arrives at is almost always the same number for the whole vehicle, and on a
+    /// 47-ECU file, applying it one ECU at a time is a chore this design creates and should
+    /// relieve rather than impose.
+    ///
+    /// **Only BlockSize and STmin are written.** P2, P2*, P4, the response delay and the forced
+    /// ResponsePending knobs are deliberately untouched: those describe how one ECU behaves and
+    /// are usually set on one ECU on purpose, so overwriting all of them in the name of fixing a
+    /// link would quietly destroy the fault injection an operator had set up. A bulk action that
+    /// can undo deliberate work is worse than no bulk action.
+    ///
+    /// Returns the handles that changed, which excludes those that already held these values —
+    /// an operator who applies the same setting twice should be told "nothing to do", not given
+    /// a number that makes it look like work happened.
+    pub fn SetFlowControlForEveryEcu(
+        &mut self,
+        u8BlockSize: u8,
+        bySeparationTimeMin: u8,
+    ) -> Result<Vec<String>, TimingValidationError> {
+        // Validated once, on a whole set of parameters, rather than per ECU: the two fields are
+        // the same for every one of them, so the answer cannot differ, and checking inside the
+        // loop would risk changing half the vehicle before refusing.
+        let probe = EcuTiming {
+            m_u8IsoTpBlockSize: u8BlockSize,
+            m_byIsoTpSeparationTimeMin: bySeparationTimeMin,
+            ..EcuTiming::default()
+        };
+        probe.Validate()?;
+
+        let vecKeys: Vec<EcuKey> = self.m_mapEcus.keys().copied().collect();
+        let mut vecChanged = Vec::new();
+
+        for key in vecKeys {
+            let runningEcu = match self.m_mapEcus.get_mut(&key) {
+                Some(runningEcu) => runningEcu,
+                None => continue,
+            };
+
+            let mut timing = runningEcu.Timing();
+            let bIsAlreadySet = timing.m_u8IsoTpBlockSize == u8BlockSize
+                && timing.m_byIsoTpSeparationTimeMin == bySeparationTimeMin;
+            if bIsAlreadySet {
+                continue;
+            }
+
+            timing.m_u8IsoTpBlockSize = u8BlockSize;
+            timing.m_byIsoTpSeparationTimeMin = bySeparationTimeMin;
+            runningEcu.SetTiming(timing);
+            UpdateVehicleTiming(self.m_optVehicle.as_mut(), key, timing);
+            vecChanged.push(DescribeKey(key));
+        }
+
+        if vecChanged.is_empty() {
+            return Ok(vecChanged);
+        }
+
+        tracing::info!(
+            blockSize = u8BlockSize,
+            separationTimeMin = format!("{bySeparationTimeMin:02X}"),
+            ecusChanged = vecChanged.len(),
+            "flow control applied to every ECU"
+        );
+        // Once, after the whole sweep rather than per ECU: a running bridge rebuilds its
+        // receivers when this changes, and doing that forty-seven times mid-edit would have it
+        // rebuild against a half-applied vehicle.
+        self.BumpConfigGeneration();
+        Ok(vecChanged)
     }
 
     /// One ECU's CAN error counters and bus state.

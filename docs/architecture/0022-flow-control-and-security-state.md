@@ -135,6 +135,7 @@ is not a security test target. A vehicle that should refuse must be told to, wit
 - The SLCAN `U` command, which would let the engine *command* a faster UART instead of only
   discovering one. The reference dongle leaves `V` unanswered, so its rate falls back to an
   assumed 115200 and the pacing above is then computed from a guess rather than a measurement.
-- An "apply this flow control to every ECU" action. Flow control is per-ECU by design, but the
-  link is shared, so setting it forty-seven times by hand is a chore this design creates and does
-  not yet relieve.
+- ~~An "apply this flow control to every ECU" action.~~ Built — `PUT /simulation/flow-control`,
+  and a button beside the per-ECU fields. It writes **only** BlockSize and STmin: the response
+  delay, the forced ResponsePending and P2/P2* are usually set on one ECU deliberately, and a
+  bulk action that undid that while fixing a link would be worse than no bulk action.

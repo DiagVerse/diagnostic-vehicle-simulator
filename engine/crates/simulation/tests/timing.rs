@@ -283,3 +283,131 @@ fn setting_timing_on_an_unknown_identifier_is_refused() {
     let resError = simulation.SetEcuTiming(EcuKey::Can(0x7E5), EcuTiming::default());
     assert!(resError.is_err());
 }
+
+// ---------------------------------------------------------------- bulk flow control
+
+#[test]
+fn flow_control_applies_to_every_ecu_at_once() {
+    // The chore this exists to relieve: the link a BlockSize compensates for is shared by the
+    // whole vehicle, so the value is the same for all of them — and setting it forty-seven
+    // times by hand is a cost the per-ECU model imposes without buying anything.
+    let mut simulation = LoadSimulation();
+
+    let vecChanged = simulation
+        .SetFlowControlForEveryEcu(4, 0x0A)
+        .expect("BlockSize 4 and STmin 10 ms are both legal");
+
+    let uEcus = simulation.RunningEcus().count();
+    assert_eq!(vecChanged.len(), uEcus, "every ECU, not just the first");
+
+    let vecKeys: Vec<EcuKey> = simulation.RunningEcus().map(|(key, _)| key).collect();
+    for key in vecKeys {
+        let timing = simulation.EcuTimingOf(key).expect("the ECU exists");
+        assert_eq!(timing.m_u8IsoTpBlockSize, 4);
+        assert_eq!(timing.m_byIsoTpSeparationTimeMin, 0x0A);
+    }
+}
+
+#[test]
+fn a_bulk_apply_does_not_overwrite_deliberate_per_ecu_timing() {
+    // The property that makes this action safe to offer at all. An operator sets a response
+    // delay and a forced ResponsePending on *one* ECU on purpose — that is fault injection,
+    // often the whole point of the session. A bulk action that silently undid it while fixing
+    // an unrelated link problem would be worse than no bulk action.
+    let mut simulation = LoadSimulation();
+    let key = EcuKey::Can(0x7E0);
+
+    let injected = ForcedPendingTiming(250, 3);
+    simulation
+        .SetEcuTiming(key, injected)
+        .expect("the ECU exists");
+
+    simulation
+        .SetFlowControlForEveryEcu(8, 0x14)
+        .expect("legal values");
+
+    let after = simulation.EcuTimingOf(key).expect("the ECU exists");
+    assert_eq!(after.m_u8IsoTpBlockSize, 8, "flow control did change");
+    assert_eq!(after.m_byIsoTpSeparationTimeMin, 0x14);
+
+    assert_eq!(
+        after.m_u32ResponseDelayMs, 250,
+        "the injected delay survived"
+    );
+    assert!(after.m_bForceResponsePending, "and so did the forced 0x78");
+    assert_eq!(after.m_u8ForcedResponsePendingCount, 3);
+    assert_eq!(
+        after.m_u32P2ServerMaxMs, injected.m_u32P2ServerMaxMs,
+        "P2 was never this action's business"
+    );
+}
+
+#[test]
+fn applying_the_same_flow_control_twice_reports_nothing_to_do() {
+    // "47 ECUs changed" after a no-op would read as work having happened, and would send
+    // someone looking for what moved.
+    let mut simulation = LoadSimulation();
+
+    let vecFirst = simulation
+        .SetFlowControlForEveryEcu(2, 0x00)
+        .expect("legal values");
+    assert!(!vecFirst.is_empty(), "the first apply changes things");
+
+    let vecSecond = simulation
+        .SetFlowControlForEveryEcu(2, 0x00)
+        .expect("legal values");
+    assert!(
+        vecSecond.is_empty(),
+        "the second changes nothing, and says so: {vecSecond:?}"
+    );
+}
+
+#[test]
+fn a_reserved_separation_time_is_refused_before_anything_is_changed() {
+    // 0x80-0xF0 is reserved by ISO 15765-2. Validating up front rather than per ECU is what
+    // keeps a refusal from leaving half a vehicle on the new value and half on the old — a
+    // state no operator asked for and none would think to check.
+    let mut simulation = LoadSimulation();
+    let key = EcuKey::Can(0x7E0);
+    let before = simulation.EcuTimingOf(key).expect("the ECU exists");
+
+    let result = simulation.SetFlowControlForEveryEcu(1, 0x90);
+    assert!(result.is_err(), "0x90 is reserved, not a separation time");
+
+    let after = simulation.EcuTimingOf(key).expect("the ECU exists");
+    assert_eq!(
+        after.m_byIsoTpSeparationTimeMin, before.m_byIsoTpSeparationTimeMin,
+        "and nothing was changed on the way to refusing"
+    );
+}
+
+#[test]
+fn a_running_bridge_is_told_the_vehicle_changed() {
+    // BlockSize and STmin are cached in a live bridge's receivers. Without the generation bump
+    // the operator's change would not reach the wire until the link was restarted — which is
+    // exactly the class of "I fixed it and nothing happened" this project has hit before.
+    let mut simulation = LoadSimulation();
+    let u64Before = simulation.ConfigGeneration();
+
+    simulation
+        .SetFlowControlForEveryEcu(6, 0x05)
+        .expect("legal values");
+
+    let u64AfterChange = simulation.ConfigGeneration();
+    assert_ne!(
+        u64AfterChange, u64Before,
+        "the bridge rebuilds its receivers on this"
+    );
+
+    // And the other half: an apply that changes nothing must not rebuild anything either.
+    // A live bridge dropping and re-making every receiver because someone pressed a button
+    // twice is a stall on the wire with no cause an operator could name.
+    simulation
+        .SetFlowControlForEveryEcu(6, 0x05)
+        .expect("legal values");
+    assert_eq!(
+        simulation.ConfigGeneration(),
+        u64AfterChange,
+        "a no-op apply leaves a running link alone"
+    );
+}
