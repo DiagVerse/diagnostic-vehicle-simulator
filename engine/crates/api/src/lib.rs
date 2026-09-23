@@ -90,6 +90,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(simulation::PostSimulationCapture)
                 .layer(DefaultBodyLimit::max(simulation::c_uMaxCaptureBodyBytes)),
         )
+        // A PDX is binary and a whole vehicle's delivery runs to tens of megabytes, so like the
+        // capture route it gets its own limit rather than raising the one every JSON route uses.
+        .route(
+            "/simulation/pdx",
+            post(simulation::PostSimulationPdx)
+                .layer(DefaultBodyLimit::max(simulation::c_uMaxPdxBodyBytes)),
+        )
         .route(
             "/simulation/identity",
             get(simulation::GetVehicleIdentity).put(simulation::PutVehicleIdentity),

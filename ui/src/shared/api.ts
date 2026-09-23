@@ -249,6 +249,18 @@ export interface SerialPorts {
   ports: SerialPort[]
 }
 
+/**
+ * A loaded vehicle, plus what the converter said while producing it.
+ *
+ * A PDX conversion is not simply success or failure. A delivery describes every build a platform
+ * offers, so ECUs are *chosen* out of it — and an operator who is not told which variants were
+ * set aside has no way to know the vehicle in front of them is one of several the archive could
+ * have produced.
+ */
+export interface PdxConversion extends SimulationState {
+  notes: string[]
+}
+
 /** Whether the simulation is on a wire, and how much has crossed it. */
 export interface HardwareStatus {
   running: boolean
@@ -564,6 +576,18 @@ export const api = {
     postJson<SimulationState>('/simulation/simfile', { logText }),
   simulationLoadCapture: (arrCapture: ArrayBuffer) =>
     postBinary<SimulationState>('/simulation/pcap', arrCapture),
+  /**
+   * Convert an ODX/PDX archive and load the vehicle it describes.
+   *
+   * Slower than the other loaders by a wide margin — the engine runs a converter that resolves
+   * ODX inheritance across every document in the archive — so callers should expect tens of
+   * seconds on a whole vehicle's delivery rather than the instant the others take.
+   */
+  simulationLoadPdx: (arrArchive: ArrayBuffer, fileName: string) =>
+    postBinary<PdxConversion>(
+      `/simulation/pdx?name=${encodeURIComponent(fileName)}`,
+      arrArchive,
+    ),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationStart: () => postJson<SimulationState>('/simulation/start', {}),
   simulationStop: () => postJson<SimulationState>('/simulation/stop', {}),

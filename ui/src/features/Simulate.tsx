@@ -43,6 +43,7 @@ export function Simulate() {
   const [canIdHex, setCanIdHex] = useState(RememberedEcu)
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
+  const [pdxNotes, setPdxNotes] = useState<string[]>([])
   const [source, setSource] = useState<VehicleSource>('log')
 
   useEffect(() => {
@@ -100,6 +101,30 @@ export function Simulate() {
    * The only source that arrives as binary, so it is base64-encoded here — the API client sends
    * JSON, and a capture is not text.
    */
+  /**
+   * Convert an ODX/PDX archive and load what it describes.
+   *
+   * The only loader that keeps something after it finishes. A PDX delivery describes every build
+   * a platform offers, so the converter *chooses* ECUs out of it — which variants were set aside
+   * is a decision the operator has to be able to see and disagree with, not a detail to discard
+   * once the vehicle is on screen.
+   */
+  async function loadPdx(arrBytes: ArrayBuffer, fileName: string) {
+    setBusy(true)
+    setPdxNotes([])
+    try {
+      const result = await api.simulationLoadPdx(arrBytes, fileName)
+      setState(result)
+      setPdxNotes(result.notes)
+      setLastResult(null)
+      setError(null)
+    } catch (e) {
+      setError(DescribeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function loadCapture(arrBytes: ArrayBuffer) {
     setBusy(true)
     try {
@@ -200,6 +225,7 @@ export function Simulate() {
       {source === 'log' && <LogLoader onLoad={load} busy={busy} />}
       {source === 'simfile' && <SimFileLoader onLoad={loadSimFile} busy={busy} />}
       {source === 'pcap' && <CaptureLoader onLoad={loadCapture} busy={busy} />}
+      {source === 'pdx' && <PdxLoader onLoad={loadPdx} busy={busy} notes={pdxNotes} />}
       {source === 'build' && (
         <VehicleBuilder onChanged={setState} onError={setError} busy={busy} />
       )}
@@ -576,7 +602,7 @@ function RememberEcu(strCanIdHex: string) {
 }
 
 /** A vehicle is either reconstructed from a capture or stated by hand. */
-type VehicleSource = 'log' | 'simfile' | 'pcap' | 'build'
+type VehicleSource = 'log' | 'simfile' | 'pcap' | 'pdx' | 'build'
 
 function SourcePicker({
   source,
@@ -595,6 +621,9 @@ function SourcePicker({
       </SourceTab>
       <SourceTab active={source === 'pcap'} onClick={() => onChange('pcap')}>
         From a DoIP capture
+      </SourceTab>
+      <SourceTab active={source === 'pdx'} onClick={() => onChange('pdx')}>
+        From a PDX
       </SourceTab>
       <SourceTab active={source === 'build'} onClick={() => onChange('build')}>
         Build from scratch
@@ -1005,6 +1034,124 @@ function CaptureLoader({
           </span>
         )}
       </div>
+    </section>
+  )
+}
+
+/**
+ * Convert an ODX/PDX archive and load the vehicle it describes.
+ *
+ * The slow loader, and the one that says the most afterwards. Two things make it different from
+ * the other three:
+ *
+ * A conversion takes tens of seconds on a whole vehicle's delivery, because resolving ODX
+ * inheritance means reading every document in the archive — so the wait is announced before it
+ * starts rather than leaving a button that looks hung.
+ *
+ * And a PDX describes every build a platform offers, not the car in front of you. The converter
+ * therefore *chooses* one ECU per address, and what it set aside is shown afterwards: an
+ * operator who is not told has no way to know the vehicle they are looking at is one of several
+ * the same archive could have produced.
+ */
+/** A file name without its extension, which is what a vehicle should be called. */
+function StemOf(strFileName: string | null): string {
+  if (!strFileName) return 'Vehicle'
+  return strFileName.replace(/\.[^.]+$/, '') || strFileName
+}
+
+function PdxLoader({
+  onLoad,
+  busy,
+  notes,
+}: {
+  onLoad: (arrBytes: ArrayBuffer, fileName: string) => void
+  busy: boolean
+  notes: string[]
+}) {
+  const [fileName, setFileName] = useState<string | null>(null)
+  const [sizeBytes, setSizeBytes] = useState(0)
+  const [arrBytes, setBytes] = useState<ArrayBuffer | null>(null)
+
+  async function readFile(file: File) {
+    setFileName(file.name)
+    setSizeBytes(file.size)
+    setBytes(await file.arrayBuffer())
+  }
+
+  return (
+    <section className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wider text-slate-400">
+          Convert a PDX
+        </h3>
+        <span className="text-xs text-slate-500">ODX / ISO 22901</span>
+      </div>
+
+      <p className="mt-2 text-xs leading-relaxed text-slate-500">
+        A single <code>.pdx</code>, or a zip holding one per ECU &mdash; which is how a delivery
+        usually arrives. Addresses, services, sessions, security levels and trouble codes are
+        read out of the ODX.
+      </p>
+      <p className="mt-2 text-xs leading-relaxed text-amber-500/80">
+        Data identifier <em>values</em> are placeholders. ODX states what an ECU answers and the
+        shape of the answer, never what any particular vehicle answers &mdash; so each one is
+        labelled with its own identifier and is yours to edit.
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500">
+          Choose file&hellip;
+          <input
+            type="file"
+            accept=".pdx,.zip"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) readFile(file)
+              e.target.value = ''
+            }}
+          />
+        </label>
+
+        <button
+          // The name travels with the bytes: the engine stages the upload under a name of its
+          // own, so without this the vehicle ends up called after that staging file.
+          onClick={() => arrBytes && onLoad(arrBytes, StemOf(fileName))}
+          disabled={busy || arrBytes === null}
+          className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
+        >
+          {busy ? 'Converting\u2026' : 'Convert & simulate'}
+        </button>
+
+        {fileName && (
+          <span className="font-mono text-xs text-slate-400">
+            {fileName} &middot; {(sizeBytes / (1024 * 1024)).toFixed(1)} MB
+          </span>
+        )}
+      </div>
+
+      {busy && (
+        <p className="mt-3 text-xs text-slate-400">
+          Reading every ODX document in the archive and resolving what each ECU inherits. A whole
+          vehicle takes tens of seconds.
+        </p>
+      )}
+
+      {!busy && notes.length > 0 && (
+        <div className="mt-4 rounded-md border border-slate-800 bg-slate-950/60 p-3">
+          <h4 className="text-xs font-medium uppercase tracking-wider text-slate-400">
+            What the converter did
+          </h4>
+          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-slate-400">
+{notes.join('\n')}
+          </pre>
+          <p className="mt-2 text-[11px] text-slate-500">
+            To keep a different build of an ECU, run{' '}
+            <code>scripts/pdx-to-simfile.py</code> with <code>--prefer</code> and load the file it
+            writes.
+          </p>
+        </div>
+      )}
     </section>
   )
 }

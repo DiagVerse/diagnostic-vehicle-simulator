@@ -48,6 +48,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Errors.
 thiserror = "1"
 anyhow = "1"
+# Scratch space for handing an uploaded archive to the PDX converter and cleaning up after it.
+tempfile = "3"
 
 # Internal crates.
 core-domain = { path = "crates/core-domain" }
