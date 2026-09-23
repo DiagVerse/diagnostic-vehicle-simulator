@@ -4,8 +4,42 @@ import {
   api,
   type DoIpSettings,
   type DoIpStatus,
+  type NetworkInterfaces,
   type VehicleIdentity,
 } from '../shared/api'
+
+/** One address to bind to, as a button that fills the bind field. */
+function InterfaceButton({
+  label,
+  note,
+  bind,
+  active,
+  disabled,
+  onPick,
+}: {
+  label: string
+  note?: string
+  bind: string
+  active: boolean
+  disabled?: boolean
+  onPick: (bind: string) => void
+}) {
+  return (
+    <button
+      onClick={() => onPick(bind)}
+      disabled={disabled}
+      title={bind}
+      className={`rounded-md border px-2.5 py-1.5 text-left text-xs transition disabled:opacity-40 ${
+        active
+          ? 'border-sky-700 bg-sky-950/40 text-sky-200'
+          : 'border-slate-700 text-slate-300 hover:border-slate-500 hover:bg-slate-800'
+      }`}
+    >
+      <span className="font-mono">{label}</span>
+      {note && <span className="ml-1.5 text-[10px] text-slate-500">{note}</span>}
+    </button>
+  )
+}
 
 /**
  * The DoIP entity: put the simulation on an Ethernet wire, decide what it tells a tester about
@@ -20,6 +54,7 @@ export function DoIp() {
   const [status, setStatus] = useState<DoIpStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [bind, setBind] = useState('0.0.0.0:13400')
+  const [interfaces, setInterfaces] = useState<NetworkInterfaces | null>(null)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -27,6 +62,14 @@ export function DoIp() {
       .doipStatus()
       .then(setStatus)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+
+    // Fetched once rather than polled: the addresses a machine has change when someone plugs a
+    // cable in, not several times a second. A failure here leaves the picker out and the typed
+    // field working, which is the behaviour before it existed.
+    api
+      .doipInterfaces()
+      .then(setInterfaces)
+      .catch(() => setInterfaces(null))
   }, [])
 
   async function run(action: () => Promise<DoIpStatus>) {
@@ -69,6 +112,45 @@ export function DoIp() {
           Binding to <span className="font-mono">0.0.0.0:13400</span> makes it reachable from
           another machine; <span className="font-mono">127.0.0.1</span> keeps it on this one.
         </p>
+
+        {interfaces && interfaces.interfaces.length > 0 && (
+          <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/50 p-3">
+            <h4 className="text-xs font-medium uppercase tracking-wider text-slate-400">
+              This machine&rsquo;s addresses
+            </h4>
+            <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+              A tester reaches the entity only from the same subnet. Pick the address on the
+              network your tester is on &mdash; or leave <span className="font-mono">0.0.0.0</span>{' '}
+              to answer on all of them.
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <InterfaceButton
+                label="all interfaces"
+                bind={interfaces.any}
+                active={bind === interfaces.any}
+                disabled={status?.running}
+                onPick={setBind}
+              />
+              {interfaces.interfaces.map((entry) => (
+                <InterfaceButton
+                  key={entry.bind}
+                  label={`${entry.name} · ${entry.address}`}
+                  note={
+                    entry.isLoopback
+                      ? 'this machine only'
+                      : entry.isLinkLocal
+                        ? 'link-local · no DHCP'
+                        : undefined
+                  }
+                  bind={entry.bind}
+                  active={bind === entry.bind}
+                  disabled={status?.running}
+                  onPick={setBind}
+                />
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="mt-3 flex flex-wrap items-end gap-2">
           <label className="flex flex-col gap-1">

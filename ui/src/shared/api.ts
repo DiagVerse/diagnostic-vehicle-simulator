@@ -261,6 +261,23 @@ export interface PdxConversion extends SimulationState {
   notes: string[]
 }
 
+/** One address this machine can bind a DoIP entity to. */
+export interface NetworkInterface {
+  name: string
+  address: string
+  /** What to put in the bind field to listen on exactly this one. */
+  bind: string
+  isLoopback: boolean
+  /** 169.254.x.x — what a host self-assigns when no DHCP server answers. */
+  isLinkLocal: boolean
+}
+
+export interface NetworkInterfaces {
+  /** Bind here to accept a tester on any interface. */
+  any: string
+  interfaces: NetworkInterface[]
+}
+
 /** Whether the simulation is on a wire, and how much has crossed it. */
 export interface HardwareStatus {
   running: boolean
@@ -626,6 +643,7 @@ export const api = {
   doipStatus: () => getJson<DoIpStatus>('/doip/status'),
   doipStart: (bind: string) => postJson<DoIpStatus>('/doip/start', { bind }),
   doipStop: () => postJson<DoIpStatus>('/doip/stop', {}),
+  doipInterfaces: () => getJson<NetworkInterfaces>('/doip/interfaces'),
   vehicleIdentity: () => getJson<VehicleIdentity>('/simulation/identity'),
   setVehicleIdentity: (identity: VehicleIdentity) =>
     putJson<VehicleIdentity>('/simulation/identity', identity),

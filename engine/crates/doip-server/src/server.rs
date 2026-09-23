@@ -26,6 +26,47 @@ const c_tickInterval: Duration = Duration::from_millis(250);
 /// Largest UDP datagram accepted. Discovery messages are tiny; anything larger is not one.
 const c_uMaxDatagram: usize = 1024;
 
+/// Which way a DoIP message crossed the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoIpDirection {
+    /// Something the entity received.
+    Received,
+    /// Something the entity sent.
+    Sent,
+}
+
+impl DoIpDirection {
+    /// The word a monitor shows, matching the `rx`/`tx` the CAN feed already uses.
+    pub fn Name(self) -> &'static str {
+        match self {
+            DoIpDirection::Received => "rx",
+            DoIpDirection::Sent => "tx",
+        }
+    }
+}
+
+/// Somewhere to report every DoIP message that crosses the wire.
+///
+/// The same shape as the CAN side's `FrameObserver`, and for the same reason: this crate owns
+/// sockets and protocol, not presentation, so it hands whole encoded messages to whoever asked
+/// and lets them decide what to do with them. Without it a DoIP session is invisible — the
+/// monitor showed CAN frames and nothing else, so a tester talking Ethernet to this simulator
+/// produced a window that stayed empty while it worked perfectly.
+pub trait DoIpObserver: Send + Sync {
+    /// One message, exactly as it went on the wire, header included.
+    ///
+    /// `strPeer` is the other end's address, which is what makes a capture comparable with what
+    /// the monitor shows. `bIsUdp` separates discovery from the diagnostic connection — they
+    /// are different conversations and reading them as one is confusing.
+    fn OnDoIpMessage(
+        &self,
+        direction: DoIpDirection,
+        strPeer: &str,
+        bIsUdp: bool,
+        arrMessage: &[u8],
+    );
+}
+
 /// A running DoIP server, and how to stop it.
 pub struct ServerHandle {
     m_taskUdp: tokio::task::JoinHandle<()>,
@@ -64,6 +105,16 @@ impl DoIpServer {
         bindAddress: SocketAddr,
         protocol: Arc<dyn ProtocolHandler>,
     ) -> std::io::Result<ServerHandle> {
+        Self::StartObserved(arcEntity, bindAddress, protocol, None).await
+    }
+
+    /// The same, reporting every message that crosses the wire to an observer.
+    pub async fn StartObserved(
+        arcEntity: Arc<Mutex<DoIpEntity>>,
+        bindAddress: SocketAddr,
+        protocol: Arc<dyn ProtocolHandler>,
+        optObserver: Option<Arc<dyn DoIpObserver>>,
+    ) -> std::io::Result<ServerHandle> {
         let tcpListener = TcpListener::bind(bindAddress).await?;
         let tcpAddress = tcpListener.local_addr()?;
 
@@ -80,12 +131,17 @@ impl DoIpServer {
         // belongs to. Created before the spawns, which both need it.
         let closeSignals: CloseSignals = Arc::new(Mutex::new(BTreeMap::new()));
 
-        let taskUdp = tokio::spawn(RunUdp(Arc::clone(&arcEntity), udpSocket));
+        let taskUdp = tokio::spawn(RunUdp(
+            Arc::clone(&arcEntity),
+            udpSocket,
+            optObserver.clone(),
+        ));
         let taskTcp = tokio::spawn(RunTcp(
             Arc::clone(&arcEntity),
             tcpListener,
             Arc::clone(&protocol),
             Arc::clone(&closeSignals),
+            optObserver.clone(),
         ));
         let taskTick = tokio::spawn(RunTick(Arc::clone(&arcEntity), Arc::clone(&closeSignals)));
 
@@ -99,7 +155,11 @@ impl DoIpServer {
 }
 
 /// Answer discovery messages.
-async fn RunUdp(arcEntity: Arc<Mutex<DoIpEntity>>, socket: UdpSocket) {
+async fn RunUdp(
+    arcEntity: Arc<Mutex<DoIpEntity>>,
+    socket: UdpSocket,
+    optObserver: Option<Arc<dyn DoIpObserver>>,
+) {
     // Shared with the tasks that send delayed answers. `send_to` takes `&self`, so several may
     // hold it at once without any locking of our own.
     let arcSocket = Arc::new(socket);
@@ -120,6 +180,14 @@ async fn RunUdp(arcEntity: Arc<Mutex<DoIpEntity>>, socket: UdpSocket) {
             continue;
         }
 
+        Report(
+            &optObserver,
+            DoIpDirection::Received,
+            &fromAddress.to_string(),
+            true,
+            &arrBuffer[..uLength],
+        );
+
         let reaction = {
             let entity = arcEntity.lock().expect("DoIP entity mutex poisoned");
             entity.HandleUdp(&arrBuffer[..uLength])
@@ -131,6 +199,7 @@ async fn RunUdp(arcEntity: Arc<Mutex<DoIpEntity>>, socket: UdpSocket) {
             // socket serving every tester on the network, and holding it for half a second
             // would make one entity's de-bursting delay every *other* answer it owes.
             let arcSocketForReply = Arc::clone(&arcSocket);
+            let optObserverForReply = optObserver.clone();
             tokio::spawn(async move {
                 if reply.m_u32AtMs > 0 {
                     tokio::time::sleep(Duration::from_millis(reply.m_u32AtMs as u64)).await;
@@ -143,7 +212,18 @@ async fn RunUdp(arcEntity: Arc<Mutex<DoIpEntity>>, socket: UdpSocket) {
                     .await
                 {
                     tracing::warn!(%error, peer = %fromAddress, "could not answer a discovery request");
+                    return;
                 }
+
+                // Reported after the send, not before: an answer that failed to leave is not
+                // one a monitor should show as having gone out.
+                Report(
+                    &optObserverForReply,
+                    DoIpDirection::Sent,
+                    &fromAddress.to_string(),
+                    true,
+                    &reply.m_vecBytes,
+                );
             });
         }
     }
@@ -155,6 +235,7 @@ async fn RunTcp(
     listener: TcpListener,
     protocol: Arc<dyn ProtocolHandler>,
     closeSignals: CloseSignals,
+    optObserver: Option<Arc<dyn DoIpObserver>>,
 ) {
     // Sockets are numbered rather than keyed by peer address: a tester may open several
     // connections from one machine, and the standard keys a connection on the socket, not the
@@ -184,6 +265,8 @@ async fn RunTcp(
             u64Socket,
             Arc::clone(&protocol),
             Arc::clone(&closeSignals),
+            optObserver.clone(),
+            peerAddress.to_string(),
         ));
     }
 }
@@ -195,6 +278,8 @@ async fn ServeConnection(
     u64Socket: u64,
     protocol: Arc<dyn ProtocolHandler>,
     closeSignals: CloseSignals,
+    optObserver: Option<Arc<dyn DoIpObserver>>,
+    strPeer: String,
 ) {
     let mut vecPending: Vec<u8> = Vec::new();
     let mut arrChunk = vec![0u8; 4096];
@@ -240,6 +325,13 @@ async fn ServeConnection(
                 break;
             }
             let vecMessage: Vec<u8> = vecPending.drain(..uMessageLength).collect();
+            Report(
+                &optObserver,
+                DoIpDirection::Received,
+                &strPeer,
+                false,
+                &vecMessage,
+            );
 
             let reaction = {
                 let mut entity = arcEntity.lock().expect("DoIP entity mutex poisoned");
@@ -263,6 +355,13 @@ async fn ServeConnection(
                     CloseConnection(&arcEntity, u64Socket);
                     return;
                 }
+                Report(
+                    &optObserver,
+                    DoIpDirection::Sent,
+                    &strPeer,
+                    false,
+                    &reply.m_vecBytes,
+                );
             }
 
             if reaction.m_bCloseSocket {
@@ -355,6 +454,22 @@ fn CloseConnection(arcEntity: &Arc<Mutex<DoIpEntity>>, u64Socket: u64) {
         .lock()
         .expect("DoIP entity mutex poisoned")
         .CloseConnection(u64Socket);
+}
+
+/// Hand one message to the observer, if there is one.
+///
+/// A free function rather than a method so every call site reads the same, and none of them has
+/// to think about whether an observer is attached — in a test none is.
+fn Report(
+    optObserver: &Option<Arc<dyn DoIpObserver>>,
+    direction: DoIpDirection,
+    strPeer: &str,
+    bIsUdp: bool,
+    arrMessage: &[u8],
+) {
+    if let Some(observer) = optObserver {
+        observer.OnDoIpMessage(direction, strPeer, bIsUdp, arrMessage);
+    }
 }
 
 /// True when a packet's source address is one no host legitimately sends from.

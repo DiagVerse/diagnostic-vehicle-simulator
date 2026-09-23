@@ -23,11 +23,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ::doip::header::c_uHeaderLength;
+use ::doip::payload::PayloadType;
 use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use bridge::observer::{FrameDirection, FrameObserver};
 use can::CanFrame;
+use doip_server::{DoIpDirection, DoIpObserver};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use simulation::RoutingOutcome;
@@ -95,6 +98,31 @@ pub enum TrafficEvent {
         responses: Vec<ExchangeResponse>,
         /// Why nothing answered, when that is the interesting part.
         reason: Option<String>,
+    },
+
+    /// One DoIP message crossing the Ethernet wire.
+    ///
+    /// Kept separate from `Frame` rather than folded into it. They share a direction and a
+    /// length and nothing else: a DoIP message has a peer address and a payload type where a
+    /// CAN frame has an identifier, and squeezing one into the other's shape would mean
+    /// inventing a CAN id for something that has none.
+    #[serde(rename_all = "camelCase")]
+    DoIp {
+        at_ms: u64,
+        /// "rx" for a message the entity received, "tx" for one it sent.
+        direction: String,
+        /// The other end's address and port, so this reads against a packet capture.
+        peer: String,
+        /// "UDP" for discovery, "TCP" for the diagnostic connection.
+        transport: String,
+        /// The ISO 13400-2 payload type, in hex.
+        payload_type_hex: String,
+        /// What that payload type is called, so a reader need not keep Table 17 to hand.
+        payload_name: String,
+        /// The payload after the eight-byte header.
+        payload_hex: String,
+        /// Payload length, sent explicitly so a reader need not count the hex.
+        length: usize,
     },
 
     /// The simulation was loaded, started, stopped or cleared.
@@ -240,6 +268,59 @@ impl Default for TrafficChannel {
 }
 
 /// Lets the CAN bridge announce frames without knowing anything about HTTP.
+impl DoIpObserver for TrafficChannel {
+    fn OnDoIpMessage(
+        &self,
+        direction: DoIpDirection,
+        strPeer: &str,
+        bIsUdp: bool,
+        arrMessage: &[u8],
+    ) {
+        // Read for display only, so a message this engine cannot decode is still shown rather
+        // than dropped: an unknown payload type is exactly the thing worth seeing, and a
+        // monitor that hid it would be silent about the interesting case.
+        let (strTypeHex, strTypeName, arrPayload) = DescribeDoIpMessage(arrMessage);
+
+        self.Publish(TrafficEvent::DoIp {
+            at_ms: NowMs(),
+            direction: direction.Name().to_string(),
+            peer: strPeer.to_string(),
+            transport: if bIsUdp { "UDP" } else { "TCP" }.to_string(),
+            payload_type_hex: strTypeHex,
+            payload_name: strTypeName,
+            payload_hex: FormatHexBytes(arrPayload),
+            length: arrPayload.len(),
+        });
+    }
+}
+
+/// Pick a payload type, a name for it, and the body out of an encoded DoIP message.
+///
+/// Deliberately tolerant. This runs on whatever crossed the wire, including the malformed
+/// things a monitor most needs to show, so a message too short to hold a header is reported as
+/// exactly that rather than skipped.
+fn DescribeDoIpMessage(arrMessage: &[u8]) -> (String, String, &[u8]) {
+    if arrMessage.len() < c_uHeaderLength {
+        return (
+            "----".to_string(),
+            "truncated (shorter than a header)".to_string(),
+            arrMessage,
+        );
+    }
+
+    let u16PayloadType = u16::from_be_bytes([arrMessage[2], arrMessage[3]]);
+    let strName = match PayloadType::FromCode(u16PayloadType) {
+        Some(payloadType) => format!("{payloadType:?}"),
+        None => "unknown payload type".to_string(),
+    };
+
+    (
+        format!("{u16PayloadType:04X}"),
+        strName,
+        &arrMessage[c_uHeaderLength..],
+    )
+}
+
 impl FrameObserver for TrafficChannel {
     fn OnFrame(&self, direction: FrameDirection, frame: &CanFrame) {
         self.Publish(TrafficEvent::Frame {
@@ -428,7 +509,8 @@ pub struct EventsQuery {
     /// dropped connection replays the whole history again, and a monitor that can only hold a
     /// few thousand events pays to parse twenty thousand in order to throw most of them away.
     pub history: Option<usize>,
-    /// Send individual CAN frames as well as decoded exchanges. Defaults to true.
+    /// Send raw wire traffic — CAN frames and DoIP messages — as well as decoded exchanges.
+    /// Defaults to true.
     ///
     /// Turning it off is not cosmetic. A flash transfer puts tens of thousands of frames on the
     /// bus in a minute, and a browser asked to receive, parse and hold all of them stops
@@ -439,7 +521,14 @@ pub struct EventsQuery {
 
 /// True for an event describing one CAN frame rather than a decoded exchange.
 fn IsFrameEvent(event: &TrafficEvent) -> bool {
-    matches!(event, TrafficEvent::Frame { .. })
+    // DoIP messages count too. They are the same kind of thing — one line per message on the
+    // wire, rather than one per decoded exchange — and a flash transfer over Ethernet produces
+    // them at the same rate a CAN one produces frames. A switch that quietly stopped working
+    // once the session moved to Ethernet would be worse than no switch.
+    matches!(
+        event,
+        TrafficEvent::Frame { .. } | TrafficEvent::DoIp { .. }
+    )
 }
 
 /// Turn the broadcast receiver into a stream of SSE events.

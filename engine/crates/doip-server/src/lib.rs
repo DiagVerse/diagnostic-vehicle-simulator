@@ -11,5 +11,5 @@ pub mod server;
 pub mod settings;
 
 pub use entity::{DoIpEntity, Reaction};
-pub use server::{DoIpServer, ServerHandle};
+pub use server::{DoIpDirection, DoIpObserver, DoIpServer, ServerHandle};
 pub use settings::DoIpSettings;
