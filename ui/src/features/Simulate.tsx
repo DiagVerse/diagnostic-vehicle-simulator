@@ -2343,6 +2343,7 @@ function TimingPanel({
   const [draft, setDraft] = useState<EcuTiming | null>(null)
   const [saving, setSaving] = useState(false)
   const [note, setNote] = useState<string | null>(null)
+  const [applyingToAll, setApplyingToAll] = useState(false)
 
   // A broadcast identifier addresses several ECUs, so there is no single timing to edit.
   if (!ecu) {
@@ -2377,6 +2378,38 @@ function TimingPanel({
       onError(DescribeError(e))
     } finally {
       setSaving(false)
+    }
+  }
+
+  /**
+   * Put this ECU's flow control on every ECU in the vehicle.
+   *
+   * Only BlockSize and STmin travel. The delay, the forced ResponsePending and P2/P2* stay
+   * where they are — those are usually set on one ECU deliberately, and a bulk action that
+   * undid that while fixing a link would be worse than no bulk action at all.
+   */
+  async function applyFlowControlToAll() {
+    setApplyingToAll(true)
+    try {
+      const result = await api.setFlowControlForEveryEcu(
+        timing.isoTpBlockSize,
+        timing.isoTpSeparationTimeMin,
+      )
+      setDraft(null)
+      onError(null)
+      setNote(
+        result.ecusChanged === 0
+          ? `All ${result.ecusTotal} ECUs already advertise BlockSize ${result.isoTpBlockSize}. Nothing changed.`
+          : `BlockSize ${result.isoTpBlockSize} and STmin 0x${result.isoTpSeparationTimeMin
+              .toString(16)
+              .toUpperCase()
+              .padStart(2, '0')} applied to ${result.ecusChanged} of ${result.ecusTotal} ECUs. Delays, forced 0x78 and P2 were left alone.`,
+      )
+      await onSaved()
+    } catch (e) {
+      onError(DescribeError(e))
+    } finally {
+      setApplyingToAll(false)
     }
   }
 
@@ -2465,6 +2498,19 @@ function TimingPanel({
             value={timing.isoTpSeparationTimeMin}
             onChange={(v) => update({ isoTpSeparationTimeMin: v })}
           />
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <button
+            onClick={applyFlowControlToAll}
+            disabled={busy || saving || applyingToAll}
+            className="rounded-md border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:border-slate-500 hover:bg-slate-800 disabled:opacity-40"
+          >
+            {applyingToAll ? 'Applying…' : 'Apply to every ECU'}
+          </button>
+          <span className="text-xs text-slate-500">
+            The adapter is shared, so this setting usually is too. Only BlockSize and STmin
+            travel — delays, forced 0x78 and P2 stay where you set them.
+          </span>
         </div>
       </div>
 

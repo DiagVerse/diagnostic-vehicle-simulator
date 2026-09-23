@@ -79,6 +79,16 @@ export interface EcuTiming {
 }
 
 /** The result of changing an ECU's timing. */
+/** What a vehicle-wide flow-control apply actually did. */
+export interface FlowControlApplied {
+  isoTpBlockSize: number
+  isoTpSeparationTimeMin: number
+  /** Excludes ECUs that already held these values, so a repeat apply reports 0. */
+  ecusChanged: number
+  ecusTotal: number
+  changedHandles: string[]
+}
+
 export interface EcuTimingUpdate extends EcuTiming {
   /** ISO 14229-1 carries P2/P2* only in the DiagnosticSessionControl response. */
   advertisedAtNextSessionControl: boolean
@@ -594,4 +604,9 @@ export const api = {
     getJson<EcuTiming>(`/simulation/ecus/${handle}/timing`),
   setEcuTiming: (handle: string, timing: EcuTiming) =>
     putJson<EcuTimingUpdate>(`/simulation/ecus/${handle}/timing`, timing),
+  setFlowControlForEveryEcu: (isoTpBlockSize: number, isoTpSeparationTimeMin: number) =>
+    putJson<FlowControlApplied>('/simulation/flow-control', {
+      isoTpBlockSize,
+      isoTpSeparationTimeMin,
+    }),
 }
