@@ -52,6 +52,9 @@ thiserror = "1"
 anyhow = "1"
 # Scratch space for handing an uploaded archive to the PDX converter and cleaning up after it.
 tempfile = "3"
+# Only for the one thing std cannot express: a second UDP socket sharing a port, so a DoIP
+# discovery answer can be pinned to the interface the entity was bound to.
+socket2 = { version = "0.5", features = ["all"] }
 
 # Internal crates.
 core-domain = { path = "crates/core-domain" }

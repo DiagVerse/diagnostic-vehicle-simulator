@@ -12,6 +12,7 @@ simulation.workspace = true
 application.workspace = true
 core-domain.workspace = true
 tokio.workspace = true
+socket2.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
