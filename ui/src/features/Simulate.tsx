@@ -43,8 +43,8 @@ export function Simulate() {
   const [canIdHex, setCanIdHex] = useState(RememberedEcu)
   const [hexInput, setHexInput] = useState('22 F1 90')
   const [busy, setBusy] = useState(false)
-  const [pdxNotes, setPdxNotes] = useState<string[]>([])
-  const [source, setSource] = useState<VehicleSource>('log')
+  const [pdxNotes, setPdxNotes] = useState<string[]>(RememberedPdxNotes)
+  const [source, setSource] = useState<VehicleSource>(RememberedSource)
 
   useEffect(() => {
     refreshState()
@@ -109,13 +109,15 @@ export function Simulate() {
    * is a decision the operator has to be able to see and disagree with, not a detail to discard
    * once the vehicle is on screen.
    */
-  async function loadPdx(arrBytes: ArrayBuffer, fileName: string) {
+  async function loadPdx(vecFiles: File[], vehicleName: string) {
     setBusy(true)
     setPdxNotes([])
+    RememberPdxNotes([])
     try {
-      const result = await api.simulationLoadPdx(arrBytes, fileName)
+      const result = await api.simulationLoadPdx(vecFiles, vehicleName)
       setState(result)
       setPdxNotes(result.notes)
+      RememberPdxNotes(result.notes)
       setLastResult(null)
       setError(null)
     } catch (e) {
@@ -220,7 +222,13 @@ export function Simulate() {
         </div>
       )}
 
-      <SourcePicker source={source} onChange={setSource} />
+      <SourcePicker
+        source={source}
+        onChange={(chosen) => {
+          setSource(chosen)
+          RememberSource(chosen)
+        }}
+      />
 
       {source === 'log' && <LogLoader onLoad={load} busy={busy} />}
       {source === 'simfile' && <SimFileLoader onLoad={loadSimFile} busy={busy} />}
@@ -603,6 +611,70 @@ function RememberEcu(strCanIdHex: string) {
 
 /** A vehicle is either reconstructed from a capture or stated by hand. */
 type VehicleSource = 'log' | 'simfile' | 'pcap' | 'pdx' | 'build'
+
+const c_vecVehicleSources: VehicleSource[] = ['log', 'simfile', 'pcap', 'pdx', 'build']
+const c_strRememberedSourceKey = 'dvsim.simulate.source'
+
+/**
+ * Which loader was open, so a reload does not silently put you back on the first one.
+ *
+ * Worth remembering because the loaders are not equivalent. The PDX panel keeps a report of
+ * what the converter chose — which ECU variants it set aside — and that report exists nowhere
+ * else; landing back on the CAN log tab after a refresh loses it with no way to ask for it
+ * again short of converting a second time.
+ *
+ * Session storage rather than local: this is about the tab you are working in, not a preference
+ * to carry into next week.
+ */
+function RememberedSource(): VehicleSource {
+  try {
+    const strStored = sessionStorage.getItem(c_strRememberedSourceKey)
+    const chosen = c_vecVehicleSources.find((candidate) => candidate === strStored)
+    return chosen ?? 'log'
+  } catch {
+    // Private browsing and blocked site data both throw here. Opening on the first tab is a
+    // far better outcome than failing to render at all.
+    return 'log'
+  }
+}
+
+function RememberSource(source: VehicleSource) {
+  try {
+    sessionStorage.setItem(c_strRememberedSourceKey, source)
+  } catch {
+    // Nothing to do, and nothing worth telling the operator about.
+  }
+}
+
+const c_strRememberedPdxNotesKey = 'dvsim.simulate.pdxNotes'
+
+/**
+ * The converter's report, kept across a reload for the same reason the chosen tab is.
+ *
+ * Which ECU variants were set aside is recorded nowhere else — not in the vehicle, not in the
+ * engine's state — so losing it to a refresh means converting again to see it.
+ */
+function RememberedPdxNotes(): string[] {
+  try {
+    const strStored = sessionStorage.getItem(c_strRememberedPdxNotesKey)
+    if (!strStored) return []
+    const parsed: unknown = JSON.parse(strStored)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((entry): entry is string => typeof entry === 'string')
+  } catch {
+    // Blocked site data, or a stored value from an older shape. Either way the report is worth
+    // less than the page rendering.
+    return []
+  }
+}
+
+function RememberPdxNotes(vecNotes: string[]) {
+  try {
+    sessionStorage.setItem(c_strRememberedPdxNotesKey, JSON.stringify(vecNotes))
+  } catch {
+    // Nothing to do, and nothing worth telling the operator about.
+  }
+}
 
 function SourcePicker({
   source,
@@ -1059,23 +1131,49 @@ function StemOf(strFileName: string | null): string {
   return strFileName.replace(/\.[^.]+$/, '') || strFileName
 }
 
+/**
+ * The folder a chosen file came from, when the browser says.
+ *
+ * Only a directory picker fills `webkitRelativePath`; choosing files individually leaves it
+ * empty, which is why the caller has a fallback rather than treating this as always available.
+ */
+function FolderOf(file: File): string | null {
+  const strPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath
+  if (!strPath) return null
+  const strFolder = strPath.split('/')[0]
+  return strFolder || null
+}
+
 function PdxLoader({
   onLoad,
   busy,
   notes,
 }: {
-  onLoad: (arrBytes: ArrayBuffer, fileName: string) => void
+  onLoad: (vecFiles: File[], vehicleName: string) => void
   busy: boolean
   notes: string[]
 }) {
-  const [fileName, setFileName] = useState<string | null>(null)
-  const [sizeBytes, setSizeBytes] = useState(0)
-  const [arrBytes, setBytes] = useState<ArrayBuffer | null>(null)
+  const [vecFiles, setFiles] = useState<File[]>([])
 
-  async function readFile(file: File) {
-    setFileName(file.name)
-    setSizeBytes(file.size)
-    setBytes(await file.arrayBuffer())
+  const sizeBytes = vecFiles.reduce((total, file) => total + file.size, 0)
+
+  /**
+   * What to call the vehicle these files describe.
+   *
+   * One file names itself. Several have no single name, so the folder they came from is used
+   * where the browser gives it and a plain label where it does not.
+   *
+   * Deliberately no count. "3 ECUs from ODX" was the first attempt and it was wrong on its
+   * first real use: three files produced two ECUs, because two of them described the same
+   * address and one was set aside. A name that can contradict the vehicle beside it is worse
+   * than a name that says less.
+   */
+  function VehicleName(): string {
+    if (vecFiles.length === 1) return StemOf(vecFiles[0].name)
+
+    const strFolder = FolderOf(vecFiles[0])
+    if (strFolder) return strFolder
+    return 'Vehicle from ODX'
   }
 
   return (
@@ -1088,9 +1186,9 @@ function PdxLoader({
       </div>
 
       <p className="mt-2 text-xs leading-relaxed text-slate-500">
-        A single <code>.pdx</code>, or a zip holding one per ECU &mdash; which is how a delivery
-        usually arrives. Addresses, services, sessions, security levels and trouble codes are
-        read out of the ODX.
+        One <code>.pdx</code>, several of them at once, or a zip holding a set &mdash; a delivery
+        is one archive per ECU, so selecting the whole folder is the normal case. Addresses,
+        services, sessions, security levels and trouble codes are read out of the ODX.
       </p>
       <p className="mt-2 text-xs leading-relaxed text-amber-500/80">
         Data identifier <em>values</em> are placeholders. ODX states what an ECU answers and the
@@ -1100,32 +1198,34 @@ function PdxLoader({
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500">
-          Choose file&hellip;
+          Choose files&hellip;
           <input
             type="file"
             accept=".pdx,.zip"
+            multiple
             className="hidden"
             onChange={(e) => {
-              const file = e.target.files?.[0]
-              if (file) readFile(file)
+              const vecChosen = Array.from(e.target.files ?? [])
+              if (vecChosen.length > 0) setFiles(vecChosen)
               e.target.value = ''
             }}
           />
         </label>
 
         <button
-          // The name travels with the bytes: the engine stages the upload under a name of its
-          // own, so without this the vehicle ends up called after that staging file.
-          onClick={() => arrBytes && onLoad(arrBytes, StemOf(fileName))}
-          disabled={busy || arrBytes === null}
+          // The name travels with the files: the engine stages them under a directory of its
+          // own, so without this the vehicle ends up called after that staging directory.
+          onClick={() => vecFiles.length > 0 && onLoad(vecFiles, VehicleName())}
+          disabled={busy || vecFiles.length === 0}
           className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
         >
           {busy ? 'Converting\u2026' : 'Convert & simulate'}
         </button>
 
-        {fileName && (
+        {vecFiles.length > 0 && (
           <span className="font-mono text-xs text-slate-400">
-            {fileName} &middot; {(sizeBytes / (1024 * 1024)).toFixed(1)} MB
+            {vecFiles.length === 1 ? vecFiles[0].name : `${vecFiles.length} files`} &middot;{' '}
+            {(sizeBytes / (1024 * 1024)).toFixed(1)} MB
           </span>
         )}
       </div>

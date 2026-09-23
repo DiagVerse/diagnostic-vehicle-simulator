@@ -527,6 +527,24 @@ async function postBinary<T>(path: string, arrBody: ArrayBuffer): Promise<T> {
   return (await res.json()) as T
 }
 
+/**
+ * Post files as multipart, which is how several of them travel in one request.
+ *
+ * The browser sets the content type itself, including the boundary it generated — setting it
+ * by hand produces a header with no boundary in it and a body the server cannot split.
+ */
+async function postFiles<T>(path: string, vecFiles: File[]): Promise<T> {
+  const form = new FormData()
+  for (const file of vecFiles) {
+    form.append('files', file, file.name)
+  }
+  const res = await fetch(path, { method: 'POST', body: form })
+  if (!res.ok) {
+    throw new Error(await describeFailure(path, res))
+  }
+  return (await res.json()) as T
+}
+
 async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -579,14 +597,17 @@ export const api = {
   /**
    * Convert an ODX/PDX archive and load the vehicle it describes.
    *
+   * Takes one file or many: a delivery is one PDX per ECU, so selecting fifty of them at once
+   * is the normal case rather than the exotic one.
+   *
    * Slower than the other loaders by a wide margin — the engine runs a converter that resolves
-   * ODX inheritance across every document in the archive — so callers should expect tens of
-   * seconds on a whole vehicle's delivery rather than the instant the others take.
+   * ODX inheritance across every document — so callers should expect tens of seconds on a whole
+   * vehicle's delivery rather than the instant the others take.
    */
-  simulationLoadPdx: (arrArchive: ArrayBuffer, fileName: string) =>
-    postBinary<PdxConversion>(
-      `/simulation/pdx?name=${encodeURIComponent(fileName)}`,
-      arrArchive,
+  simulationLoadPdx: (vecFiles: File[], vehicleName: string) =>
+    postFiles<PdxConversion>(
+      `/simulation/pdx?name=${encodeURIComponent(vehicleName)}`,
+      vecFiles,
     ),
   simulationReset: () => postJson<SimulationState>('/simulation/reset', {}),
   simulationStart: () => postJson<SimulationState>('/simulation/start', {}),
