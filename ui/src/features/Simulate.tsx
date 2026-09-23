@@ -1510,6 +1510,21 @@ function EcuCard({
                 rename
               </button>
               <button
+                onClick={() => run(async () => {
+                  await api.simulationSetGateway(ecu.handle)
+                  return api.simulationState()
+                })}
+                disabled={busy || working || ecu.isGateway}
+                title={
+                  ecu.isGateway
+                    ? 'This ECU already fronts the vehicle'
+                    : 'Make this the ECU a tester meets first, with every other one behind it'
+                }
+                className="text-xs text-slate-500 transition hover:text-sky-300 disabled:opacity-40"
+              >
+                {ecu.isGateway ? 'gateway' : 'make gateway'}
+              </button>
+              <button
                 onClick={() => run(() => api.simulationRemoveEcu(ecu.handle))}
                 disabled={busy || working}
                 title="Remove this ECU from the vehicle"
