@@ -118,14 +118,55 @@ impl DoIpServer {
         let tcpListener = TcpListener::bind(bindAddress).await?;
         let tcpAddress = tcpListener.local_addr()?;
 
-        // The discovery socket takes the port the TCP listener ended up on, so a test that asks
-        // for an ephemeral port still finds both halves together.
-        let mut udpAddress = bindAddress;
+        // Discovery listens on every interface whatever address the caller chose, because a
+        // vehicle identification request arrives as a **broadcast** and a socket bound to one
+        // address does not receive one. Binding it the way the TCP listener is bound — which is
+        // the obvious thing, and what this did — makes an entity that is perfectly reachable by
+        // a tester that already knows its address and cannot be discovered by one that does not.
+        let mut udpAddress: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, 0).into();
         udpAddress.set_port(tcpAddress.port());
         let udpSocket = UdpSocket::bind(udpAddress).await?;
         udpSocket.set_broadcast(true)?;
 
-        tracing::info!(tcp = %tcpAddress, "DoIP entity listening");
+        // What a discovery answer is *sent from* is a different question, and the one that
+        // decides whether a tester can then connect: a tester reads the vehicle's address off
+        // the source of the announcement, so replying from a different interface than the TCP
+        // listener sits on sends it somewhere nothing is listening.
+        //
+        // With no address chosen there is nothing to pin and the routing table decides, which is
+        // right. With one chosen, replies go out a second socket bound to it.
+        let optReplySocket = match bindAddress.ip() {
+            std::net::IpAddr::V4(address) if !address.is_unspecified() => {
+                let replyAddress = SocketAddr::from((address, tcpAddress.port()));
+                match BindReplySocket(replyAddress) {
+                    Ok(socket) => Some(Arc::new(socket)),
+                    Err(error) => {
+                        // Not fatal: discovery still works, the announcement just carries
+                        // whichever source address the routing table picks. Said out loud
+                        // because that is exactly the condition that is hard to diagnose later.
+                        tracing::warn!(
+                            %error,
+                            address = %replyAddress,
+                            "could not pin discovery answers to this address; they will use \
+                             whichever interface the routing table chooses"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        tracing::info!(
+            tcp = %tcpAddress,
+            discovery = %udpSocket.local_addr()?,
+            answersFrom = %optReplySocket
+                .as_ref()
+                .and_then(|socket| socket.local_addr().ok())
+                .map(|address| address.to_string())
+                .unwrap_or_else(|| "whichever interface routes to the tester".to_string()),
+            "DoIP entity listening"
+        );
 
         // Shared with every connection task so an elapsed timer can reach the socket it
         // belongs to. Created before the spawns, which both need it.
@@ -134,6 +175,7 @@ impl DoIpServer {
         let taskUdp = tokio::spawn(RunUdp(
             Arc::clone(&arcEntity),
             udpSocket,
+            optReplySocket,
             optObserver.clone(),
         ));
         let taskTcp = tokio::spawn(RunTcp(
@@ -158,20 +200,58 @@ impl DoIpServer {
 async fn RunUdp(
     arcEntity: Arc<Mutex<DoIpEntity>>,
     socket: UdpSocket,
+    optReplySocket: Option<Arc<UdpSocket>>,
     optObserver: Option<Arc<dyn DoIpObserver>>,
 ) {
     // Shared with the tasks that send delayed answers. `send_to` takes `&self`, so several may
     // hold it at once without any locking of our own.
-    let arcSocket = Arc::new(socket);
+    let arcListenSocket = Arc::new(socket);
+    // Answers go out the pinned socket when there is one, and otherwise back out the one they
+    // arrived on.
+    let arcSocket = optReplySocket
+        .clone()
+        .unwrap_or_else(|| Arc::clone(&arcListenSocket));
     let mut arrBuffer = vec![0u8; c_uMaxDatagram];
 
+    let mut arrSecondBuffer = vec![0u8; c_uMaxDatagram];
+
     loop {
-        let (uLength, fromAddress) = match arcSocket.recv_from(&mut arrBuffer).await {
+        // Both sockets are read, and this is not optional. Binding the pinned socket to the same
+        // port makes the operating system deliver *unicast* datagrams to it rather than to the
+        // one on `0.0.0.0` — the more specific bind wins — so a discovery request sent straight
+        // to the entity's address went unanswered while a broadcast still worked. Reading only
+        // the socket that was bound first is what produced that, and it is a strange failure to
+        // meet: discoverable by a tester that knows nothing and silent to one that knows where
+        // to look.
+        let received = match &optReplySocket {
+            Some(arcPinned) => {
+                tokio::select! {
+                    result = arcListenSocket.recv_from(&mut arrBuffer) => {
+                        result.map(|(uLength, from)| (uLength, from, false))
+                    }
+                    result = arcPinned.recv_from(&mut arrSecondBuffer) => {
+                        result.map(|(uLength, from)| (uLength, from, true))
+                    }
+                }
+            }
+            None => arcListenSocket
+                .recv_from(&mut arrBuffer)
+                .await
+                .map(|(uLength, from)| (uLength, from, false)),
+        };
+
+        let (uLength, fromAddress, bOnPinned) = match received {
             Ok(received) => received,
             Err(error) => {
                 tracing::warn!(%error, "the DoIP discovery socket failed");
                 return;
             }
+        };
+
+        let arrDatagram: &[u8] = if bOnPinned {
+            &arrSecondBuffer[..uLength]
+        } else {
+            &arrBuffer[..uLength]
         };
 
         // A packet whose source is itself a broadcast or multicast address is ignored outright
@@ -185,12 +265,12 @@ async fn RunUdp(
             DoIpDirection::Received,
             &fromAddress.to_string(),
             true,
-            &arrBuffer[..uLength],
+            arrDatagram,
         );
 
         let reaction = {
             let entity = arcEntity.lock().expect("DoIP entity mutex poisoned");
-            entity.HandleUdp(&arrBuffer[..uLength])
+            entity.HandleUdp(arrDatagram)
         };
 
         for reply in reaction.m_vecReplies {
@@ -470,6 +550,25 @@ fn Report(
     if let Some(observer) = optObserver {
         observer.OnDoIpMessage(direction, strPeer, bIsUdp, arrMessage);
     }
+}
+
+/// A second discovery socket bound to one address, for sending answers from it.
+///
+/// Needs `SO_REUSEADDR` and `SO_REUSEPORT` because the listening socket already holds the same
+/// port on `0.0.0.0`. The two are not in competition: this one is only ever written to.
+fn BindReplySocket(address: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.set_broadcast(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+
+    UdpSocket::from_std(std::net::UdpSocket::from(socket))
 }
 
 /// True when a packet's source address is one no host legitimately sends from.
