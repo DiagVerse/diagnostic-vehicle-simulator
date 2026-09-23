@@ -21,3 +21,4 @@ yarn-error.log*
 .vscode/*
 !.vscode/extensions.json
 *.swp
+__pycache__/
