@@ -101,6 +101,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/simulation/identity",
             get(simulation::GetVehicleIdentity).put(simulation::PutVehicleIdentity),
         )
+        .route("/simulation/gateway", put(simulation::PutVehicleGateway))
         .route("/simulation/state", get(simulation::GetSimulationState))
         .route(
             "/simulation/request",

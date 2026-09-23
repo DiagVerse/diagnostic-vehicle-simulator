@@ -353,3 +353,146 @@ fn a_broadcast_skips_an_ecu_behind_a_gateway_that_is_switched_off() {
         "the gateway is off and the engine sits behind it"
     );
 }
+
+// ---------------------------------------------------------------- naming the gateway
+
+/// A flat vehicle: three DoIP ECUs, none of them marked as fronting the others. This is what a
+/// PDX delivery and a DoIP capture both produce, because neither source records what is wired
+/// to what.
+const c_strFlatSimFile: &str = r#"{
+  "simfileVersion": 2,
+  "vehicle": "Flat vehicle",
+  "ecus": [
+    { "name": "Airbag", "doip": { "logicalAddress": "0x100B" },
+      "sessions": ["default"], "dids": { "F18C": { "text": "SRS" } } },
+    { "name": "S-GW4", "doip": { "logicalAddress": "0x00D4" },
+      "sessions": ["default"], "dids": { "F18C": { "text": "GW" } } },
+    { "name": "Engine", "doip": { "logicalAddress": "0x1004" },
+      "sessions": ["default"], "dids": { "F18C": { "text": "ENG" } } }
+  ]
+}"#;
+
+fn LoadFlat() -> SimulationService {
+    let mut simulation = SimulationService::New();
+    simulation
+        .LoadFromSimFileText(c_strFlatSimFile)
+        .expect("the flat simfile should load");
+    simulation.Start();
+    simulation
+}
+
+fn KeyOf(simulation: &SimulationService, u16LogicalAddress: u16) -> EcuKey {
+    simulation
+        .RunningEcus()
+        .find(|(_, ecu)| ecu.Config().m_u16LogicalAddress == u16LogicalAddress)
+        .map(|(key, _)| key)
+        .expect("an ECU at that logical address")
+}
+
+#[test]
+fn naming_a_gateway_puts_every_other_ecu_behind_it() {
+    // The one action that replaces a network declaration plus a placement call per ECU. On a
+    // fifty-ECU delivery that cost is why vehicles with a real gateway were left flat.
+    let mut simulation = LoadFlat();
+    let gateway = KeyOf(&simulation, 0x00D4);
+
+    simulation
+        .SetVehicleGateway(gateway)
+        .expect("the ECU exists and the wiring is valid");
+
+    let vehicle = simulation.Vehicle().expect("a vehicle is loaded");
+    let ecuGateway = vehicle
+        .m_vecEcus
+        .iter()
+        .find(|ecu| ecu.m_u16LogicalAddress == 0x00D4)
+        .expect("the gateway");
+    assert_eq!(
+        ecuGateway.m_vecGatewayForNetworkIds.len(),
+        1,
+        "it forwards onto exactly one link"
+    );
+
+    let strBehind = ecuGateway.m_vecGatewayForNetworkIds[0].clone();
+    for ecu in &vehicle.m_vecEcus {
+        if ecu.m_u16LogicalAddress == 0x00D4 {
+            continue;
+        }
+        assert_eq!(
+            ecu.m_optStrNetworkId.as_deref(),
+            Some(strBehind.as_str()),
+            "'{}' sits behind the gateway",
+            ecu.m_strName
+        );
+        assert!(
+            ecu.m_vecGatewayForNetworkIds.is_empty(),
+            "and is not itself a gateway"
+        );
+    }
+}
+
+#[test]
+fn switching_the_gateway_off_takes_the_whole_vehicle_off_the_air() {
+    // The behaviour that makes naming a gateway worth doing rather than cosmetic. A locked
+    // gateway is the only way in, so losing it loses everything behind it — flat, it silenced
+    // one ECU and left the rest cheerfully answering, which is not a vehicle any tester meets.
+    let mut simulation = LoadFlat();
+    let gateway = KeyOf(&simulation, 0x00D4);
+    let engine = KeyOf(&simulation, 0x1004);
+
+    // Flat first: the engine answers with the gateway switched off.
+    simulation
+        .SetEcuEnabled(gateway, false)
+        .expect("the gateway can be switched off");
+    let outcome = simulation.ProcessByLogicalAddress(0x1004, &[0x22, 0xF1, 0x8C], &UdsHandler);
+    assert!(
+        matches!(outcome, RoutingOutcome::Handled(_)),
+        "flat, nothing is behind anything, so it still answers"
+    );
+
+    simulation
+        .SetEcuEnabled(gateway, true)
+        .expect("back on for the real test");
+    simulation
+        .SetVehicleGateway(gateway)
+        .expect("name the gateway");
+    simulation
+        .SetEcuEnabled(gateway, false)
+        .expect("and switch it off again");
+
+    match simulation.ProcessByLogicalAddress(0x1004, &[0x22, 0xF1, 0x8C], &UdsHandler) {
+        RoutingOutcome::Silenced { strReason, .. } => {
+            assert!(
+                strReason.contains("S-GW4"),
+                "and says which gateway took it off the air: {strReason}"
+            );
+        }
+        other => panic!("expected the engine to be unreachable, got {other:?}"),
+    }
+    let _ = engine;
+}
+
+#[test]
+fn naming_a_different_gateway_moves_the_role_rather_than_adding_one() {
+    // A vehicle has one front door. Leaving the previous one marked would draw a topology with
+    // two gateways and make the DoIP entity address ambiguous.
+    let mut simulation = LoadFlat();
+    simulation
+        .SetVehicleGateway(KeyOf(&simulation, 0x00D4))
+        .expect("first gateway");
+    simulation
+        .SetVehicleGateway(KeyOf(&simulation, 0x100B))
+        .expect("second gateway replaces it");
+
+    let vehicle = simulation.Vehicle().expect("a vehicle is loaded");
+    let vecGateways: Vec<&str> = vehicle
+        .m_vecEcus
+        .iter()
+        .filter(|ecu| !ecu.m_vecGatewayForNetworkIds.is_empty())
+        .map(|ecu| ecu.m_strName.as_str())
+        .collect();
+    assert_eq!(
+        vecGateways,
+        vec!["Airbag"],
+        "exactly one, and it is the new one"
+    );
+}

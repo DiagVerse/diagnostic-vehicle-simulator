@@ -21,9 +21,10 @@ use std::collections::BTreeMap;
 use application::ProtocolHandler;
 use can::confinement::FaultConfinement;
 use core_domain::model::{
-    CanAddress, Ecu, EcuTiming, Network, ResponseOverride, SecurityLevel, TimingValidationError,
-    Vehicle, VehicleIdentity,
+    CanAddress, Ecu, EcuTiming, Network, NetworkKind, ResponseOverride, SecurityLevel,
+    TimingValidationError, Vehicle, VehicleIdentity,
 };
+use core_domain::Confidence;
 use doip::messages::IsFunctionalAddress;
 use ecu::schedule::ResponsePlan;
 use ecu::VirtualEcu;
@@ -46,6 +47,11 @@ const c_arrFunctionallySuppressedNrcs: [u8; 5] = [
 /// flow control, so ISO 15765-2 permits a SingleFrame only — seven payload bytes with normal
 /// addressing.
 const c_uMaxFunctionalRequestBytes: usize = 7;
+
+/// The link a tester attaches to when an operator names a gateway, and the one everything else
+/// is put on. Fixed ids so naming a gateway twice replaces the pair rather than accumulating.
+const c_strGatewayLinkId: &str = "diagnostic-link";
+const c_strBehindGatewayLinkId: &str = "behind-gateway";
 
 /// How the simulation refers to one running ECU internally.
 ///
@@ -995,6 +1001,109 @@ impl SimulationService {
             gatewayFor = ?vecGatewayForNetworkIds,
             "ECU placement set"
         );
+        Ok(())
+    }
+
+    /// Make one ECU the vehicle's gateway, with every other ECU behind it.
+    ///
+    /// A gateway forwards onto *networks*, so saying "this ECU fronts the vehicle" means putting
+    /// the others on a network and naming this ECU as its gateway. Doing that by hand is a
+    /// network to declare and one placement call per ECU — fifty of them on a real delivery — and
+    /// that cost is why vehicles that genuinely have a gateway were being simulated flat.
+    ///
+    /// Flat is not a harmless simplification. It costs three things that are real on a vehicle
+    /// whose gateway fronts everything:
+    ///
+    /// * The DoIP entity address. The entity a tester meets *is* the gateway, and with none
+    ///   marked the engine falls back to the lowest logical address — an arbitrary ECU.
+    /// * Switching the gateway off. On a locked gateway that takes the whole vehicle off the
+    ///   air; flat, it silences one ECU and leaves the rest answering.
+    /// * The topology diagram, which draws a row of peers rather than what is actually there.
+    ///
+    /// Re-callable: naming a different ECU moves the role rather than adding a second gateway.
+    /// The ECUs are *placed*, not renamed or re-addressed, so nothing about how a tester reaches
+    /// them changes — this says who forwards to whom, and only that.
+    pub fn SetVehicleGateway(&mut self, key: EcuKey) -> Result<(), SimulationError> {
+        let mut vehicle = self.CloneVehicleForEdit()?;
+
+        let optGateway = vehicle
+            .m_vecEcus
+            .iter()
+            .find(|config| MatchesKey(config, key));
+        let strGatewayName = match optGateway {
+            Some(config) => config.m_strName.clone(),
+            None => {
+                return Err(SimulationError::EcuNotFound {
+                    strHandle: DescribeKey(key),
+                })
+            }
+        };
+
+        // Two links: the one a tester attaches to, and the one everything else sits on. Both are
+        // named for what they are rather than for the gateway, so renaming the ECU later does
+        // not leave a network called after a name nothing uses any more.
+        vehicle.m_vecNetworks.retain(|network| {
+            network.m_strId != c_strGatewayLinkId && network.m_strId != c_strBehindGatewayLinkId
+        });
+        vehicle.m_vecNetworks.push(Network {
+            m_strId: c_strGatewayLinkId.to_string(),
+            m_strName: "Diagnostic link".to_string(),
+            m_kind: NetworkKind::EthernetDoIp,
+            m_bIsDiagnosticEntryPoint: true,
+            m_optU32BitrateBps: None,
+            m_optU32DataBitrateBps: None,
+            m_confidence: Confidence::Inferred,
+        });
+        vehicle.m_vecNetworks.push(Network {
+            m_strId: c_strBehindGatewayLinkId.to_string(),
+            m_strName: format!("Behind {strGatewayName}"),
+            m_kind: NetworkKind::Unknown,
+            m_bIsDiagnosticEntryPoint: false,
+            m_optU32BitrateBps: None,
+            m_optU32DataBitrateBps: None,
+            m_confidence: Confidence::Inferred,
+        });
+
+        for config in &mut vehicle.m_vecEcus {
+            if MatchesKey(config, key) {
+                config.m_optStrNetworkId = Some(c_strGatewayLinkId.to_string());
+                config.m_vecGatewayForNetworkIds = vec![c_strBehindGatewayLinkId.to_string()];
+            } else {
+                config.m_optStrNetworkId = Some(c_strBehindGatewayLinkId.to_string());
+                // Any ECU that used to forward somewhere is no longer a gateway: a vehicle has
+                // one front door, and leaving a second one marked would draw a topology with two
+                // and make the entity address ambiguous.
+                config.m_vecGatewayForNetworkIds.clear();
+            }
+        }
+
+        self.CommitVehicleEdit(vehicle)?;
+
+        // The running ECUs carry their own copy of the placement, and a stale one would make the
+        // diagram and the simulation disagree about the same ECU.
+        let vecKeys: Vec<EcuKey> = self.m_mapEcus.keys().copied().collect();
+        for otherKey in vecKeys {
+            let runningEcu = match self.m_mapEcus.get_mut(&otherKey) {
+                Some(runningEcu) => runningEcu,
+                None => continue,
+            };
+            if otherKey == key {
+                runningEcu.SetPlacement(
+                    Some(c_strGatewayLinkId.to_string()),
+                    vec![c_strBehindGatewayLinkId.to_string()],
+                );
+            } else {
+                runningEcu.SetPlacement(Some(c_strBehindGatewayLinkId.to_string()), Vec::new());
+            }
+        }
+
+        tracing::info!(
+            ecu = %strGatewayName,
+            addressedOn = %DescribeKey(key),
+            behind = self.m_mapEcus.len().saturating_sub(1),
+            "gateway named; every other ECU is now behind it"
+        );
+        self.BumpModelRevision();
         Ok(())
     }
 

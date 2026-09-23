@@ -121,6 +121,13 @@ export interface SimulationEcu {
   timing: EcuTiming
   /** Whether the ECU is switched on. Off keeps its configuration and answers nothing. */
   isEnabled: boolean
+  /**
+   * True when this ECU forwards diagnostics onto a link behind it.
+   *
+   * It is what a tester meets first, and what takes the rest of the vehicle with it when
+   * switched off — neither of which is visible from a list of addresses.
+   */
+  isGateway: boolean
 }
 
 /** What the engine currently has loaded. */
@@ -656,6 +663,14 @@ export const api = {
   simulationRequest: (canIdHex: string, requestHex: string) =>
     postJson<SimulationRequestResult>('/simulation/request', { canIdHex, requestHex }),
   simulationTopology: () => getJson<Topology>('/simulation/topology'),
+  /**
+   * Name the ECU that fronts the vehicle, putting every other one behind it.
+   *
+   * One call instead of a network declaration plus a placement per ECU. It changes who forwards
+   * to whom and nothing about how a tester addresses anything.
+   */
+  simulationSetGateway: (handle: string) =>
+    putJson<Topology>('/simulation/gateway', { handle }),
   simulationDeclareNetwork: (network: NewNetwork) =>
     postJson<Topology>('/simulation/networks', network),
   simulationRemoveNetwork: (networkId: string) =>

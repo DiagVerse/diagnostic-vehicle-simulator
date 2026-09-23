@@ -225,6 +225,12 @@ pub struct SimulationEcuDto {
     /// Whether the ECU is switched on. A switched-off ECU stays listed, keeps its
     /// configuration, and answers nothing.
     pub is_enabled: bool,
+    /// True when this ECU forwards diagnostics onto a link behind it.
+    ///
+    /// Reported per ECU because it is what a tester meets first and what takes the rest of the
+    /// vehicle with it when it is switched off — two consequences an operator cannot see from a
+    /// list of addresses.
+    pub is_gateway: bool,
 }
 
 /// What is currently loaded and running.
@@ -2355,6 +2361,7 @@ fn BuildEcuDto(key: EcuKey, runningEcu: &VirtualEcu) -> SimulationEcuDto {
         dids: config.m_mapDids.keys().copied().collect(),
         dtc_count: config.m_vecDtcs.len(),
         is_enabled: config.m_bIsEnabled,
+        is_gateway: !config.m_vecGatewayForNetworkIds.is_empty(),
     }
 }
 
@@ -2786,6 +2793,34 @@ pub async fn PutEcuPlacement(
     let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
     simulation
         .SetEcuPlacement(key, optStrNetworkId, body.gateway_for_network_ids.clone())
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+
+    Ok(Json(BuildTopologyDto(&simulation)))
+}
+
+/// Request body for `PUT /simulation/gateway`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGatewayBody {
+    /// The ECU that fronts the vehicle, by handle.
+    pub handle: String,
+}
+
+/// PUT /simulation/gateway — name the ECU that fronts the vehicle.
+///
+/// Puts every other ECU behind it in one call. Doing it by hand is a network to declare and one
+/// placement call per ECU, which on a fifty-ECU delivery is why vehicles that genuinely have a
+/// gateway were left modelled flat — and flat costs the DoIP entity address, the effect of
+/// switching the gateway off, and the shape of the topology diagram.
+pub async fn PutVehicleGateway(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SetGatewayBody>,
+) -> Result<Json<TopologyDto>, ApiError> {
+    let key = ParseEcuHandle(&body.handle).map_err(ApiError::BadRequest)?;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .SetVehicleGateway(key)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
 
     Ok(Json(BuildTopologyDto(&simulation)))
