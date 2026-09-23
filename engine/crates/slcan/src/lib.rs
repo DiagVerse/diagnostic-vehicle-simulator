@@ -148,6 +148,115 @@ pub fn EncodeFrame(frame: &CanFrame) -> String {
     strLine
 }
 
+/// The host-to-adapter line speeds the `U` command selects.
+///
+/// **Not the CAN bitrate.** This is the UART between the PC and the dongle, and it is the one
+/// that decides whether a long multi-frame request survives: a 500 kbit/s bus delivers roughly
+/// 3703 frames per second while a 115200-baud SLCAN line carries about 426, so the link is the
+/// bottleneck by a factor of eight and raising it is the only fix that costs nothing on the
+/// wire.
+///
+/// The digits are LAWICEL's, and firmwares vary in which they implement — several support only
+/// the two slowest. An unsupported digit is answered with BEL rather than accepted, which is
+/// why the command is always confirmed rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlcanLineSpeed {
+    Baud230400,
+    Baud115200,
+    Baud57600,
+    Baud38400,
+    Baud19200,
+    Baud9600,
+    Baud2400,
+}
+
+impl SlcanLineSpeed {
+    /// The `U<n>` digit this speed is selected with.
+    pub fn ToCommandDigit(self) -> char {
+        match self {
+            SlcanLineSpeed::Baud230400 => '0',
+            SlcanLineSpeed::Baud115200 => '1',
+            SlcanLineSpeed::Baud57600 => '2',
+            SlcanLineSpeed::Baud38400 => '3',
+            SlcanLineSpeed::Baud19200 => '4',
+            SlcanLineSpeed::Baud9600 => '5',
+            SlcanLineSpeed::Baud2400 => '6',
+        }
+    }
+
+    /// Bits per second, which is what the host's UART must then be set to.
+    pub fn ToBitsPerSecond(self) -> u32 {
+        match self {
+            SlcanLineSpeed::Baud230400 => 230_400,
+            SlcanLineSpeed::Baud115200 => 115_200,
+            SlcanLineSpeed::Baud57600 => 57_600,
+            SlcanLineSpeed::Baud38400 => 38_400,
+            SlcanLineSpeed::Baud19200 => 19_200,
+            SlcanLineSpeed::Baud9600 => 9_600,
+            SlcanLineSpeed::Baud2400 => 2_400,
+        }
+    }
+
+    /// Pick the setting for a bits-per-second value, or `None` if `U` cannot express it.
+    ///
+    /// Returning `None` rather than rounding to the nearest is deliberate. A caller asking for
+    /// 921600 wants 921600; silently giving it 230400 and reporting success would leave an
+    /// operator believing the link is four times faster than it is, and then blaming the
+    /// simulator for the frames that go missing.
+    pub fn FromBitsPerSecond(u32BitsPerSecond: u32) -> Option<SlcanLineSpeed> {
+        let arrAll = [
+            SlcanLineSpeed::Baud230400,
+            SlcanLineSpeed::Baud115200,
+            SlcanLineSpeed::Baud57600,
+            SlcanLineSpeed::Baud38400,
+            SlcanLineSpeed::Baud19200,
+            SlcanLineSpeed::Baud9600,
+            SlcanLineSpeed::Baud2400,
+        ];
+        arrAll
+            .into_iter()
+            .find(|speed| speed.ToBitsPerSecond() == u32BitsPerSecond)
+    }
+
+    /// The speeds this command can select, fastest first.
+    pub fn All() -> [SlcanLineSpeed; 7] {
+        [
+            SlcanLineSpeed::Baud230400,
+            SlcanLineSpeed::Baud115200,
+            SlcanLineSpeed::Baud57600,
+            SlcanLineSpeed::Baud38400,
+            SlcanLineSpeed::Baud19200,
+            SlcanLineSpeed::Baud9600,
+            SlcanLineSpeed::Baud2400,
+        ]
+    }
+}
+
+/// The command that asks an adapter to change its own UART speed.
+///
+/// The adapter answers at the **old** speed and only then switches, so a caller must read the
+/// acknowledgement before reopening the port — see `bridge::probe::CommandLineSpeed`.
+pub fn LineSpeedCommand(speed: SlcanLineSpeed) -> String {
+    format!("U{}\r", speed.ToCommandDigit())
+}
+
+/// Whether a reply is an acknowledgement (`\r`) or a refusal (BEL), or neither yet.
+///
+/// Both are one byte and there is no third answer, so anything else means the reply has not
+/// arrived — not that it was refused. Treating "nothing yet" as a refusal is how a working
+/// adapter gets reported as unsupported on a slow host.
+pub fn ReadAcknowledgement(arrBytes: &[u8]) -> Option<bool> {
+    for byByte in arrBytes {
+        if *byByte == c_byTerminator {
+            return Some(true);
+        }
+        if *byByte == c_byBell {
+            return Some(false);
+        }
+    }
+    None
+}
+
 /// Commands that open a channel at a bitrate, in the order an adapter requires.
 ///
 /// The close comes first on purpose: an adapter left open by a crashed process rejects the

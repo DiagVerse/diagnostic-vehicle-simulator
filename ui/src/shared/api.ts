@@ -266,6 +266,17 @@ export interface HardwareStatus {
   framesSent: number
 }
 
+/** What came of asking an adapter to change its own UART speed. */
+export interface LineSpeedChange {
+  /** `confirmed`, `refused`, `notConfirmed` or `noRealSerialLine`. */
+  outcome: string
+  /** Where the link ended up — the same as before unless the change was confirmed. */
+  serialBaudBps: number
+  requestedSerialBaudBps: number
+  adapterVersion: string | null
+  message: string
+}
+
 /** A run of request bytes copied into the response, so a wildcard override still echoes. */
 export interface EchoSpan {
   requestOffset: number
@@ -584,6 +595,16 @@ export const api = {
   hardwareStart: (port: string, bitrateBps: number, serialBaudBps?: number) =>
     postJson<HardwareStatus>('/hw/start', { port, bitrateBps, serialBaudBps }),
   hardwareStop: () => postJson<HardwareStatus>('/hw/stop', {}),
+  /**
+   * Ask the adapter to run its UART faster. Never automatic: on several firmwares the setting
+   * survives a power cycle, so it is a change to the operator's hardware, not to this session.
+   */
+  commandLineSpeed: (port: string, serialBaudBps: number, currentSerialBaudBps?: number) =>
+    postJson<LineSpeedChange>('/hw/line-speed', {
+      port,
+      serialBaudBps,
+      currentSerialBaudBps,
+    }),
   busLoad: () => getJson<BusLoad>('/hw/busload'),
   ecuBusState: (handle: string) => getJson<BusState>(`/simulation/ecus/${handle}/bus-state`),
   setEcuBusState: (handle: string, body: SetBusState) =>

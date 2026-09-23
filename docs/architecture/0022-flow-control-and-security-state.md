@@ -132,9 +132,18 @@ is not a security test target. A vehicle that should refuse must be told to, wit
 
 **Not addressed here**, and still open:
 
-- The SLCAN `U` command, which would let the engine *command* a faster UART instead of only
-  discovering one. The reference dongle leaves `V` unanswered, so its rate falls back to an
-  assumed 115200 and the pacing above is then computed from a guess rather than a measurement.
+- ~~The SLCAN `U` command.~~ Built — `POST /hw/line-speed`, and buttons in the Hardware tab.
+  It is an **explicit action and never automatic**, because on several firmwares the setting
+  outlives a power cycle: an adapter left at a raised speed will not talk to other software that
+  assumes 115200 until it is set back, and silently reconfiguring a shared piece of the
+  operator's hardware is not a decision this simulator gets to make. The adapter is commanded,
+  the port is reopened at the new speed, and the adapter is asked to identify itself there — if
+  it does not answer, the link is **put back**, because an unconfirmed speed is indistinguishable
+  from a wrong one and a wrong one delivers garbage rather than slowness.
+
+  What this does *not* solve is the reference dongle, which answers nothing. For an adapter that
+  never replies the outcome is always `notConfirmed`, and the honest result is that its speed
+  still cannot be raised — the command may well have worked, and there is no way to know.
 - ~~An "apply this flow control to every ECU" action.~~ Built — `PUT /simulation/flow-control`,
   and a button beside the per-ECU fields. It writes **only** BlockSize and STmin: the response
   delay, the forced ResponsePending and P2/P2* are usually set on one ECU deliberately, and a

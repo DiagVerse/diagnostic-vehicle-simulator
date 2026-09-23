@@ -107,6 +107,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/hw/busload", get(hardware::GetBusLoad))
         .route("/hw/start", post(hardware::PostHardwareStart))
         .route("/hw/stop", post(hardware::PostHardwareStop))
+        // Explicit, never automatic: on several firmwares this survives a power cycle, so it
+        // is a change to the operator's hardware rather than to this process.
+        .route("/hw/line-speed", post(hardware::PostCommandLineSpeed))
         .route("/events", get(traffic::GetEvents))
         .route("/doip/status", get(doip::GetDoIpStatus))
         .route(
