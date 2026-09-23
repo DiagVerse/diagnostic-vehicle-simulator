@@ -35,6 +35,28 @@ export interface TrafficExchange {
   reason: string | null;
 }
 
+/**
+ * One DoIP message crossing the Ethernet wire.
+ *
+ * Its own kind rather than folded into `TrafficFrame`. The two share a direction and a length
+ * and nothing else: this has a peer address and a payload type where a CAN frame has an
+ * identifier, and squeezing one into the other's shape would mean inventing a CAN id.
+ */
+export interface TrafficDoIp {
+  kind: "doIp";
+  atMs: number;
+  /** 'rx' for a message the entity received, 'tx' for one it sent. */
+  direction: string;
+  /** The other end's address and port, so this reads against a packet capture. */
+  peer: string;
+  /** 'UDP' for discovery, 'TCP' for the diagnostic connection. */
+  transport: string;
+  payloadTypeHex: string;
+  payloadName: string;
+  payloadHex: string;
+  length: number;
+}
+
 /** The simulation was loaded, started, stopped, or put on a wire. */
 export interface TrafficLifecycle {
   kind: "lifecycle";
@@ -61,6 +83,7 @@ export interface TrafficReplayed {
 export type TrafficEvent =
   | TrafficFrame
   | TrafficExchange
+  | TrafficDoIp
   | TrafficLifecycle
   | TrafficLagged
   | TrafficReplayed;
@@ -256,6 +279,10 @@ export function FormatEventLine(event: TrafficEvent): string {
     case "frame":
       return `${strAt}  ${event.direction.toUpperCase()}  ${event.canIdHex.padEnd(8)} [${event.length}] ${event.dataHex}${
         event.isFlowControl ? "   (flow control)" : ""
+      }`;
+    case "doIp":
+      return `${strAt}  ${event.direction.toUpperCase()}  ${event.transport.padEnd(3)} ${event.peer.padEnd(21)} ${event.payloadTypeHex} ${event.payloadName}${
+        event.payloadHex ? `  [${event.length}] ${event.payloadHex}` : ""
       }`;
     case "exchange": {
       const strAnswers =

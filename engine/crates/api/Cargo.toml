@@ -19,6 +19,9 @@ simfile.workspace = true
 serial-can.workspace = true
 bridge.workspace = true
 doip-server.workspace = true
+# For naming payload types in the traffic feed. Referred to as `::doip`: this crate has a
+# module of the same name, and the leading `::` is what tells them apart.
+doip.workspace = true
 isotp.workspace = true
 slcan.workspace = true
 core-domain.workspace = true

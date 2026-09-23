@@ -119,6 +119,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/hw/line-speed", post(hardware::PostCommandLineSpeed))
         .route("/events", get(traffic::GetEvents))
         .route("/doip/status", get(doip::GetDoIpStatus))
+        .route("/doip/interfaces", get(doip::GetNetworkInterfaces))
         .route(
             "/doip/settings",
             get(doip::GetDoIpSettings).put(doip::PutDoIpSettings),

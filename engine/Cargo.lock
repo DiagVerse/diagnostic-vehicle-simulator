@@ -74,6 +74,7 @@ dependencies = [
  "bridge",
  "can",
  "core-domain",
+ "doip",
  "doip-server",
  "ecu",
  "futures-core",

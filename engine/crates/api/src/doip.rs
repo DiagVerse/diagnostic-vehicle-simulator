@@ -56,6 +56,112 @@ pub struct DoIpStatusDto {
     pub logical_addresses_hex: Vec<String>,
 }
 
+/// One address this machine can bind a DoIP entity to.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInterfaceDto {
+    /// The interface's name, as the operating system calls it.
+    pub name: String,
+    /// The IPv4 address on it.
+    pub address: String,
+    /// What to put in the bind field to listen on exactly this one.
+    pub bind: String,
+    /// True for the loopback interface, which no tester on another machine can reach.
+    pub is_loopback: bool,
+    /// True for a link-local (169.254.x.x) address.
+    ///
+    /// Worth calling out rather than hiding: link-local is what a host self-assigns when no
+    /// DHCP server answers, and a vehicle and a tester that have both fallen back to it can
+    /// still talk — that is the normal state of a diagnostic Ethernet link with nothing else
+    /// on it. Seeing the address is how an operator knows which subnet their tester must join.
+    pub is_link_local: bool,
+}
+
+/// What `GET /doip/interfaces` answers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInterfacesDto {
+    /// Bind here to accept a tester on any interface, which is almost always what is wanted.
+    pub any: String,
+    pub interfaces: Vec<NetworkInterfaceDto>,
+}
+
+/// GET /doip/interfaces — the addresses a DoIP entity could listen on.
+///
+/// Exists because choosing wrongly is invisible until it is not. A tester reaches the entity
+/// only if the two are on the same subnet, and an entity bound to loopback answers nothing from
+/// another machine while looking perfectly healthy from this one — so the addresses are listed
+/// rather than left for someone to find with `ifconfig`.
+pub async fn GetNetworkInterfaces() -> Json<NetworkInterfacesDto> {
+    let mut vecInterfaces = Vec::new();
+
+    for interface in ListIpv4Interfaces() {
+        let bIsLoopback = interface.1.is_loopback();
+        let bIsLinkLocal = interface.1.is_link_local();
+        vecInterfaces.push(NetworkInterfaceDto {
+            name: interface.0,
+            address: interface.1.to_string(),
+            bind: format!("{}:{}", interface.1, c_u16DefaultDoIpPort),
+            is_loopback: bIsLoopback,
+            is_link_local: bIsLinkLocal,
+        });
+    }
+
+    // Loopback last. It is the one that cannot serve a real tester, and putting it first in a
+    // list someone picks from is an invitation to the failure this endpoint exists to prevent.
+    vecInterfaces.sort_by_key(|dto| (dto.is_loopback, dto.name.clone()));
+
+    Json(NetworkInterfacesDto {
+        any: format!("0.0.0.0:{c_u16DefaultDoIpPort}"),
+        interfaces: vecInterfaces,
+    })
+}
+
+/// The port ISO 13400-2 assigns to DoIP discovery and unsecured diagnostics.
+const c_u16DefaultDoIpPort: u16 = 13400;
+
+/// Every IPv4 address this machine has, with the interface it sits on.
+///
+/// Uses `getifaddrs` through the standard library's socket layer where it can and falls back to
+/// nothing rather than guessing: an empty list sends an operator to `0.0.0.0`, which works,
+/// while an invented address would send them somewhere that does not.
+fn ListIpv4Interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
+    let output = match std::process::Command::new("ifconfig").arg("-a").output() {
+        Ok(output) if output.status.success() => output,
+        // No `ifconfig` — a stripped container, or Windows. `0.0.0.0` still works and is what
+        // the caller falls back to.
+        _ => return Vec::new(),
+    };
+
+    let strText = String::from_utf8_lossy(&output.stdout);
+    let mut vecFound = Vec::new();
+    let mut strCurrent = String::new();
+
+    for strLine in strText.lines() {
+        // An interface's block starts at column zero with its name; its addresses are indented
+        // beneath it. That shape is common to macOS, BSD and Linux `ifconfig`.
+        if !strLine.starts_with([' ', '\t']) {
+            if let Some((strName, _)) = strLine.split_once(':') {
+                strCurrent = strName.trim().to_string();
+            }
+            continue;
+        }
+
+        let strTrimmed = strLine.trim_start();
+        let strRest = match strTrimmed.strip_prefix("inet ") {
+            Some(strRest) => strRest,
+            None => continue,
+        };
+
+        let strAddress = strRest.split_whitespace().next().unwrap_or("");
+        if let Ok(address) = strAddress.parse::<std::net::Ipv4Addr>() {
+            vecFound.push((strCurrent.clone(), address));
+        }
+    }
+
+    vecFound
+}
+
 /// GET /doip/status — whether a tester could reach this simulation over Ethernet.
 pub async fn GetDoIpStatus(State(state): State<Arc<AppState>>) -> Json<DoIpStatusDto> {
     let doip = state.doip.lock().expect("DoIP mutex poisoned");
@@ -118,11 +224,17 @@ pub async fn PostDoIpStart(
         arcSettings,
     )));
 
-    let handle = DoIpServer::Start(arcEntity, bindAddress, Arc::from(protocol))
-        .await
-        .map_err(|error| {
-            ApiError::BadRequest(format!("could not listen on {bindAddress}: {error}"))
-        })?;
+    // The same observer the CAN bridge gets, so a DoIP session shows up in the monitor beside
+    // CAN traffic instead of being invisible. Without it the window stayed empty while the
+    // entity worked perfectly, which reads as "nothing is happening".
+    let handle = DoIpServer::StartObserved(
+        arcEntity,
+        bindAddress,
+        Arc::from(protocol),
+        Some(Arc::new(state.traffic.clone())),
+    )
+    .await
+    .map_err(|error| ApiError::BadRequest(format!("could not listen on {bindAddress}: {error}")))?;
 
     let strBoundAddress = handle.TcpAddress().to_string();
 

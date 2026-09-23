@@ -399,6 +399,20 @@ function EventBody({ event }: { event: TrafficEvent }) {
       )
     }
 
+    case 'doIp': {
+      const bIsReceived = event.direction === 'rx'
+      return (
+        <span className={bIsReceived ? 'text-slate-400' : 'text-emerald-400/80'}>
+          <span className="text-slate-600">{bIsReceived ? '→' : '←'}</span>{' '}
+          <span className="text-violet-400/80">{event.transport}</span>{' '}
+          <span className="text-slate-600">{event.peer}</span>{' '}
+          <span className="text-slate-500">{event.payloadTypeHex}</span>{' '}
+          {event.payloadName}
+          {event.payloadHex && <span className="text-slate-500"> {event.payloadHex}</span>}
+        </span>
+      )
+    }
+
     case 'exchange':
       return (
         <span>
@@ -448,7 +462,10 @@ function FilterEntries(
   }
 
   return entries.filter((entry) => {
-    if (!showFrames && entry.event.kind === 'frame') {
+    // A DoIP message is raw wire traffic just as a CAN frame is, so one switch hides both.
+    // Leaving it always visible would make turning frames off stop working on an Ethernet
+    // session, which is the case the switch exists for.
+    if (!showFrames && (entry.event.kind === 'frame' || entry.event.kind === 'doIp')) {
       return false
     }
     if (strNeedle.length === 0) {
