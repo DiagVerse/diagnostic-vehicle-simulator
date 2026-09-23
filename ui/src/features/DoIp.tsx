@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Badge } from '../components/primitives'
 import {
   api,
+  SharesSubnet,
   type DoIpSettings,
   type DoIpStatus,
   type NetworkInterfaces,
@@ -12,6 +13,7 @@ import {
 function InterfaceButton({
   label,
   note,
+  tone,
   bind,
   active,
   disabled,
@@ -19,24 +21,38 @@ function InterfaceButton({
 }: {
   label: string
   note?: string
+  /** Set once a tester address is known, so reachable and unreachable read apart at a glance. */
+  tone?: 'good' | 'bad'
   bind: string
   active: boolean
   disabled?: boolean
   onPick: (bind: string) => void
 }) {
+  const strBorder = active
+    ? 'border-sky-700 bg-sky-950/40 text-sky-200'
+    : tone === 'good'
+      ? 'border-emerald-800 text-slate-200 hover:border-emerald-600 hover:bg-slate-800'
+      : tone === 'bad'
+        ? 'border-slate-800 text-slate-500 hover:border-slate-600 hover:bg-slate-800'
+        : 'border-slate-700 text-slate-300 hover:border-slate-500 hover:bg-slate-800'
+
   return (
     <button
       onClick={() => onPick(bind)}
       disabled={disabled}
       title={bind}
-      className={`rounded-md border px-2.5 py-1.5 text-left text-xs transition disabled:opacity-40 ${
-        active
-          ? 'border-sky-700 bg-sky-950/40 text-sky-200'
-          : 'border-slate-700 text-slate-300 hover:border-slate-500 hover:bg-slate-800'
-      }`}
+      className={`rounded-md border px-2.5 py-1.5 text-left text-xs transition disabled:opacity-40 ${strBorder}`}
     >
       <span className="font-mono">{label}</span>
-      {note && <span className="ml-1.5 text-[10px] text-slate-500">{note}</span>}
+      {note && (
+        <span
+          className={`ml-1.5 text-[10px] ${
+            tone === 'good' ? 'text-emerald-400/80' : 'text-slate-500'
+          }`}
+        >
+          {note}
+        </span>
+      )}
     </button>
   )
 }
@@ -55,6 +71,8 @@ export function DoIp() {
   const [error, setError] = useState<string | null>(null)
   const [bind, setBind] = useState('0.0.0.0:13400')
   const [interfaces, setInterfaces] = useState<NetworkInterfaces | null>(null)
+  const [testerAddress, setTesterAddress] = useState('')
+  const [entityAddress, setEntityAddress] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -136,11 +154,22 @@ export function DoIp() {
                   key={entry.bind}
                   label={`${entry.name} · ${entry.address}`}
                   note={
-                    entry.isLoopback
-                      ? 'this machine only'
-                      : entry.isLinkLocal
-                        ? 'link-local · no DHCP'
-                        : undefined
+                    testerAddress.trim()
+                      ? SharesSubnet(entry, testerAddress)
+                        ? `${entry.network} · reaches your tester`
+                        : `${entry.network} · cannot reach it`
+                      : entry.isLoopback
+                        ? `${entry.network} · this machine only`
+                        : entry.isLinkLocal
+                          ? `${entry.network} · no DHCP`
+                          : entry.network
+                  }
+                  tone={
+                    testerAddress.trim()
+                      ? SharesSubnet(entry, testerAddress)
+                        ? 'good'
+                        : 'bad'
+                      : undefined
                   }
                   bind={entry.bind}
                   active={bind === entry.bind}
@@ -149,10 +178,49 @@ export function DoIp() {
                 />
               ))}
             </div>
+
+            <label className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <span>My tester is at</span>
+              <input
+                value={testerAddress}
+                onChange={(e) => setTesterAddress(e.target.value)}
+                placeholder="192.168.11.10"
+                className="w-40 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200 outline-none focus:border-slate-500"
+              />
+              {testerAddress.trim() &&
+                (interfaces.interfaces.some((entry) => SharesSubnet(entry, testerAddress)) ? (
+                  <span className="text-emerald-400/90">
+                    one of these interfaces is on its network &mdash; bind to that one
+                  </span>
+                ) : (
+                  <span className="text-amber-400/90">
+                    no interface on this machine shares a subnet with it. Give this machine an
+                    address on the tester&rsquo;s network, or move the tester onto one of these.
+                  </span>
+                ))}
+            </label>
           </div>
         )}
 
         <div className="mt-3 flex flex-wrap items-end gap-2">
+          <label className="flex flex-col gap-1">
+            <span className="text-xs text-slate-400">Announce as</span>
+            <select
+              value={entityAddress}
+              onChange={(e) => setEntityAddress(e.target.value)}
+              disabled={status?.running}
+              title="The logical address the vehicle announces itself as — the one a tester meets first"
+              className="w-56 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-200 outline-none focus:border-slate-500 disabled:opacity-40"
+            >
+              <option value="">gateway, or lowest address</option>
+              {(status?.logicalAddressesHex ?? []).map((strHex) => (
+                <option key={strHex} value={strHex}>
+                  0x{strHex}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <label className="flex flex-col gap-1">
             <span className="text-xs text-slate-400">Bind address</span>
             <input
@@ -173,7 +241,7 @@ export function DoIp() {
             </button>
           ) : (
             <button
-              onClick={() => run(() => api.doipStart(bind))}
+              onClick={() => run(() => api.doipStart(bind, entityAddress || undefined))}
               disabled={busy}
               className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:opacity-40"
             >

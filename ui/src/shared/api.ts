@@ -270,6 +270,30 @@ export interface NetworkInterface {
   isLoopback: boolean
   /** 169.254.x.x — what a host self-assigns when no DHCP server answers. */
   isLinkLocal: boolean
+  /** The subnet in CIDR form, e.g. `192.168.1.0/24`. */
+  network: string
+  prefixLength: number
+}
+
+/**
+ * Whether a tester at this address could reach an entity on this interface.
+ *
+ * The question an address alone cannot answer: `192.168.1.8` and `192.168.11.10` look alike
+ * and are on different networks, so nothing either one sends reaches the other.
+ */
+export function SharesSubnet(entry: NetworkInterface, strTesterAddress: string): boolean {
+  const vecTester = strTesterAddress.trim().split('.').map(Number)
+  const vecMine = entry.address.split('.').map(Number)
+  if (vecTester.length !== 4 || vecTester.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false
+  }
+
+  // Compared bit by bit over the prefix rather than byte by byte, because a prefix is not
+  // always a whole number of bytes — a /22 or a /30 is ordinary on a diagnostic link.
+  const ToNumber = (vecParts: number[]) =>
+    ((vecParts[0] << 24) | (vecParts[1] << 16) | (vecParts[2] << 8) | vecParts[3]) >>> 0
+  const uMask = entry.prefixLength === 0 ? 0 : (0xffffffff << (32 - entry.prefixLength)) >>> 0
+  return (ToNumber(vecTester) & uMask) === (ToNumber(vecMine) & uMask)
 }
 
 export interface NetworkInterfaces {
@@ -641,7 +665,13 @@ export const api = {
   simulationSetEcuEnabled: (handle: string, enabled: boolean) =>
     putJson<SimulationState>(`/simulation/ecus/${handle}/enabled`, { enabled }),
   doipStatus: () => getJson<DoIpStatus>('/doip/status'),
-  doipStart: (bind: string) => postJson<DoIpStatus>('/doip/start', { bind }),
+  /**
+   * `entityAddressHex` is the logical address the vehicle announces itself as — the one a
+   * tester meets first. Omit it and the engine picks the gateway, or the lowest address when
+   * no ECU is marked as one.
+   */
+  doipStart: (bind: string, entityAddressHex?: string) =>
+    postJson<DoIpStatus>('/doip/start', { bind, entityAddressHex }),
   doipStop: () => postJson<DoIpStatus>('/doip/stop', {}),
   doipInterfaces: () => getJson<NetworkInterfaces>('/doip/interfaces'),
   vehicleIdentity: () => getJson<VehicleIdentity>('/simulation/identity'),

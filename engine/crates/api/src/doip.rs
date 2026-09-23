@@ -75,6 +75,14 @@ pub struct NetworkInterfaceDto {
     /// still talk — that is the normal state of a diagnostic Ethernet link with nothing else
     /// on it. Seeing the address is how an operator knows which subnet their tester must join.
     pub is_link_local: bool,
+    /// The subnet in CIDR form, e.g. `192.168.1.0/24`.
+    ///
+    /// The whole point of listing interfaces. "Same subnet" is the question that decides
+    /// whether a tester can reach the entity at all, and an address on its own does not answer
+    /// it — `192.168.1.8` and `192.168.11.10` look alike and cannot talk.
+    pub network: String,
+    /// How many leading bits the netmask sets.
+    pub prefix_length: u8,
 }
 
 /// What `GET /doip/interfaces` answers.
@@ -95,15 +103,20 @@ pub struct NetworkInterfacesDto {
 pub async fn GetNetworkInterfaces() -> Json<NetworkInterfacesDto> {
     let mut vecInterfaces = Vec::new();
 
-    for interface in ListIpv4Interfaces() {
-        let bIsLoopback = interface.1.is_loopback();
-        let bIsLinkLocal = interface.1.is_link_local();
+    for (strName, address, u32Netmask) in ListIpv4Interfaces() {
+        let bIsLoopback = address.is_loopback();
+        let bIsLinkLocal = address.is_link_local();
+        let u8PrefixLength = u32Netmask.count_ones() as u8;
+        let networkAddress = std::net::Ipv4Addr::from(u32::from(address) & u32Netmask);
+
         vecInterfaces.push(NetworkInterfaceDto {
-            name: interface.0,
-            address: interface.1.to_string(),
-            bind: format!("{}:{}", interface.1, c_u16DefaultDoIpPort),
+            name: strName,
+            address: address.to_string(),
+            bind: format!("{address}:{c_u16DefaultDoIpPort}"),
             is_loopback: bIsLoopback,
             is_link_local: bIsLinkLocal,
+            network: format!("{networkAddress}/{u8PrefixLength}"),
+            prefix_length: u8PrefixLength,
         });
     }
 
@@ -120,12 +133,11 @@ pub async fn GetNetworkInterfaces() -> Json<NetworkInterfacesDto> {
 /// The port ISO 13400-2 assigns to DoIP discovery and unsecured diagnostics.
 const c_u16DefaultDoIpPort: u16 = 13400;
 
-/// Every IPv4 address this machine has, with the interface it sits on.
+/// Every IPv4 address this machine has, with its interface and netmask.
 ///
-/// Uses `getifaddrs` through the standard library's socket layer where it can and falls back to
-/// nothing rather than guessing: an empty list sends an operator to `0.0.0.0`, which works,
-/// while an invented address would send them somewhere that does not.
-fn ListIpv4Interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
+/// Falls back to nothing rather than guessing: an empty list sends an operator to `0.0.0.0`,
+/// which works, while an invented address would send them somewhere that does not.
+fn ListIpv4Interfaces() -> Vec<(String, std::net::Ipv4Addr, u32)> {
     let output = match std::process::Command::new("ifconfig").arg("-a").output() {
         Ok(output) if output.status.success() => output,
         // No `ifconfig` — a stripped container, or Windows. `0.0.0.0` still works and is what
@@ -153,10 +165,34 @@ fn ListIpv4Interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
             None => continue,
         };
 
-        let strAddress = strRest.split_whitespace().next().unwrap_or("");
-        if let Ok(address) = strAddress.parse::<std::net::Ipv4Addr>() {
-            vecFound.push((strCurrent.clone(), address));
+        let mut vecWords = strRest.split_whitespace();
+        let strAddress = vecWords.next().unwrap_or("");
+        let address = match strAddress.parse::<std::net::Ipv4Addr>() {
+            Ok(address) => address,
+            Err(_) => continue,
+        };
+
+        // The netmask follows the word "netmask", and the two platforms spell it differently:
+        // macOS and BSD write it as hex (`0xffffff00`), Linux as dotted quad (`255.255.255.0`).
+        // Both are read; a line with neither falls back to a host route, which claims nothing
+        // about a subnet rather than inventing one.
+        let mut u32Netmask = u32::MAX;
+        while let Some(strWord) = vecWords.next() {
+            if strWord != "netmask" {
+                continue;
+            }
+            let strValue = vecWords.next().unwrap_or("");
+            if let Some(strHex) = strValue.strip_prefix("0x") {
+                if let Ok(u32Parsed) = u32::from_str_radix(strHex, 16) {
+                    u32Netmask = u32Parsed;
+                }
+            } else if let Ok(mask) = strValue.parse::<std::net::Ipv4Addr>() {
+                u32Netmask = u32::from(mask);
+            }
+            break;
         }
+
+        vecFound.push((strCurrent.clone(), address, u32Netmask));
     }
 
     vecFound
@@ -291,7 +327,41 @@ fn ResolveEntityAddress(state: &Arc<AppState>, optStrHex: Option<&str>) -> Resul
     }
 
     let simulation = state.simulation.lock().expect("simulation mutex poisoned");
+
+    // A gateway first, because on a real vehicle the DoIP entity *is* the gateway: it is what
+    // the tester discovers, opens a connection to, and routes everything else through. Picking
+    // the lowest logical address instead — which is what this did — announced whichever ECU
+    // happened to sort first, so a 50-ECU vehicle introduced itself as an arbitrary node and a
+    // tester that expects to meet the gateway met something else.
+    if let Some(vehicle) = simulation.Vehicle() {
+        let optGateway = vehicle
+            .m_vecEcus
+            .iter()
+            .filter(|ecu| ecu.m_bHasDoIpAddress && !ecu.m_vecGatewayForNetworkIds.is_empty())
+            .min_by_key(|ecu| ecu.m_u16LogicalAddress);
+
+        if let Some(gateway) = optGateway {
+            tracing::info!(
+                ecu = %gateway.m_strName,
+                entityAddress = format!("{:04X}", gateway.m_u16LogicalAddress),
+                "the vehicle's gateway is the DoIP entity"
+            );
+            return Ok(gateway.m_u16LogicalAddress);
+        }
+    }
+
+    // No ECU is marked as a gateway — a vehicle built from a source that does not state
+    // topology, which a PDX delivery and a capture both are. The lowest address is then an
+    // arbitrary but stable choice, and it is said out loud so an operator who wanted a
+    // particular one knows to name it.
     let optU16Lowest = simulation.LogicalAddresses().next();
+    if let Some(u16Lowest) = optU16Lowest {
+        tracing::info!(
+            entityAddress = format!("{u16Lowest:04X}"),
+            "no ECU is marked as a gateway; announcing the lowest logical address instead"
+        );
+    }
+
     optU16Lowest.ok_or_else(|| {
         ApiError::Conflict(
             "no ECU in the loaded vehicle has a DoIP logical address, so there is no entity to be"
