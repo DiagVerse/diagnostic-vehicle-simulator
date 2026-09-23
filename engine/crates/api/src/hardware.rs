@@ -112,6 +112,102 @@ pub struct HardwareStatusDto {
     pub frames_sent: u64,
 }
 
+/// Request body for `POST /hw/line-speed`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandLineSpeedBody {
+    /// A port name from `GET /hw/ports`.
+    pub port: String,
+    /// The host-to-adapter line speed to ask the adapter to switch to — **not** the CAN
+    /// bitrate. Must be one the `U` command can name.
+    pub serial_baud_bps: u32,
+    /// The speed the adapter is on now, so the command can be sent at a rate it is listening
+    /// at. Omit it and the adapter is probed first.
+    #[serde(default)]
+    pub current_serial_baud_bps: Option<u32>,
+}
+
+/// What `POST /hw/line-speed` answers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineSpeedChangeDto {
+    /// `confirmed`, `refused`, `notConfirmed` or `noRealSerialLine`.
+    pub outcome: String,
+    /// The speed the link is on now, whatever happened.
+    pub serial_baud_bps: u32,
+    /// The speed that was asked for, which is not the same thing unless it worked.
+    pub requested_serial_baud_bps: u32,
+    /// What the adapter called itself at the new speed, when it answered.
+    pub adapter_version: Option<String>,
+    /// The outcome in words, for an operator deciding whether to try a slower speed or stop.
+    pub message: String,
+}
+
+/// POST /hw/line-speed — ask the adapter to run its UART faster.
+///
+/// This is the one thing probing cannot do. `GET /hw/status` reports the speed an adapter is
+/// *already* using; this changes it, which on a link that is the bottleneck by a factor of
+/// eight is the cheapest improvement available — and the only one that costs nothing on the
+/// CAN bus itself.
+///
+/// **Never automatic, and deliberately so.** On several firmwares the setting survives a power
+/// cycle, so an adapter left at a raised speed will not talk to other software that assumes
+/// 115200 until it is set back. A simulator that silently reconfigured a shared piece of
+/// hardware would be making a decision that is not its to make.
+///
+/// Refused while a bridge is running: the live link holds the port, and changing the speed
+/// underneath it would leave the bridge talking at a rate the adapter has left.
+pub async fn PostCommandLineSpeed(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CommandLineSpeedBody>,
+) -> Result<Json<LineSpeedChangeDto>, ApiError> {
+    let speed = slcan::SlcanLineSpeed::FromBitsPerSecond(body.serial_baud_bps).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "{} baud is not a line speed the SLCAN U command can select; use 230400, 115200, 57600, 38400, 19200, 9600 or 2400",
+            body.serial_baud_bps
+        ))
+    })?;
+
+    {
+        let hardware = state.hardware.lock().expect("hardware mutex poisoned");
+        if hardware.m_optTask.is_some() {
+            return Err(ApiError::Conflict(format!(
+                "a bridge is running on {}; stop it before changing the adapter's line speed, or it will be left talking at a rate the adapter has left",
+                hardware.m_strPortName
+            )));
+        }
+    }
+
+    // Probed rather than assumed when the caller does not say: sending the command at a speed
+    // the adapter is not listening at achieves nothing and reports nothing useful.
+    let u32CurrentBaudRate = match body.current_serial_baud_bps {
+        Some(u32Current) => u32Current,
+        None => DetectSerialLinkSpeed(&body.port).m_u32BaudRate,
+    };
+
+    let change = bridge::probe::CommandLineSpeed(&body.port, u32CurrentBaudRate, speed);
+    let strOutcome = match &change {
+        bridge::probe::LineSpeedChange::Confirmed { .. } => "confirmed",
+        bridge::probe::LineSpeedChange::Refused { .. } => "refused",
+        bridge::probe::LineSpeedChange::NotConfirmed { .. } => "notConfirmed",
+        bridge::probe::LineSpeedChange::NoRealSerialLine => "noRealSerialLine",
+    };
+    let optStrAdapterVersion = match &change {
+        bridge::probe::LineSpeedChange::Confirmed {
+            strAdapterVersion, ..
+        } => Some(strAdapterVersion.clone()),
+        _ => None,
+    };
+
+    Ok(Json(LineSpeedChangeDto {
+        outcome: strOutcome.to_string(),
+        serial_baud_bps: change.EffectiveBaudRate(u32CurrentBaudRate),
+        requested_serial_baud_bps: body.serial_baud_bps,
+        adapter_version: optStrAdapterVersion,
+        message: change.Describe(),
+    }))
+}
+
 /// Work out the host-to-adapter line speed for this connection.
 ///
 /// This is the rate between host and dongle, not the CAN bitrate. They are set separately and

@@ -39,6 +39,7 @@ export function Hardware() {
   const [serialBaud, setSerialBaud] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [lineSpeedNote, setLineSpeedNote] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -72,6 +73,32 @@ export function Hardware() {
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Ask the adapter to run its UART faster.
+   *
+   * Separate from Connect on purpose. Probing discovers the speed an adapter is already using;
+   * this changes it, and on several firmwares the change outlives a power cycle — so it is a
+   * change to the operator's hardware rather than to this session, and it is theirs to ask for.
+   */
+  async function raiseLineSpeed(targetBaud: number) {
+    setBusy(true)
+    try {
+      const result = await api.commandLineSpeed(
+        selected,
+        targetBaud,
+        status?.serialBaudBps ?? undefined,
+      )
+      setLineSpeedNote(result.message)
+      setError(null)
+      await refresh()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setLineSpeedNote(null)
     } finally {
       setBusy(false)
     }
@@ -197,6 +224,45 @@ export function Hardware() {
               <dd className="font-mono text-slate-300">{status.framesSent}</dd>
             </div>
           </dl>
+        )}
+      </section>
+
+      <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+        <div className="flex items-baseline justify-between">
+          <h3 className="text-sm font-medium text-slate-200">Adapter line speed</h3>
+          <span className="text-xs text-slate-500">SLCAN U command</span>
+        </div>
+        <p className="mt-1 text-xs leading-relaxed text-slate-500">
+          The UART between this PC and the dongle — not the CAN bitrate. It is usually the
+          bottleneck: at 115200 baud the link carries about 426 frames per second while a
+          500 kbit/s bus delivers roughly 3703, which is why long requests arrive with holes in
+          them. Raising it is the only fix that costs nothing on the bus.
+        </p>
+        <p className="mt-2 text-xs leading-relaxed text-amber-500/80">
+          On several firmwares this outlives a power cycle. An adapter left at a raised speed
+          will not talk to other software that assumes 115200 until it is set back here.
+        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {[230400, 115200, 57600].map((baud) => (
+            <button
+              key={baud}
+              onClick={() => raiseLineSpeed(baud)}
+              disabled={busy || status?.running || selected.trim().length === 0}
+              className="rounded-md border border-slate-700 px-3 py-1.5 font-mono text-xs text-slate-200 transition hover:border-slate-500 hover:bg-slate-800 disabled:opacity-40"
+            >
+              {baud}
+            </button>
+          ))}
+          <span className="text-xs text-slate-500">
+            {status?.running
+              ? 'Disconnect first — changing it under a live link would leave the bridge talking at a rate the adapter has left.'
+              : 'The adapter is asked, then checked at the new speed. If it does not answer, it is put back.'}
+          </span>
+        </div>
+        {lineSpeedNote && (
+          <p className="mt-3 rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+            {lineSpeedNote}
+          </p>
         )}
       </section>
 
