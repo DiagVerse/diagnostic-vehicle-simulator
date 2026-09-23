@@ -12,6 +12,8 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+use axum::body::Bytes;
+
 use std::collections::{BTreeMap, BTreeSet};
 // Only the owned form is imported: axum's extractor is also called `Path`, and the borrowed
 // one is spelled out at its single use site rather than aliased.
@@ -20,9 +22,8 @@ use std::sync::Arc;
 
 use ::simulation::execute::{EmittedFrame, ExecutePlans};
 use ::simulation::{EcuKey, RoutedResponse, RoutingOutcome, SimulationService};
-use axum::body::Bytes;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -563,15 +564,21 @@ pub struct PdxConversionDto {
 pub async fn PostSimulationPdx(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PdxQuery>,
-    body: Bytes,
+    multipart: Multipart,
 ) -> Result<Json<PdxConversionDto>, ApiError> {
-    if body.is_empty() {
-        return Err(ApiError::BadRequest("the archive is empty".to_string()));
+    let vecFiles = ReadUploadedFiles(multipart).await?;
+    if vecFiles.is_empty() {
+        return Err(ApiError::BadRequest(
+            "no files were uploaded; choose one .pdx, several of them, or a zip holding a set"
+                .to_string(),
+        ));
     }
-    if body.len() > c_uMaxPdxBytes {
+
+    let uTotalBytes: usize = vecFiles.iter().map(|file| file.m_vecBytes.len()).sum();
+    if uTotalBytes > c_uMaxPdxBytes {
         return Err(ApiError::BadRequest(format!(
-            "this archive is {} MB; the limit is {} MB",
-            body.len() / (1024 * 1024),
+            "these files are {} MB together; the limit is {} MB",
+            uTotalBytes / (1024 * 1024),
             c_uMaxPdxBytes / (1024 * 1024)
         )));
     }
@@ -586,10 +593,9 @@ pub async fn PostSimulationPdx(
 
     // Converting is a minute of CPU in another process, so it is moved off the async runtime
     // rather than blocking a worker that other requests are waiting on.
-    let vecBytes = body.to_vec();
     let optStrVehicleName = CleanVehicleName(query.name.as_deref());
     let conversion = tokio::task::spawn_blocking(move || {
-        RunPdxConverter(&pathConverter, &vecBytes, optStrVehicleName.as_deref())
+        RunPdxConverter(&pathConverter, &vecFiles, optStrVehicleName.as_deref())
     })
     .await
     .map_err(|error| ApiError::Internal(format!("the converter task failed: {error}")))??;
@@ -638,6 +644,80 @@ fn CleanVehicleName(optStrName: Option<&str>) -> Option<String> {
     Some(strTrimmed)
 }
 
+/// One file of a PDX upload.
+struct UploadedFile {
+    /// The name the browser sent, already reduced to something safe to use as a file name.
+    m_strFileName: String,
+    m_vecBytes: Vec<u8>,
+}
+
+/// Read every file out of a multipart upload.
+///
+/// Multipart rather than one raw body because a PDX delivery is a *set* — one archive per ECU —
+/// and an operator who has fifty of them in a folder should be able to select all of them
+/// rather than zip them first. One file is simply the set of size one, so there is a single path
+/// here instead of one for each shape.
+async fn ReadUploadedFiles(mut multipart: Multipart) -> Result<Vec<UploadedFile>, ApiError> {
+    let mut vecFiles = Vec::new();
+
+    loop {
+        let optField = multipart.next_field().await.map_err(|error| {
+            ApiError::BadRequest(format!("the upload could not be read: {error}"))
+        })?;
+
+        let field = match optField {
+            Some(field) => field,
+            None => break,
+        };
+
+        let strFileName = SafeFileName(field.file_name(), vecFiles.len());
+        let vecBytes = field
+            .bytes()
+            .await
+            .map_err(|error| ApiError::BadRequest(format!("a file could not be read: {error}")))?
+            .to_vec();
+
+        if vecBytes.is_empty() {
+            continue;
+        }
+        vecFiles.push(UploadedFile {
+            m_strFileName: strFileName,
+            m_vecBytes: vecBytes,
+        });
+    }
+
+    Ok(vecFiles)
+}
+
+/// A file name safe to create inside a scratch directory.
+///
+/// The browser's name is kept where it can be, because the converter reads an ECU's address and
+/// a readable name out of it — `30000_ODX_0x00E2_E-ACT-EBA_29b - ...pdx` is how the vehicle ends
+/// up with ECUs called something a person recognises. What it must not do is escape the
+/// directory, so every path separator and every `..` is gone before it is used, and a name left
+/// with nothing usable falls back to its position in the upload.
+fn SafeFileName(optStrName: Option<&str>, uIndex: usize) -> String {
+    const c_uMaxFileNameChars: usize = 120;
+
+    let strTail = optStrName
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("");
+
+    let strCleaned: String = strTail
+        .chars()
+        .filter(|character| !character.is_control() && *character != ':')
+        .take(c_uMaxFileNameChars)
+        .collect();
+    let strCleaned = strCleaned.replace("..", "_").trim().to_string();
+
+    if strCleaned.is_empty() {
+        return format!("upload-{uIndex}.pdx");
+    }
+    strCleaned
+}
+
 /// What a successful conversion produced.
 struct PdxConversion {
     m_strSimFileText: String,
@@ -684,7 +764,7 @@ fn FindPdxConverter() -> Option<PathBuf> {
 /// Write the archive somewhere the converter can read it, run it, and read back what it wrote.
 fn RunPdxConverter(
     pathConverter: &std::path::Path,
-    arrArchive: &[u8],
+    vecFiles: &[UploadedFile],
     optStrVehicleName: Option<&str>,
 ) -> Result<PdxConversion, ApiError> {
     let dirScratch = tempfile::Builder::new()
@@ -692,17 +772,30 @@ fn RunPdxConverter(
         .tempdir()
         .map_err(|error| ApiError::Internal(format!("no scratch directory: {error}")))?;
 
-    // A fixed name, not the one the upload arrived with. The archive's own name never reaches a
-    // command line this way, so there is nothing in it that could escape into a path.
-    let pathArchive = dirScratch.path().join("upload.zip");
+    // The uploads go in a sub-directory of their own, so the simulation file written beside it
+    // cannot be mistaken for one of them by a directory scan.
+    let dirUploads = dirScratch.path().join("uploads");
+    std::fs::create_dir(&dirUploads)
+        .map_err(|error| ApiError::Internal(format!("could not stage the upload: {error}")))?;
+
+    for file in vecFiles {
+        std::fs::write(dirUploads.join(&file.m_strFileName), &file.m_vecBytes)
+            .map_err(|error| ApiError::Internal(format!("could not stage a file: {error}")))?;
+    }
+
+    // One file is handed over as a file and several as the directory holding them — the
+    // converter reads both, and a directory of one behaves differently from the file itself
+    // only in that a stray non-PDX beside it would be picked up, which cannot happen here.
+    let pathInput = match vecFiles {
+        [file] => dirUploads.join(&file.m_strFileName),
+        _ => dirUploads.clone(),
+    };
     let pathSimFile = dirScratch.path().join("vehicle.simfile.json");
-    std::fs::write(&pathArchive, arrArchive)
-        .map_err(|error| ApiError::Internal(format!("could not stage the archive: {error}")))?;
 
     let mut command = std::process::Command::new("python3");
     command
         .arg(pathConverter)
-        .arg(&pathArchive)
+        .arg(&pathInput)
         .arg("-o")
         .arg(&pathSimFile);
     if let Some(strVehicleName) = optStrVehicleName {

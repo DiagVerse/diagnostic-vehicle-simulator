@@ -37,7 +37,9 @@ rust-version = "1.98"
 abi_stable = "0.11"
 # Async runtime + web.
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
+# `multipart` so a PDX upload can carry several per-ECU files at once, which is how a
+# delivery is usually handed over.
+axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 # Serialization.
 serde = { version = "1", features = ["derive"] }
