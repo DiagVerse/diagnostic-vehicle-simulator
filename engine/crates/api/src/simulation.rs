@@ -13,13 +13,16 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use std::collections::{BTreeMap, BTreeSet};
+// Only the owned form is imported: axum's extractor is also called `Path`, and the borrowed
+// one is spelled out at its single use site rather than aliased.
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ::simulation::execute::{EmittedFrame, ExecutePlans};
 use ::simulation::{EcuKey, RoutedResponse, RoutingOutcome, SimulationService};
 use axum::body::Bytes;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -100,6 +103,19 @@ impl ApiError {
     pub(crate) fn NotFound(strMessage: String) -> Self {
         ApiError {
             m_status: StatusCode::NOT_FOUND,
+            m_strMessage: strMessage,
+        }
+    }
+
+    /// The engine failed at something that was its own to do.
+    ///
+    /// Distinct from `BadRequest` and `Conflict` on purpose: those say the caller can fix it by
+    /// sending something else, and a 500 says they cannot. Reporting a failed write or a
+    /// missing scratch directory as a bad request would send someone editing their file to fix
+    /// a problem on this side of the wire.
+    pub(crate) fn Internal(strMessage: String) -> Self {
+        ApiError {
+            m_status: StatusCode::INTERNAL_SERVER_ERROR,
             m_strMessage: strMessage,
         }
     }
@@ -508,7 +524,243 @@ pub async fn PostSimulationCapture(
     Ok(Json(BuildStateDto(&simulation, state.protocol.is_some())))
 }
 
-/// POST /simulation/simfile — load a vehicle from a simulation file.
+/// The most a PDX archive may be. A per-ECU file is a few hundred kilobytes and a whole
+/// vehicle's delivery is tens of megabytes; this leaves room for a large one without letting
+/// the route stand in for an unbounded upload.
+pub const c_uMaxPdxBytes: usize = 128 * 1024 * 1024;
+
+/// A little above it, so this endpoint's own message is what refuses an oversized archive
+/// rather than axum's bare 413.
+pub const c_uMaxPdxBodyBytes: usize = c_uMaxPdxBytes + 8 * 1024 * 1024;
+
+/// What came of converting a PDX, beyond whether it worked.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdxConversionDto {
+    /// The vehicle, exactly as every other source reports it.
+    #[serde(flatten)]
+    pub state: SimulationStateDto,
+    /// What the converter said while it worked: ECU variants set aside, files that needed
+    /// lenient parsing, files it could not read at all.
+    ///
+    /// Carried through rather than discarded because a PDX conversion is not simply success or
+    /// failure. A delivery describes every build a platform offers, so ECUs are *chosen* out of
+    /// it, and an operator who is not told which were set aside has no way to know the vehicle
+    /// in front of them is one of several the archive could have produced.
+    pub notes: Vec<String>,
+}
+
+/// POST /simulation/pdx — convert an ODX/PDX archive and load the vehicle it describes.
+///
+/// The conversion runs in `scripts/pdx-to-simfile.py` rather than in this binary. ODX spreads an
+/// ECU's services across shared layers through PARENT-REF and IMPORT-REF, and resolving that
+/// correctly is what `odxtools` exists for — the script's own header records why
+/// re-implementing it here would be the wrong trade.
+///
+/// So this endpoint is honest about its shape: the engine asks a converter to produce the
+/// canonical document, then loads that document through the same path a hand-written simulation
+/// file takes. Nothing downstream knows a PDX was involved.
+pub async fn PostSimulationPdx(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PdxQuery>,
+    body: Bytes,
+) -> Result<Json<PdxConversionDto>, ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest("the archive is empty".to_string()));
+    }
+    if body.len() > c_uMaxPdxBytes {
+        return Err(ApiError::BadRequest(format!(
+            "this archive is {} MB; the limit is {} MB",
+            body.len() / (1024 * 1024),
+            c_uMaxPdxBytes / (1024 * 1024)
+        )));
+    }
+
+    let pathConverter = FindPdxConverter().ok_or_else(|| {
+        ApiError::Conflict(
+            "the PDX converter was not found. It lives at scripts/pdx-to-simfile.py in the \
+             repository; set DVSIM_PDX_CONVERTER to its path if the engine runs from elsewhere."
+                .to_string(),
+        )
+    })?;
+
+    // Converting is a minute of CPU in another process, so it is moved off the async runtime
+    // rather than blocking a worker that other requests are waiting on.
+    let vecBytes = body.to_vec();
+    let optStrVehicleName = CleanVehicleName(query.name.as_deref());
+    let conversion = tokio::task::spawn_blocking(move || {
+        RunPdxConverter(&pathConverter, &vecBytes, optStrVehicleName.as_deref())
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("the converter task failed: {error}")))??;
+
+    let mut simulation = state.simulation.lock().expect("simulation mutex poisoned");
+    simulation
+        .LoadFromSimFileText(&conversion.m_strSimFileText)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
+    Ok(Json(PdxConversionDto {
+        state: BuildStateDto(&simulation, state.protocol.is_some()),
+        notes: conversion.m_vecNotes,
+    }))
+}
+
+/// Query parameters for `POST /simulation/pdx`.
+#[derive(Deserialize)]
+pub struct PdxQuery {
+    /// What to call the vehicle — the name of the file the operator chose.
+    ///
+    /// Sent by the caller because the engine never sees it: the upload arrives as bytes and is
+    /// staged under a fixed name of the engine's own choosing. Without it the vehicle ends up
+    /// named after that staging file, which means nothing to anyone.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Tidy a caller-supplied vehicle name, or `None` to let the converter choose.
+///
+/// The name reaches the converter as one entry of an argument vector, never through a shell, so
+/// there is nothing in it that could be read as a command. What this removes is display
+/// trouble: control characters that would corrupt a log line, and a length no heading can hold.
+fn CleanVehicleName(optStrName: Option<&str>) -> Option<String> {
+    const c_uMaxVehicleNameChars: usize = 80;
+
+    let strCleaned: String = optStrName?
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(c_uMaxVehicleNameChars)
+        .collect();
+
+    let strTrimmed = strCleaned.trim().to_string();
+    if strTrimmed.is_empty() {
+        return None;
+    }
+    Some(strTrimmed)
+}
+
+/// What a successful conversion produced.
+struct PdxConversion {
+    m_strSimFileText: String,
+    m_vecNotes: Vec<String>,
+}
+
+/// Where the converter script lives.
+///
+/// The engine runs from `engine/` during development and from anywhere at all otherwise, so the
+/// script is looked for relative to both the working directory and the binary, and an
+/// environment variable settles it for a deployment that puts them somewhere else entirely.
+fn FindPdxConverter() -> Option<PathBuf> {
+    if let Ok(strOverride) = std::env::var("DVSIM_PDX_CONVERTER") {
+        let path = PathBuf::from(strOverride);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut vecCandidates: Vec<PathBuf> = vec![
+        PathBuf::from("scripts/pdx-to-simfile.py"),
+        PathBuf::from("../scripts/pdx-to-simfile.py"),
+        PathBuf::from("../../scripts/pdx-to-simfile.py"),
+    ];
+
+    if let Ok(pathExe) = std::env::current_exe() {
+        // target/debug/dvsim sits three levels below the workspace, which is itself one below
+        // the repository root the scripts directory hangs off.
+        for uUp in 3..=5 {
+            let mut path = pathExe.clone();
+            let mut bPopped = true;
+            for _ in 0..uUp {
+                bPopped = path.pop();
+            }
+            if bPopped {
+                vecCandidates.push(path.join("scripts/pdx-to-simfile.py"));
+            }
+        }
+    }
+
+    vecCandidates.into_iter().find(|path| path.is_file())
+}
+
+/// Write the archive somewhere the converter can read it, run it, and read back what it wrote.
+fn RunPdxConverter(
+    pathConverter: &std::path::Path,
+    arrArchive: &[u8],
+    optStrVehicleName: Option<&str>,
+) -> Result<PdxConversion, ApiError> {
+    let dirScratch = tempfile::Builder::new()
+        .prefix("dvsim-pdx-")
+        .tempdir()
+        .map_err(|error| ApiError::Internal(format!("no scratch directory: {error}")))?;
+
+    // A fixed name, not the one the upload arrived with. The archive's own name never reaches a
+    // command line this way, so there is nothing in it that could escape into a path.
+    let pathArchive = dirScratch.path().join("upload.zip");
+    let pathSimFile = dirScratch.path().join("vehicle.simfile.json");
+    std::fs::write(&pathArchive, arrArchive)
+        .map_err(|error| ApiError::Internal(format!("could not stage the archive: {error}")))?;
+
+    let mut command = std::process::Command::new("python3");
+    command
+        .arg(pathConverter)
+        .arg(&pathArchive)
+        .arg("-o")
+        .arg(&pathSimFile);
+    if let Some(strVehicleName) = optStrVehicleName {
+        command.arg("--vehicle").arg(strVehicleName);
+    }
+
+    let output = command.output().map_err(|error| {
+        ApiError::Conflict(format!(
+            "python3 could not be started ({error}). Converting a PDX needs Python and \
+                 odxtools: pip3 install odxtools"
+        ))
+    })?;
+
+    let strStdErr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        // The converter's last word is its reason; everything before it is progress. Reporting
+        // the whole stream would bury that under hundreds of library warnings.
+        let strReason = ReadConverterNotes(&strStdErr)
+            .pop()
+            .unwrap_or_else(|| "the converter failed without saying why".to_string());
+        return Err(ApiError::BadRequest(format!(
+            "the PDX could not be converted: {strReason}"
+        )));
+    }
+
+    let strSimFileText = std::fs::read_to_string(&pathSimFile).map_err(|error| {
+        ApiError::Internal(format!(
+            "the converter reported success but wrote no file: {error}"
+        ))
+    })?;
+
+    Ok(PdxConversion {
+        m_strSimFileText: strSimFileText,
+        m_vecNotes: ReadConverterNotes(&strStdErr),
+    })
+}
+
+/// The lines of the converter's report worth putting in front of an operator.
+///
+/// `odxtools` writes its own unresolved-reference warning once per occurrence, and there can be
+/// hundreds of identical ones. They are dropped because the converter already summarises that
+/// condition in a line of its own, and passing both through would bury the summary under its
+/// own evidence.
+fn ReadConverterNotes(strStdErr: &str) -> Vec<String> {
+    strStdErr
+        .lines()
+        .map(|strLine| strLine.trim_end())
+        .filter(|strLine| !strLine.trim().is_empty())
+        .filter(|strLine| !strLine.starts_with("ODXLINK reference"))
+        // The converter names the file it wrote. Here that is a scratch directory the operator
+        // never chose and cannot open, so the line is dropped while its counts — printed
+        // separately for exactly this reason — are kept.
+        .filter(|strLine| !strLine.starts_with("wrote "))
+        .map(|strLine| strLine.to_string())
+        .collect()
+}
+
 /// POST /simulation/simfile — load a vehicle from a simulation file.
 pub async fn PostSimulationSimFile(
     State(state): State<Arc<AppState>>,

@@ -545,6 +545,26 @@ def KeepOneEcuPerAddress(vecEcus, strPrefer):
     return vecOrder, vecDropped
 
 
+def IsPdxArchive(strPath):
+    """Whether this zip is itself a PDX, rather than a zip holding several of them.
+
+    Decided by what is inside rather than by the extension, because the extension is not always
+    there to read: a caller that staged an upload under a name of its own — the engine's
+    convert-a-PDX route does exactly that — has a PDX called something else entirely.
+
+    A PDX *is* a zip, so "extract it and look for .pdx files" finds nothing inside one and
+    reports an empty archive. What it does hold is ODX documents, and that is what is checked.
+    """
+    try:
+        with zipfile.ZipFile(strPath) as archive:
+            return any(
+                strMember.lower().endswith((".odx-d", ".odx-v", ".odx-c", ".odx-cs"))
+                for strMember in archive.namelist()
+            )
+    except zipfile.BadZipFile:
+        return False
+
+
 def CollectPdxPaths(strInput, strScratchDir):
     """Every PDX to read, from a file, a directory, or a zip holding a set of them."""
     if os.path.isdir(strInput):
@@ -554,9 +574,20 @@ def CollectPdxPaths(strInput, strScratchDir):
         return [strInput]
 
     if zipfile.is_zipfile(strInput):
+        # Checked before extracting: a PDX unpacks into ODX documents, and globbing for .pdx
+        # among them would report that a perfectly good archive held nothing.
+        if IsPdxArchive(strInput):
+            return [strInput]
+
         with zipfile.ZipFile(strInput) as archive:
             archive.extractall(strScratchDir)
-        return sorted(glob.glob(os.path.join(strScratchDir, "**", "*.pdx"), recursive=True))
+        vecPaths = sorted(glob.glob(os.path.join(strScratchDir, "**", "*.pdx"), recursive=True))
+        if vecPaths:
+            return vecPaths
+        sys.exit(
+            f"{strInput} is a zip, but holds neither .pdx files nor the ODX documents a PDX "
+            f"contains"
+        )
 
     sys.exit(f"{strInput} is not a .pdx, a directory, or a zip archive of them")
 
@@ -604,8 +635,16 @@ def main():
                 vecDegraded.append((os.path.basename(strPath), strDegraded))
 
             for ecu in database.ecus:
+                # The file name is preferred only when it has the supplier's shape — an address
+                # and a readable name. Anything else means the file has been renamed or staged
+                # under a caller's own name, and the ODX's own long name is then the better of
+                # the two: a vehicle whose ECU is called "upload" helps nobody.
+                strDisplayName = strName
+                if u16Address is None:
+                    strDisplayName = ecu.long_name or ecu.short_name or strName
+
                 try:
-                    dtoEcu = BuildEcu(ecu, strName, u16Address)
+                    dtoEcu = BuildEcu(ecu, strDisplayName, u16Address)
                     dtoEcu["_source"] = os.path.basename(strPath)
                     vecEcus.append(dtoEcu)
                 except Exception as error:
@@ -627,12 +666,13 @@ def main():
                 dtoEcu["name"] = f"{strBase} ({uCount + 1})"
 
         strVehicle = args.vehicle or os.path.splitext(os.path.basename(args.input))[0]
+        # The name is a name. The caveat that belongs with it is reported below instead: it was
+        # tried as part of the name and the result was a vehicle called "upload (from ODX — data
+        # identifier values are placeholders; ODX states what an ECU answers and the shape of
+        # it, never the value)", rendered as a heading. A disclaimer is not an identifier.
         dtoFile = {
             "simfileVersion": 2,
-            "vehicle": (
-                f"{strVehicle} (from ODX — data identifier values are placeholders; "
-                f"ODX states what an ECU answers and the shape of it, never the value)"
-            ),
+            "vehicle": strVehicle,
             "ecus": vecEcus,
         }
 
@@ -658,11 +698,21 @@ def main():
 
         uDids = sum(len(dtoEcu.get("dids", {})) for dtoEcu in vecEcus)
         uDtcs = sum(len(dtoEcu.get("dtcs", [])) for dtoEcu in vecEcus)
+        # The counts and the destination are separate lines on purpose. A caller that ran this
+        # on the operator's behalf — the engine's own convert-a-PDX route does — wants to show
+        # the counts and has no use for a scratch path the operator never chose, so it drops the
+        # "wrote" line. Keeping them on one line would force it to choose between both and
+        # neither.
         print(
-            f"wrote {args.output}: {len(vecEcus)} ECU(s), {uDids} data identifier(s), "
-            f"{uDtcs} trouble code(s)",
+            f"{len(vecEcus)} ECU(s), {uDids} data identifier(s), {uDtcs} trouble code(s)",
             file=sys.stderr,
         )
+        print(
+            "data identifier values are placeholders: ODX states what an ECU answers and the "
+            "shape of it, never the value",
+            file=sys.stderr,
+        )
+        print(f"wrote {args.output}", file=sys.stderr)
         if vecDegraded:
             print(
                 f"{len(vecDegraded)} file(s) needed lenient parsing — a reference their own ODX "

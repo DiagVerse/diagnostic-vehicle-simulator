@@ -160,6 +160,42 @@ def TestVariantSelection():
     Check("an ECU with no address is not discarded", len(vecKept), 1)
 
 
+def TestArchiveShapes():
+    print("archive shapes")
+
+    import tempfile
+    import zipfile
+
+    strDir = tempfile.mkdtemp(prefix="pdx-test-")
+
+    # A PDX is itself a zip of ODX documents. Staged under a caller's own name — which the
+    # engine's convert-a-PDX route does — its extension is gone, so the content is what decides.
+    strPdx = os.path.join(strDir, "upload.zip")
+    with zipfile.ZipFile(strPdx, "w") as archive:
+        archive.writestr("ecu.odx-d", "<ODX/>")
+        archive.writestr("index.xml", "<index/>")
+    Check("a PDX is recognised without its extension", conv.IsPdxArchive(strPdx), True)
+    Check(
+        "and is read as one file, not unpacked and searched",
+        conv.CollectPdxPaths(strPdx, tempfile.mkdtemp()),
+        [strPdx],
+    )
+
+    # A delivery: a zip holding one PDX per ECU.
+    strDelivery = os.path.join(strDir, "delivery.zip")
+    with zipfile.ZipFile(strDelivery, "w") as archive:
+        archive.writestr("PZ1A/first.pdx", "not really a pdx")
+        archive.writestr("PZ1A/second.pdx", "nor this")
+    Check("a delivery is not mistaken for a PDX", conv.IsPdxArchive(strDelivery), False)
+    Check(
+        "and yields every PDX inside it",
+        len(conv.CollectPdxPaths(strDelivery, tempfile.mkdtemp())),
+        2,
+    )
+
+    Check("something that is not a zip at all", conv.IsPdxArchive(__file__), False)
+
+
 def TestComparamFlattening():
     print("comparam values")
 
@@ -174,6 +210,7 @@ def main():
     TestNameAndAddress()
     TestPlaceholderValue()
     TestVariantSelection()
+    TestArchiveShapes()
     TestComparamFlattening()
 
     print()
